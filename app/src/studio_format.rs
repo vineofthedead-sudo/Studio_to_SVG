@@ -125,9 +125,31 @@ impl Default for AffineTransform2D {
     }
 }
 
+impl std::ops::Mul for AffineTransform2D {
+    type Output = Self;
+
+    /// Multiplies two 2D affine transform matrices: `parent * child`.
+    /// When applied to point `p`, `(parent * child).apply(p) == parent.apply(child.apply(p))`.
+    fn mul(self, rhs: Self) -> Self {
+        Self {
+            a: self.a * rhs.a + self.b * rhs.c,
+            b: self.a * rhs.b + self.b * rhs.d,
+            tx: self.a * rhs.tx + self.b * rhs.ty + self.tx,
+            c: self.c * rhs.a + self.d * rhs.c,
+            d: self.c * rhs.b + self.d * rhs.d,
+            ty: self.c * rhs.tx + self.d * rhs.ty + self.ty,
+        }
+    }
+}
+
 impl AffineTransform2D {
     pub fn new(a: f32, b: f32, tx: f32, c: f32, d: f32, ty: f32) -> Self {
         Self { a, b, tx, c, d, ty }
+    }
+
+    /// Combines parent matrix with child matrix: `parent.combine(child)`.
+    pub fn combine(&self, child: &Self) -> Self {
+        *self * *child
     }
 
     pub fn apply(&self, p: egui::Pos2) -> egui::Pos2 {
@@ -304,38 +326,38 @@ fn normalize_shapes_onto_mat(shapes: &mut [CanvasShape], mat_w_in: f32, mat_h_in
     let w = (max_x - min_x).max(0.001);
     let h = (max_y - min_y).max(0.001);
 
-    // If shapes are outside normal margin or have negative bounds, center them
+    // If shapes are already fully within the mat, keep their authentic design positions
+    let is_already_on_mat = min_x >= 0.0 && min_y >= 0.0 && max_x <= mat_w_in && max_y <= mat_h_in;
+    if is_already_on_mat {
+        return;
+    }
+
     let margin = 0.5_f32;
-    let needs_recenter = min_x < margin || min_y < margin || max_x > (mat_w_in - margin) || max_y > (mat_h_in - margin);
+    let max_w = (mat_w_in - margin * 2.0).max(1.0);
+    let max_h = (mat_h_in - margin * 2.0).max(1.0);
+    let scale = if w > max_w || h > max_h {
+        (max_w / w).min(max_h / h).min(1.0)
+    } else {
+        1.0
+    };
 
-    if needs_recenter {
-        // Proportionally scale if larger than mat
-        let max_w = (mat_w_in - margin * 2.0).max(1.0);
-        let max_h = (mat_h_in - margin * 2.0).max(1.0);
-        let scale = if w > max_w || h > max_h {
-            (max_w / w).min(max_h / h).min(1.0)
-        } else {
-            1.0
-        };
+    let target_cx = mat_w_in * 0.5;
+    let target_cy = mat_h_in * 0.5;
+    let orig_cx = (min_x + max_x) * 0.5;
+    let orig_cy = (min_y + max_y) * 0.5;
 
-        let target_cx = mat_w_in * 0.5;
-        let target_cy = mat_h_in * 0.5;
-        let orig_cx = (min_x + max_x) * 0.5;
-        let orig_cy = (min_y + max_y) * 0.5;
-
-        for shape in shapes.iter_mut() {
-            for pt in &mut shape.points {
-                pt.x = target_cx + (pt.x - orig_cx) * scale;
-                pt.y = target_cy + (pt.y - orig_cy) * scale;
-            }
-
-            let (s_min_x, s_min_y, s_max_x, s_max_y) = compute_bounds(&shape.points);
-            shape.x = s_min_x;
-            shape.y = s_min_y;
-            shape.width = (s_max_x - s_min_x).max(0.005);
-            shape.height = (s_max_y - s_min_y).max(0.005);
-            shape.precompute_triangles();
+    for shape in shapes.iter_mut() {
+        for pt in &mut shape.points {
+            pt.x = target_cx + (pt.x - orig_cx) * scale;
+            pt.y = target_cy + (pt.y - orig_cy) * scale;
         }
+
+        let (s_min_x, s_min_y, s_max_x, s_max_y) = compute_bounds(&shape.points);
+        shape.x = s_min_x;
+        shape.y = s_min_y;
+        shape.width = (s_max_x - s_min_x).max(0.005);
+        shape.height = (s_max_y - s_min_y).max(0.005);
+        shape.precompute_triangles();
     }
 }
 
@@ -690,83 +712,138 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
     }
 
     // Cluster consecutive vertices into paths based on stream proximity (nominal stride = 34 bytes)
-    let mut current_path: Vec<StudioBezierVertex> = Vec::new();
-    let mut current_transform = AffineTransform2D::default();
-    let current_fill = egui::Color32::TRANSPARENT;
-    let current_stroke = egui::Color32::from_rgb(255, 0, 0); // Default Silhouette cut line: Red
+    struct PathCluster {
+        start_pos: usize,
+        end_pos: usize,
+        vertices: Vec<StudioBezierVertex>,
+    }
+
+    let mut path_clusters: Vec<PathCluster> = Vec::new();
+    let mut cur_cluster: Vec<(usize, StudioBezierVertex)> = Vec::new();
+
+    for (pos, vert) in vertices_with_pos {
+        if let Some(&(prev_pos, _)) = cur_cluster.last() {
+            let gap = pos.saturating_sub(prev_pos);
+            if gap > 48 {
+                if cur_cluster.len() >= 2 {
+                    let start_pos = cur_cluster.first().map(|p| p.0).unwrap_or(0);
+                    let end_pos = cur_cluster.last().map(|p| p.0 + 34).unwrap_or(start_pos);
+                    let vertices = cur_cluster.into_iter().map(|p| p.1).collect();
+                    path_clusters.push(PathCluster { start_pos, end_pos, vertices });
+                }
+                cur_cluster = Vec::new();
+            }
+        }
+        cur_cluster.push((pos, vert));
+    }
+    if cur_cluster.len() >= 2 {
+        let start_pos = cur_cluster.first().map(|p| p.0).unwrap_or(0);
+        let end_pos = cur_cluster.last().map(|p| p.0 + 34).unwrap_or(start_pos);
+        let vertices = cur_cluster.into_iter().map(|p| p.1).collect();
+        path_clusters.push(PathCluster { start_pos, end_pos, vertices });
+    }
+
+    if path_clusters.is_empty() {
+        return shapes;
+    }
+
+    // Determine matrix and fill for each cluster
+    let mut cluster_data: Vec<(AffineTransform2D, egui::Color32)> = Vec::new();
+    let mut last_valid_xfm = AffineTransform2D::default();
+    let mut last_valid_fill = egui::Color32::TRANSPARENT;
+
+    for idx in 0..path_clusters.len() {
+        let cluster = &path_clusters[idx];
+        let next_start = path_clusters.get(idx + 1).map(|p| p.start_pos).unwrap_or(stream.len());
+
+        // 1. Matrix: search in gap immediately following this cluster
+        let gap_start = cluster.end_pos;
+        let gap_end = next_start.min(gap_start.saturating_add(120)).min(stream.len());
+        let mut xfm = None;
+        if gap_start < gap_end {
+            if let Some(gap_slice) = stream.get(gap_start..gap_end) {
+                xfm = find_transform_in_slice(gap_slice);
+            }
+        }
+
+        // If not found in immediate gap, look ahead to next cluster's trailing gap (compound path contour)
+        if xfm.is_none() && idx + 1 < path_clusters.len() {
+            let next_end = path_clusters[idx + 1].end_pos;
+            let next_after_start = path_clusters.get(idx + 2).map(|p| p.start_pos).unwrap_or(stream.len());
+            let next_gap_end = next_after_start.min(next_end.saturating_add(120)).min(stream.len());
+            if next_end < next_gap_end {
+                if let Some(next_gap_slice) = stream.get(next_end..next_gap_end) {
+                    xfm = find_transform_in_slice(next_gap_slice);
+                }
+            }
+        }
+
+        // If still not found, check before start_pos
+        if xfm.is_none() {
+            let prefix_start = cluster.start_pos.saturating_sub(120);
+            if let Some(prefix_slice) = stream.get(prefix_start..cluster.start_pos) {
+                xfm = find_transform_in_slice(prefix_slice);
+            }
+        }
+
+        let final_xfm = match xfm {
+            Some(t) => {
+                last_valid_xfm = t;
+                t
+            }
+            None => last_valid_xfm,
+        };
+
+        // 2. Fill color: search in prefix before start_pos
+        let prefix_start = cluster.start_pos.saturating_sub(350);
+        let mut fill_color = None;
+        if let Some(prefix_slice) = stream.get(prefix_start..cluster.start_pos) {
+            fill_color = find_fill_color_in_slice(prefix_slice);
+        }
+
+        let final_fill = match fill_color {
+            Some(c) => {
+                last_valid_fill = c;
+                c
+            }
+            None => {
+                if last_valid_fill.a() > 0 {
+                    last_valid_fill
+                } else {
+                    egui::Color32::TRANSPARENT
+                }
+            }
+        };
+
+        cluster_data.push((final_xfm, final_fill));
+    }
+
+    // Document-wide unit check: check maximum transformed coordinate
+    let mut doc_max_coord: f32 = 0.0;
+    for (cluster, (xfm, _)) in path_clusters.iter().zip(cluster_data.iter()) {
+        for v in &cluster.vertices {
+            let p_tx = xfm.apply(v.anchor);
+            doc_max_coord = doc_max_coord.max(p_tx.x.abs().max(p_tx.y.abs()));
+        }
+    }
+
+    // In Silhouette Studio, coordinates are in points (72 pt = 1 in).
+    // If transformed coords exceed 24.0 (the largest physical cutting mat size in inches), scale by 1/72.
+    let scale_to_in = if doc_max_coord > 24.0 { 1.0 / 72.0 } else { 1.0 };
+
+    let current_stroke = egui::Color32::from_rgb(255, 38, 38); // Silhouette cut line: Red (#ff2626)
     let current_stroke_width = 0.02_f32; // ~1.5 pt
     let current_layer_id = 1_u64;
 
-    for k in 0..vertices_with_pos.len() {
-        let (pos, vert) = vertices_with_pos[k];
-
-        if k > 0 {
-            let prev_pos = vertices_with_pos[k - 1].0;
-            let gap = pos.saturating_sub(prev_pos);
-
-            // Stride between records in a single path is nominally 34 bytes (gap <= 48 bytes)
-            if gap > 48 {
-                // Finalize previous path
-                if current_path.len() >= 2 {
-                    if let Some(shape) = create_canvas_shape_from_vertices(
-                        &current_path,
-                        current_layer_id,
-                        Some(&current_transform),
-                        current_fill,
-                        current_stroke,
-                        current_stroke_width,
-                    ) {
-                        shapes.push(shape);
-                    }
-                }
-                current_path.clear();
-
-                // Look for affine transform following previous path or preceding current path
-                let search_start = prev_pos.saturating_add(34);
-                let search_end = pos.min(search_start.saturating_add(120)).min(stream.len());
-                if search_start < search_end {
-                    if let Some(gap_slice) = stream.get(search_start..search_end) {
-                        if let Some(xfm) = find_transform_in_slice(gap_slice) {
-                            current_transform = xfm;
-                        }
-                    }
-                }
-            }
-        } else {
-            // Check stream before the first vertex for transform or color
-            let prefix_end = pos.min(stream.len());
-            let prefix_start = prefix_end.saturating_sub(120);
-            if let Some(prefix_slice) = stream.get(prefix_start..prefix_end) {
-                if let Some(xfm) = find_transform_in_slice(prefix_slice) {
-                    current_transform = xfm;
-                }
-            }
-        }
-
-        current_path.push(vert);
-    }
-
-    if current_path.len() >= 2 {
-        // Check trailing bytes for final path transform
-        if let Some(&(last_pos, _)) = vertices_with_pos.last() {
-            let search_start = last_pos.saturating_add(34);
-            let search_end = (search_start + 120).min(stream.len());
-            if search_start < search_end {
-                if let Some(trailing_slice) = stream.get(search_start..search_end) {
-                    if let Some(xfm) = find_transform_in_slice(trailing_slice) {
-                        current_transform = xfm;
-                    }
-                }
-            }
-        }
-
+    for (cluster, (xfm, fill)) in path_clusters.into_iter().zip(cluster_data.into_iter()) {
         if let Some(shape) = create_canvas_shape_from_vertices(
-            &current_path,
+            &cluster.vertices,
             current_layer_id,
-            Some(&current_transform),
-            current_fill,
+            Some(&xfm),
+            fill,
             current_stroke,
             current_stroke_width,
+            scale_to_in,
         ) {
             shapes.push(shape);
         }
@@ -1013,6 +1090,7 @@ fn create_canvas_shape_from_vertices(
     fill_color: egui::Color32,
     stroke_color: egui::Color32,
     stroke_width: f32,
+    scale_to_in: f32,
 ) -> Option<CanvasShape> {
     if vertices.len() < 2 {
         return None;
@@ -1023,12 +1101,6 @@ fn create_canvas_shape_from_vertices(
     let last = vertices.last()?;
     let d = (first.anchor.x - last.anchor.x).hypot(first.anchor.y - last.anchor.y);
     let is_closed = d < 1.0 || vertices.len() >= 3;
-
-    let max_coord = vertices
-        .iter()
-        .map(|v| v.anchor.x.abs().max(v.anchor.y.abs()))
-        .fold(0.0_f32, f32::max);
-    let scale_to_in = if max_coord > 36.0 { 1.0 / 72.0 } else { 1.0 };
 
     let polyline = path_vertices_to_polyline(vertices, is_closed, transform, scale_to_in, 0.002);
     if polyline.len() < 2 {
@@ -1085,7 +1157,31 @@ fn find_transform_in_slice(slice: &[u8]) -> Option<AffineTransform2D> {
         }
     }
 
-    // 2. Look for valid 24-byte matrix [a, b, tx, c, d, ty] in slice
+    // 2. Look for valid 36-byte 3x3 matrix [a, b, tx, c, d, ty, 0, 0, 1] in slice
+    let mut i = 0;
+    while i + 36 <= slice.len() {
+        if let (Some(a), Some(b), Some(tx), Some(c), Some(d), Some(ty), Some(m20), Some(m21), Some(m22)) = (
+            read_f32_le(slice, i),
+            read_f32_le(slice, i + 4),
+            read_f32_le(slice, i + 8),
+            read_f32_le(slice, i + 12),
+            read_f32_le(slice, i + 16),
+            read_f32_le(slice, i + 20),
+            read_f32_le(slice, i + 24),
+            read_f32_le(slice, i + 28),
+            read_f32_le(slice, i + 32),
+        ) {
+            if m20.abs() < 1e-4 && m21.abs() < 1e-4 && (m22 - 1.0).abs() < 1e-4 {
+                let det = a * d - b * c;
+                if (0.001..500.0).contains(&det.abs()) && tx.abs() < 20_000.0 && ty.abs() < 20_000.0 {
+                    return Some(AffineTransform2D::new(a, b, tx, c, d, ty));
+                }
+            }
+        }
+        i = i.saturating_add(1);
+    }
+
+    // 3. Look for valid 24-byte matrix [a, b, tx, c, d, ty] in slice
     let mut i = 0;
     while i + 24 <= slice.len() {
         if let (Some(a), Some(b), Some(tx), Some(c), Some(d), Some(ty)) = (
@@ -1108,7 +1204,48 @@ fn find_transform_in_slice(slice: &[u8]) -> Option<AffineTransform2D> {
                 return Some(AffineTransform2D::new(a, b, tx, c, d, ty));
             }
         }
-        i = i.saturating_add(4);
+        i = i.saturating_add(1);
+    }
+
+    None
+}
+
+fn find_fill_color_in_slice(slice: &[u8]) -> Option<egui::Color32> {
+    if slice.len() < 16 {
+        return None;
+    }
+
+    // Look for 01 ea 00 00 00 marker (Silhouette Studio fill record)
+    let marker_ea: [u8; 5] = [0x01, 0xea, 0x00, 0x00, 0x00];
+    let mut search_from = slice.len();
+    while search_from >= 5 {
+        let sub = slice.get(..search_from)?;
+        if let Some(pos) = sub.windows(5).rposition(|w| w == marker_ea) {
+            for candidate_off in [pos + 7, pos + 5, pos + 8] {
+                if let (Some(r), Some(g), Some(b), Some(a)) = (
+                    read_f32_le(slice, candidate_off),
+                    read_f32_le(slice, candidate_off + 4),
+                    read_f32_le(slice, candidate_off + 8),
+                    read_f32_le(slice, candidate_off + 12),
+                ) {
+                    if (0.0..=1.0).contains(&r)
+                        && (0.0..=1.0).contains(&g)
+                        && (0.0..=1.0).contains(&b)
+                        && (a - 1.0).abs() < 1e-3
+                    {
+                        return Some(egui::Color32::from_rgba_unmultiplied(
+                            (r * 255.0).round() as u8,
+                            (g * 255.0).round() as u8,
+                            (b * 255.0).round() as u8,
+                            255,
+                        ));
+                    }
+                }
+            }
+            search_from = pos;
+        } else {
+            break;
+        }
     }
 
     None
@@ -1338,6 +1475,21 @@ mod tests {
     }
 
     #[test]
+    fn test_affine_matrix_multiplication() {
+        let parent = AffineTransform2D::new(2.0, 0.0, 10.0, 0.0, 3.0, 20.0);
+        let child = AffineTransform2D::new(1.0, 0.5, 5.0, -0.5, 1.0, 7.0);
+        let combined = parent * child;
+
+        let p = egui::pos2(4.0, 6.0);
+        let via_child_then_parent = parent.apply(child.apply(p));
+        let via_combined = combined.apply(p);
+
+        assert!((via_child_then_parent.x - via_combined.x).abs() < 1e-4);
+        assert!((via_child_then_parent.y - via_combined.y).abs() < 1e-4);
+        assert_eq!(parent.combine(&child), combined);
+    }
+
+    #[test]
     fn test_roundtrip_studio_v4_import() {
         let vertices = vec![
             StudioBezierVertex { anchor: egui::pos2(72.0, 72.0), handle_in: egui::pos2(72.0, 72.0), handle_out: egui::pos2(72.0, 72.0) },
@@ -1448,6 +1600,13 @@ mod tests {
             let doc1 = parse_studio_file(path1).expect("Parse Peeker Bears.studio");
             assert_eq!(doc1.version, StudioFormatVersion::StudioV4);
             assert!(doc1.shapes.len() >= 20, "Expected >= 20 shapes in Peeker Bears, got {}", doc1.shapes.len());
+
+            let mut min_x = f32::MAX;
+            let mut min_y = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut max_y = f32::MIN;
+            let mut colored_shapes = 0;
+
             for shape in &doc1.shapes {
                 assert!(shape.width > 0.0);
                 assert!(shape.height > 0.0);
@@ -1455,7 +1614,25 @@ mod tests {
                 assert!(shape.y.is_finite());
                 assert!(shape.x >= 0.0 && shape.x <= doc1.mat_width_in);
                 assert!(shape.y >= 0.0 && shape.y <= doc1.mat_height_in);
+
+                min_x = min_x.min(shape.x);
+                min_y = min_y.min(shape.y);
+                max_x = max_x.max(shape.x + shape.width);
+                max_y = max_y.max(shape.y + shape.height);
+
+                if shape.fill_color.a() > 0 {
+                    colored_shapes += 1;
+                }
             }
+
+            // Verify solid RGBA fill colors were extracted
+            assert!(colored_shapes >= 20, "Expected >= 20 filled shapes in Peeker Bears, got {}", colored_shapes);
+
+            // Verify shapes form a coherent, compact group on the 8.5x11 page instead of being scattered
+            let design_w = max_x - min_x;
+            let design_h = max_y - min_y;
+            assert!(design_w > 2.0 && design_w < 5.0, "Unexpected design width: {:.2} in", design_w);
+            assert!(design_h > 1.5 && design_h < 4.5, "Unexpected design height: {:.2} in", design_h);
 
             let svg1 = convert_studio_to_svg(&std::fs::read(path1).unwrap()).expect("Convert Peeker Bears to SVG");
             assert!(svg1.contains("<svg"));
