@@ -15,6 +15,12 @@ A lightweight, native Linux replacement for Silhouette Studio built in Rust with
   - `Rectangle` & `Ellipse`: Standard vector primitive shapes.
   - `Freehand`: Sampled polyline and closed-polygon drawing.
   - `Text`: TrueType font rendering with customizable font size and placement.
+- **Legacy Silhouette Studio Format Parser (`.studio` / `.studio3`)**:
+  - Direct binary import and conversion of proprietary Silhouette Studio `.studio` (`silhouette04;`) and `.studio3` (`silhouette05;`) files on Linux without Windows or Wine.
+  - Automatically identifies format headers and offsets (`0x0000` for v4, `0x0400` with section offset tables for v5).
+  - Parses cubic Bézier records (`01 21 00 00 00`), 2D affine transforms `[a, b, tx, c, d, ty]`, RGBA cut/fill colors, and mat presets (`12x12`, `letter`, in 72 pt/in units).
+  - Flattens Bézier curves via adaptive de Casteljau subdivision into smooth canvas polylines.
+  - **Batch Converter**: One-click folder batch conversion to export clean, standard vector `.svg` files for entire directories of Silhouette Studio files.
 - **High-Performance SVG Import**:
   - Parses complex multi-layer commercial SVG cutting files with `usvg` 0.45.
   - Renders exact SVG styles, CSS classes, linear/radial gradients, and `FillRule::EvenOdd` cutouts into a cached `egui::TextureHandle` via `resvg` 0.45.
@@ -49,16 +55,18 @@ silhouette-studio-linux/
 └── app/
     ├── Cargo.toml            # Dependencies: eframe, egui, tiny-skia, usvg, resvg, image, rfd
     └── src/
-        └── main.rs           # Core application architecture
+        ├── main.rs           # Core application UI, viewport, undo stack & tools
+        └── studio_format.rs  # Silhouette Studio binary parser, de Casteljau & SVG converter
 ```
 
-### Main Components in `app/src/main.rs`:
+### Main Components:
 
-| Struct / Enum | Role |
+| Struct / Enum / Module | Role |
 | :--- | :--- |
 | `Tool` | Active tool mode (`Select`, `Line`, `Rectangle`, `Ellipse`, `Text`, `Freehand`). |
 | `ShapeKind` | Vector shape classification (`Rectangle`, `Ellipse`, `Line`, `Freehand`, `Text`). |
 | `CanvasShape` | In-memory canvas object: mat-inch bounds, points, fill/stroke styling, precomputed triangles, `group_id`, `is_visible`, `is_locked`, and `is_svg_path`. |
+| `studio_format` | Binary parser & converter module decoding `silhouette04;` and `silhouette05;` streams, `01 21 00 00 00` Bézier knots, and affine transforms. |
 | `SerializableShape` | Serde-compatible representation of shapes for JSON project files. |
 | `CachedSvg` | Caches `tiny_skia::Pixmap` rasterization from `resvg` and GPU `egui::TextureHandle` for imported SVGs. |
 | `StudioApp` | Central application state: canvas viewport, tool selection, layer stack, mat dimensions, paper background, and event handling. |

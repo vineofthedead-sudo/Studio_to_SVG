@@ -1,3 +1,5 @@
+pub mod studio_format;
+
 use eframe::egui;
 use std::path::Path;
 
@@ -1499,6 +1501,92 @@ impl StudioApp {
         Ok(())
     }
 
+    // 4b. Import Silhouette Studio (.studio / .studio3) into CanvasShapes
+    pub fn import_studio_file(&mut self, path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+        let content = std::fs::read(path)?;
+        self.import_studio_bytes(&content)
+    }
+
+    pub fn import_studio_bytes(&mut self, bytes: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
+        let parsed = studio_format::parse_studio_data(bytes)?;
+        let count = parsed.shapes.len();
+        if count > 0 {
+            self.push_undo();
+
+            // Update mat size if specified in file
+            if parsed.mat_width_in > 0.0 && parsed.mat_height_in > 0.0 {
+                self.mat_width_in = parsed.mat_width_in;
+                self.mat_height_in = parsed.mat_height_in;
+            }
+
+            // Remap and register layer names and group IDs
+            let mut layer_map: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+            for (file_gid, name) in parsed.group_names {
+                let app_gid = self.next_group_id();
+                self.group_names.insert(app_gid, name);
+                layer_map.insert(file_gid, app_gid);
+            }
+
+            let start_idx = self.shapes.len();
+            for mut shape in parsed.shapes {
+                if let Some(old_gid) = shape.group_id {
+                    let new_gid = layer_map.get(&old_gid).copied().unwrap_or(old_gid);
+                    shape.group_id = Some(new_gid);
+                    shape.group_path = vec![new_gid];
+                }
+                self.shapes.push(shape);
+            }
+
+            self.selected_indices = (start_idx..self.shapes.len()).collect();
+            self.selected_index = Some(self.shapes.len() - 1);
+            self.sync_active_properties();
+        }
+        Ok(count)
+    }
+
+    // 4c. Batch convert .studio and .studio3 files in a directory to clean SVG files
+    pub fn batch_convert_studio_folder(&mut self, folder: &Path) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+        let mut converted = 0;
+        let mut errors = 0;
+
+        let entries = std::fs::read_dir(folder)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    let ext_lower = ext.to_lowercase();
+                    if ext_lower == "studio" || ext_lower == "studio3" {
+                        match std::fs::read(&path) {
+                            Ok(data) => {
+                                match studio_format::convert_studio_to_svg(&data) {
+                                    Ok(svg_str) => {
+                                        let mut out_path = path.clone();
+                                        out_path.set_extension("svg");
+                                        if let Err(e) = std::fs::write(&out_path, svg_str) {
+                                            eprintln!("Failed to write {}: {}", out_path.display(), e);
+                                            errors += 1;
+                                        } else {
+                                            converted += 1;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to parse {}: {:?}", path.display(), e);
+                                        errors += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to read {}: {}", path.display(), e);
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok((converted, errors))
+    }
+
     // 4. Import SVG into CanvasShapes with cached resvg texture
     pub fn import_svg_file(&mut self, path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
         let content = std::fs::read(path)?;
@@ -2306,6 +2394,39 @@ impl eframe::App for StudioApp {
                         ui.close_menu();
                     }
                     ui.separator();
+                    if ui.button("Open / Import .studio / .studio3...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Silhouette Studio Files (*.studio, *.studio3)", &["studio", "studio3"])
+                            .pick_file()
+                        {
+                            match self.import_studio_file(&path) {
+                                Ok(n) => self.set_status(format!("Imported {} shapes from Silhouette Studio file", n)),
+                                Err(e) => self.set_status(format!("Error importing Studio file: {}", e)),
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Batch Convert .studio to SVG...").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new()
+                            .set_title("Select Folder to Batch Convert Silhouette Studio Files")
+                            .pick_folder()
+                        {
+                            match self.batch_convert_studio_folder(&folder) {
+                                Ok((count, errs)) => {
+                                    if count == 0 && errs == 0 {
+                                        self.set_status("No .studio or .studio3 files found in folder");
+                                    } else if errs == 0 {
+                                        self.set_status(format!("Batch converted {} Silhouette Studio files to SVG", count));
+                                    } else {
+                                        self.set_status(format!("Batch converted {} files ({} failed)", count, errs));
+                                    }
+                                }
+                                Err(e) => self.set_status(format!("Batch conversion error: {}", e)),
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Import SVG...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Scalable Vector Graphics (*.svg)", &["svg"])
@@ -2415,6 +2536,28 @@ impl eframe::App for StudioApp {
                             self.shapes.clear();
                             self.cached_svgs.clear();
                             self.clear_selection();
+                        }
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Tools", |ui| {
+                    if ui.button("Batch Convert .studio to SVG...").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new()
+                            .set_title("Select Folder to Batch Convert Silhouette Studio Files")
+                            .pick_folder()
+                        {
+                            match self.batch_convert_studio_folder(&folder) {
+                                Ok((count, errs)) => {
+                                    if count == 0 && errs == 0 {
+                                        self.set_status("No .studio or .studio3 files found in folder");
+                                    } else if errs == 0 {
+                                        self.set_status(format!("Batch converted {} Silhouette Studio files to SVG", count));
+                                    } else {
+                                        self.set_status(format!("Batch converted {} files ({} failed)", count, errs));
+                                    }
+                                }
+                                Err(e) => self.set_status(format!("Batch conversion error: {}", e)),
+                            }
                         }
                         ui.close_menu();
                     }
@@ -4297,5 +4440,96 @@ mod tests {
         assert_eq!(shape.width, 8.0);
         assert_eq!(shape.height, 8.0);
         assert_eq!(shape.points[2], egui::pos2(10.0, 10.0));
+    }
+
+    #[test]
+    fn test_import_studio_with_undo_and_mat_resize() {
+        let mut app = StudioApp::new(None);
+        app.mat_width_in = 12.0;
+        app.mat_height_in = 12.0;
+        assert_eq!(app.shapes.len(), 0);
+
+        // Create synthetic studio v4 data with "letter" mat preset and a path
+        let vertices = vec![
+            studio_format::StudioBezierVertex { anchor: egui::pos2(72.0, 72.0), handle_in: egui::pos2(72.0, 72.0), handle_out: egui::pos2(72.0, 72.0) },
+            studio_format::StudioBezierVertex { anchor: egui::pos2(144.0, 72.0), handle_in: egui::pos2(144.0, 72.0), handle_out: egui::pos2(144.0, 72.0) },
+            studio_format::StudioBezierVertex { anchor: egui::pos2(144.0, 144.0), handle_in: egui::pos2(144.0, 144.0), handle_out: egui::pos2(144.0, 144.0) },
+            studio_format::StudioBezierVertex { anchor: egui::pos2(72.0, 144.0), handle_in: egui::pos2(72.0, 144.0), handle_out: egui::pos2(72.0, 144.0) },
+        ];
+        let path = studio_format::TestPathData {
+            layer_id: 1,
+            is_closed: true,
+            fill_color: [255, 0, 0, 255],
+            stroke_color: [0, 0, 0, 255],
+            stroke_width: 0.02,
+            transform: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            vertices,
+        };
+        let data = studio_format::create_test_v4_data("letter", "Cut Layer", &[path]);
+
+        // Import
+        let count = app.import_studio_bytes(&data).expect("Import succeeded");
+        assert_eq!(count, 1);
+        assert_eq!(app.shapes.len(), 1);
+        assert_eq!(app.mat_width_in, 8.5);
+        assert_eq!(app.mat_height_in, 11.0);
+
+        // Undo
+        app.undo();
+        assert_eq!(app.shapes.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_convert_studio_folder() {
+        let mut app = StudioApp::new(None);
+        let temp_dir = std::env::temp_dir().join(format!("studio_batch_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).expect("Create temp dir");
+
+        let vertices = vec![
+            studio_format::StudioBezierVertex { anchor: egui::pos2(0.0, 0.0), handle_in: egui::pos2(0.0, 0.0), handle_out: egui::pos2(0.0, 0.0) },
+            studio_format::StudioBezierVertex { anchor: egui::pos2(72.0, 0.0), handle_in: egui::pos2(72.0, 0.0), handle_out: egui::pos2(72.0, 0.0) },
+            studio_format::StudioBezierVertex { anchor: egui::pos2(72.0, 72.0), handle_in: egui::pos2(72.0, 72.0), handle_out: egui::pos2(72.0, 72.0) },
+        ];
+        let path = studio_format::TestPathData {
+            layer_id: 1,
+            is_closed: true,
+            fill_color: [100, 200, 50, 255],
+            stroke_color: [0, 0, 0, 255],
+            stroke_width: 0.02,
+            transform: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            vertices,
+        };
+
+        // File 1: .studio (v4)
+        let v4_data = studio_format::create_test_v4_data("12x12", "Layer 1", &[path.clone()]);
+        let file1 = temp_dir.join("design1.studio");
+        std::fs::write(&file1, v4_data).expect("write file1");
+
+        // File 2: .studio3 (v5)
+        let v5_data = studio_format::create_test_v5_data("letter", "Layer 2", &[path]);
+        let file2 = temp_dir.join("design2.studio3");
+        std::fs::write(&file2, v5_data).expect("write file2");
+
+        // Run batch conversion
+        let (converted, errors) = app.batch_convert_studio_folder(&temp_dir).expect("batch convert");
+        assert_eq!(converted, 2);
+        assert_eq!(errors, 0);
+
+        // Verify output SVG files exist
+        let svg1 = temp_dir.join("design1.svg");
+        let svg2 = temp_dir.join("design2.svg");
+        assert!(svg1.exists());
+        assert!(svg2.exists());
+
+        let svg1_content = std::fs::read_to_string(svg1).expect("read svg1");
+        assert!(svg1_content.contains("<svg"));
+        assert!(svg1_content.contains("<g id=\"Layer 1\">"));
+
+        let svg2_content = std::fs::read_to_string(svg2).expect("read svg2");
+        assert!(svg2_content.contains("<svg"));
+        assert!(svg2_content.contains("<g id=\"Layer 2\">"));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

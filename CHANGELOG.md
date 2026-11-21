@@ -8,7 +8,27 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ### Completed Tonight
 
-#### 1. Interactive Corner Resize Handles & Shift Aspect-Ratio Lock
+#### 1. Silhouette Studio Binary Format Parser & Converter (`.studio` / `.studio3`)
+- **Dedicated Parser Module (`app/src/studio_format.rs`)**:
+  - Full reverse-engineered binary container decoding for both legacy `.studio` (v2-v4) and modern `.studio3` (v4-v5) proprietary formats without requiring Windows or Silhouette Studio.
+- **Binary Header & Stream Detection**:
+  - `.studio` (`silhouette04;`): Serialized object stream detected directly at byte offset `0x0000`.
+  - `.studio3` (`silhouette05;`): 1,024-byte (`0x0400`) header with section offset table, followed by serialized `silhouette05;` object stream at `0x0400` (or stream offset designated in header table).
+- **Document Metadata & Units**:
+  - Parses mat dimensions (`12x12`, `letter`, `12x24`, `portrait`, `A4` in points: 72 pt = 1 in) and automatically configures the canvas mat size.
+  - Extracts semantic layer names (`Default Layer`, `Layer 1`, etc.) and maps them directly into `StudioApp::group_names`.
+- **Cubic Bézier Path Vertex Records (`01 21 00 00 00`)**:
+  - Decodes `01 21 00 00 00` marker records containing anchor coordinates `(x, y)` and incoming/outgoing control handles `(cx1, cy1)`, `(cx2, cy2)` as little-endian IEEE-754 `f32` values.
+  - Handles 2D affine transform matrices `[a, b, tx, c, d, ty]` applied to vertices.
+  - Preserves RGBA stroke colors (defaulting to standard `#FF0000` cut lines) and fill colors.
+- **Adaptive de Casteljau Subdivision**:
+  - Recursively subdivides cubic Bézier curves until chord deviation is within tolerance, generating smooth polylines with zero unnecessary points on straight segments.
+  - Generates `CanvasShape`s with precomputed polygon mesh triangulation for full-color on-mat rendering, vector SVG export, and high-DPI PNG export.
+- **UI Integration**:
+  - **File -> Open / Import .studio / .studio3...**: Native file picker filtered to `*.studio`, `*.studio3` with snapshot undo support and automatic mat size adjustment.
+  - **Tools / File -> Batch Convert .studio to SVG...**: Folder picker that scans directories for `.studio` and `.studio3` files and exports clean, standalone `.svg` vector files alongside them with live status count reporting.
+
+#### 2. Interactive Corner Resize Handles & Shift Aspect-Ratio Lock
 - **Draggable 4-Corner Handles**: Interactive 8px square handles at all 4 corners (`TopLeft`, `TopRight`, `BottomLeft`, `BottomRight`) on the selection bounding box for live mouse-driven scaling of individual shapes or entire multi-shape groups.
 - **Directional Cursor Icons**: Hovering or dragging over corners dynamically updates the cursor to `ResizeNwSe` or `ResizeNeSw`.
 - **Shift Key Aspect Ratio Lock**: Holding `Shift` while dragging any corner constrains scaling to preserve the selection's original aspect ratio.
@@ -98,11 +118,9 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ## Roadmap & Next Milestones
 
-1. **`.studio` / `.studio3` Legacy Format Support**:
-   - Reverse-engineer and parse proprietary Silhouette Studio v2/v3/v4 binary container formats (encrypted ZIP / zlib streams containing proprietary shape vectors, text styles, and cut settings) to allow opening existing library files directly on Linux.
-2. **Cardstock Offset / Contour Tool**:
+1. **Cardstock Offset / Contour Tool**:
    - Polygon buffering algorithm to create exterior or interior cut lines (offsets) around text and shapes for stickers, vinyl decals, and layered cardstock backing.
-3. **Rotation Transform Handle & Angle Readout**:
+2. **Rotation Transform Handle & Angle Readout**:
    - Top center rotation stalk handle for mouse-driven angular rotation of selections on the cutting mat with Shift-snapping (15-degree increments).
-4. **Direct USB Cutter Device Communication**:
+3. **Direct USB Cutter Device Communication**:
    - `libusb` interface for Silhouette Cameo (1-5), Portrait (1-4), and Curio cutters to send G-code / GP-GL commands directly over USB on Linux without Windows emulation.
