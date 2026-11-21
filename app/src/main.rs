@@ -45,6 +45,9 @@ pub struct CanvasShape {
     pub is_svg_path: bool,
     pub is_modified: bool,
     pub triangles: Vec<[usize; 3]>,
+    pub group_id: Option<u64>,
+    pub is_visible: bool,
+    pub is_locked: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -67,6 +70,16 @@ pub struct SerializableShape {
     pub is_svg_path: bool,
     #[serde(default)]
     pub is_modified: bool,
+    #[serde(default)]
+    pub group_id: Option<u64>,
+    #[serde(default = "default_true")]
+    pub is_visible: bool,
+    #[serde(default)]
+    pub is_locked: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -105,6 +118,9 @@ impl CanvasShape {
             is_closed: self.is_closed,
             is_svg_path: self.is_svg_path,
             is_modified: self.is_modified,
+            group_id: self.group_id,
+            is_visible: self.is_visible,
+            is_locked: self.is_locked,
         }
     }
 
@@ -133,6 +149,9 @@ impl CanvasShape {
             is_svg_path: s.is_svg_path,
             is_modified: s.is_modified,
             triangles: Vec::new(),
+            group_id: s.group_id,
+            is_visible: s.is_visible,
+            is_locked: s.is_locked,
         };
         shape.precompute_triangles();
         shape
@@ -334,9 +353,15 @@ pub struct StudioApp {
     pub shapes: Vec<CanvasShape>,
     pub cached_svgs: Vec<CachedSvg>,
     pub selected_index: Option<usize>,
+    pub selected_indices: std::collections::BTreeSet<usize>,
+    pub next_group_id: u64,
     pub drag_start: Option<egui::Pos2>,       // in mat inches
+    pub marquee_start: Option<egui::Pos2>,    // in mat inches
     pub freehand_points: Vec<egui::Pos2>,     // in mat inches
     pub is_dragging_shape: bool,
+    pub paper_texture: Option<egui::TextureHandle>,
+    pub paper_image: Option<egui::ColorImage>,
+    pub paper_bytes: Option<Vec<u8>>,
     pub status_message: Option<(String, std::time::Instant)>,
     pub screenshot_path: Option<String>,
     pub frames_rendered: u32,
@@ -356,13 +381,213 @@ impl StudioApp {
             shapes: Vec::new(),
             cached_svgs: Vec::new(),
             selected_index: None,
+            selected_indices: std::collections::BTreeSet::new(),
+            next_group_id: 0,
             drag_start: None,
+            marquee_start: None,
             freehand_points: Vec::new(),
             is_dragging_shape: false,
+            paper_texture: None,
+            paper_image: None,
+            paper_bytes: None,
             status_message: None,
             screenshot_path,
             frames_rendered: 0,
         }
+    }
+
+    pub fn is_selected(&self, idx: usize) -> bool {
+        self.selected_indices.contains(&idx) || self.selected_index == Some(idx)
+    }
+
+    pub fn all_selected_indices(&self) -> Vec<usize> {
+        let mut set = self.selected_indices.clone();
+        if let Some(i) = self.selected_index {
+            set.insert(i);
+        }
+        set.into_iter().filter(|&i| i < self.shapes.len()).collect()
+    }
+
+    pub fn select_shape(&mut self, idx: usize, multi: bool) {
+        if !multi {
+            self.selected_indices.clear();
+        }
+        if let Some(gid) = self.shapes.get(idx).and_then(|s| s.group_id) {
+            for (i, s) in self.shapes.iter().enumerate() {
+                if s.group_id == Some(gid) {
+                    self.selected_indices.insert(i);
+                }
+            }
+        } else {
+            self.selected_indices.insert(idx);
+        }
+        self.selected_index = Some(idx);
+        self.sync_active_properties();
+    }
+
+    pub fn toggle_select_shape(&mut self, idx: usize) {
+        let gid = self.shapes.get(idx).and_then(|s| s.group_id);
+        let was_selected = self.is_selected(idx);
+        if let Some(gid) = gid {
+            for (i, s) in self.shapes.iter().enumerate() {
+                if s.group_id == Some(gid) {
+                    if was_selected {
+                        self.selected_indices.remove(&i);
+                    } else {
+                        self.selected_indices.insert(i);
+                    }
+                }
+            }
+        } else {
+            if was_selected {
+                self.selected_indices.remove(&idx);
+            } else {
+                self.selected_indices.insert(idx);
+            }
+        }
+        self.selected_index = self.selected_indices.iter().copied().next_back();
+        self.sync_active_properties();
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected_indices.clear();
+        self.selected_index = None;
+    }
+
+    pub fn sync_active_properties(&mut self) {
+        if let Some(idx) = self.selected_index {
+            if let Some(s) = self.shapes.get(idx) {
+                self.fill_color = [
+                    s.fill_color.r() as f32 / 255.0,
+                    s.fill_color.g() as f32 / 255.0,
+                    s.fill_color.b() as f32 / 255.0,
+                ];
+                if s.kind == ShapeKind::Text && !s.text.is_empty() {
+                    self.text_sample = s.text.clone();
+                }
+            }
+        }
+    }
+
+    pub fn next_group_id(&mut self) -> u64 {
+        self.next_group_id += 1;
+        self.next_group_id
+    }
+
+    pub fn group_selected(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.len() >= 2 {
+            let gid = self.next_group_id();
+            for &idx in &sel {
+                if let Some(s) = self.shapes.get_mut(idx) {
+                    s.group_id = Some(gid);
+                }
+            }
+            self.set_status(format!("Grouped {} shapes", sel.len()));
+        } else if sel.len() == 1 {
+            self.set_status("Select at least 2 shapes to group");
+        }
+    }
+
+    pub fn ungroup_selected(&mut self) {
+        let sel = self.all_selected_indices();
+        let mut count = 0;
+        for &idx in &sel {
+            if let Some(s) = self.shapes.get_mut(idx) {
+                if s.group_id.is_some() {
+                    s.group_id = None;
+                    s.is_modified = true;
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            self.set_status(format!("Ungrouped {} shapes", count));
+        } else {
+            self.set_status("No grouped shapes selected");
+        }
+    }
+
+    pub fn bring_to_front(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() || sel.len() == self.shapes.len() {
+            return;
+        }
+        let mut selected_shapes = Vec::new();
+        let mut unselected_shapes = Vec::new();
+        for (i, shape) in self.shapes.drain(..).enumerate() {
+            if sel.contains(&i) {
+                selected_shapes.push(shape);
+            } else {
+                unselected_shapes.push(shape);
+            }
+        }
+        let unsel_count = unselected_shapes.len();
+        self.shapes = unselected_shapes;
+        self.shapes.extend(selected_shapes);
+        self.selected_indices = (unsel_count..self.shapes.len()).collect();
+        self.selected_index = self.shapes.len().checked_sub(1);
+        self.set_status("Brought to front");
+    }
+
+    pub fn send_to_back(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() || sel.len() == self.shapes.len() {
+            return;
+        }
+        let mut selected_shapes = Vec::new();
+        let mut unselected_shapes = Vec::new();
+        for (i, shape) in self.shapes.drain(..).enumerate() {
+            if sel.contains(&i) {
+                selected_shapes.push(shape);
+            } else {
+                unselected_shapes.push(shape);
+            }
+        }
+        let sel_count = selected_shapes.len();
+        selected_shapes.extend(unselected_shapes);
+        self.shapes = selected_shapes;
+        self.selected_indices = (0..sel_count).collect();
+        self.selected_index = Some(0);
+        self.set_status("Sent to back");
+    }
+
+    pub fn bring_forward(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() {
+            return;
+        }
+        let mut new_sel = std::collections::BTreeSet::new();
+        for &idx in sel.iter().rev() {
+            if idx + 1 < self.shapes.len() && !sel.contains(&(idx + 1)) {
+                self.shapes.swap(idx, idx + 1);
+                new_sel.insert(idx + 1);
+            } else {
+                new_sel.insert(idx);
+            }
+        }
+        self.selected_indices = new_sel;
+        self.selected_index = self.selected_indices.iter().copied().next_back();
+        self.set_status("Brought forward");
+    }
+
+    pub fn send_backward(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() {
+            return;
+        }
+        let mut new_sel = std::collections::BTreeSet::new();
+        for &idx in &sel {
+            if idx > 0 && !sel.contains(&(idx - 1)) {
+                self.shapes.swap(idx, idx - 1);
+                new_sel.insert(idx - 1);
+            } else {
+                new_sel.insert(idx);
+            }
+        }
+        self.selected_indices = new_sel;
+        self.selected_index = self.selected_indices.iter().copied().next();
+        self.set_status("Sent backward");
     }
 
     pub fn current_color32(&self) -> egui::Color32 {
@@ -400,7 +625,7 @@ impl StudioApp {
         self.mat_height_in = data.mat_height_in;
         self.shapes = data.shapes.into_iter().map(CanvasShape::from_serializable).collect();
         self.cached_svgs.clear();
-        self.selected_index = None;
+        self.clear_selection();
         Ok(())
     }
 
@@ -530,6 +755,20 @@ impl StudioApp {
             pb.line_to(w as f32, y);
             if let Some(path) = pb.finish() {
                 pixmap.stroke_path(&path, &grid_paint, &grid_stroke, tiny_skia::Transform::identity(), None);
+            }
+        }
+
+        // Optional paper background image
+        if let Some(ref bytes) = self.paper_bytes {
+            if let Ok(dyn_img) = image::load_from_memory(bytes) {
+                let rgba = dyn_img.to_rgba8();
+                let (pw, ph) = rgba.dimensions();
+                if let Some(paper_pixmap) = tiny_skia::Pixmap::from_vec(rgba.into_raw(), tiny_skia::IntSize::from_wh(pw, ph).unwrap()) {
+                    let sx = w as f32 / pw as f32;
+                    let sy = h as f32 / ph as f32;
+                    let ts = tiny_skia::Transform::from_scale(sx, sy);
+                    pixmap.draw_pixmap(0, 0, paper_pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), ts, None);
+                }
             }
         }
 
@@ -752,12 +991,15 @@ impl StudioApp {
         let mut imported = import_svg_data(bytes, self.current_color32());
         let count = imported.len();
         if count > 0 {
+            let gid = self.next_group_id();
             let start_idx = self.shapes.len();
             for s in &mut imported {
                 s.is_svg_path = true;
+                s.group_id = Some(gid);
                 s.precompute_triangles();
             }
             self.shapes.extend(imported);
+            self.selected_indices = (start_idx..self.shapes.len()).collect();
             self.selected_index = Some(self.shapes.len() - 1);
 
             self.cached_svgs.push(CachedSvg {
@@ -888,6 +1130,9 @@ pub fn import_svg_data(bytes: &[u8], default_color: egui::Color32) -> Vec<Canvas
                 is_svg_path: true,
                 is_modified: false,
                 triangles: Vec::new(),
+                group_id: None,
+                is_visible: true,
+                is_locked: false,
             };
             shape.precompute_triangles();
             result.push(shape);
@@ -1230,6 +1475,16 @@ impl eframe::App for StudioApp {
             }
         }
 
+        if self.paper_texture.is_none() {
+            if let Some(ref img) = self.paper_image {
+                self.paper_texture = Some(ctx.load_texture(
+                    "paper_background",
+                    img.clone(),
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+
         if self.screenshot_path.is_some() {
             ctx.request_repaint();
             self.frames_rendered += 1;
@@ -1254,12 +1509,20 @@ impl eframe::App for StudioApp {
         // Keyboard shortcuts
         if !ctx.wants_keyboard_input() {
             if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
-                if let Some(idx) = self.selected_index {
-                    if idx < self.shapes.len() {
+                let mut to_remove = self.all_selected_indices();
+                to_remove.sort_unstable();
+                for &idx in to_remove.iter().rev() {
+                    if idx < self.shapes.len() && !self.shapes[idx].is_locked {
                         self.shapes.remove(idx);
-                        self.selected_index = None;
                     }
                 }
+                self.clear_selection();
+            }
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::G)) {
+                self.group_selected();
+            }
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.shift && i.key_pressed(egui::Key::G)) {
+                self.ungroup_selected();
             }
         }
 
@@ -1270,7 +1533,7 @@ impl eframe::App for StudioApp {
                     if ui.button("New Design").clicked() {
                         self.shapes.clear();
                         self.cached_svgs.clear();
-                        self.selected_index = None;
+                        self.clear_selection();
                         self.pan = egui::Vec2::ZERO;
                         self.zoom = 1.0;
                         ui.close_menu();
@@ -1351,20 +1614,50 @@ impl eframe::App for StudioApp {
                         self.pan = egui::Vec2::ZERO;
                         ui.close_menu();
                     }
-                    let has_sel = self.selected_index.is_some();
+                    ui.separator();
+                    let sel_count = self.all_selected_indices().len();
+                    if ui.add_enabled(sel_count >= 2, egui::Button::new("Group (Ctrl+G)")).clicked() {
+                        self.group_selected();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(sel_count >= 1, egui::Button::new("Ungroup (Ctrl+Shift+G)")).clicked() {
+                        self.ungroup_selected();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(sel_count >= 1, egui::Button::new("Bring to Front")).clicked() {
+                        self.bring_to_front();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(sel_count >= 1, egui::Button::new("Bring Forward")).clicked() {
+                        self.bring_forward();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(sel_count >= 1, egui::Button::new("Send Backward")).clicked() {
+                        self.send_backward();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(sel_count >= 1, egui::Button::new("Send to Back")).clicked() {
+                        self.send_to_back();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    let has_sel = sel_count > 0;
                     if ui.add_enabled(has_sel, egui::Button::new("Delete Selected")).clicked() {
-                        if let Some(idx) = self.selected_index {
-                            if idx < self.shapes.len() {
+                        let mut to_remove = self.all_selected_indices();
+                        to_remove.sort_unstable();
+                        for &idx in to_remove.iter().rev() {
+                            if idx < self.shapes.len() && !self.shapes[idx].is_locked {
                                 self.shapes.remove(idx);
-                                self.selected_index = None;
                             }
                         }
+                        self.clear_selection();
                         ui.close_menu();
                     }
                     if ui.button("Clear All Shapes").clicked() {
                         self.shapes.clear();
                         self.cached_svgs.clear();
-                        self.selected_index = None;
+                        self.clear_selection();
                         ui.close_menu();
                     }
                 });
@@ -1423,9 +1716,9 @@ impl eframe::App for StudioApp {
         });
 
         // Right inspector panel
-        egui::SidePanel::right("right_panels").default_width(240.0).show(ctx, |ui| {
+        egui::SidePanel::right("right_panels").default_width(260.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                for tab in ["Page Setup", "Fill", "Text", "Transform"] {
+                for tab in ["Page Setup", "Layers", "Fill", "Text", "Transform"] {
                     if ui.selectable_label(self.right_panel == tab, tab).clicked() {
                         self.right_panel = tab;
                     }
@@ -1437,6 +1730,144 @@ impl eframe::App for StudioApp {
                     ui.heading("Page Setup");
                     ui.add(egui::Slider::new(&mut self.mat_width_in, 4.0..=24.0).text("Width (in)"));
                     ui.add(egui::Slider::new(&mut self.mat_height_in, 4.0..=24.0).text("Height (in)"));
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.heading("Paper Background");
+                    if self.paper_image.is_some() {
+                        ui.label("Custom background paper loaded.");
+                        if ui.button("🗑 Clear Paper").clicked() {
+                            self.paper_texture = None;
+                            self.paper_image = None;
+                            self.paper_bytes = None;
+                            self.set_status("Paper background cleared");
+                        }
+                    } else {
+                        if ui.button("🖼 Import Paper Background...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Images (*.png, *.jpg, *.jpeg)", &["png", "jpg", "jpeg"])
+                                .pick_file()
+                            {
+                                match std::fs::read(&path) {
+                                    Ok(bytes) => {
+                                        match image::load_from_memory(&bytes) {
+                                            Ok(dyn_img) => {
+                                                let rgba = dyn_img.to_rgba8();
+                                                let (w, h) = rgba.dimensions();
+                                                let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                                                    [w as usize, h as usize],
+                                                    &rgba.into_raw(),
+                                                );
+                                                self.paper_image = Some(color_img);
+                                                self.paper_texture = None;
+                                                self.paper_bytes = Some(bytes);
+                                                self.set_status("Imported paper background");
+                                            }
+                                            Err(e) => self.set_status(format!("Error decoding image: {}", e)),
+                                        }
+                                    }
+                                    Err(e) => self.set_status(format!("Error reading file: {}", e)),
+                                }
+                            }
+                        }
+                    }
+                }
+                "Layers" => {
+                    ui.heading("Layers");
+                    ui.horizontal(|ui| {
+                        let has_sel = !self.all_selected_indices().is_empty();
+                        if ui.add_enabled(has_sel, egui::Button::new("⏏ Front")).on_hover_text("Bring to Front").clicked() {
+                            self.bring_to_front();
+                        }
+                        if ui.add_enabled(has_sel, egui::Button::new("▲ Up")).on_hover_text("Bring Forward").clicked() {
+                            self.bring_forward();
+                        }
+                        if ui.add_enabled(has_sel, egui::Button::new("▼ Down")).on_hover_text("Send Backward").clicked() {
+                            self.send_backward();
+                        }
+                        if ui.add_enabled(has_sel, egui::Button::new("⏷ Back")).on_hover_text("Send to Back").clicked() {
+                            self.send_to_back();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let sel_count = self.all_selected_indices().len();
+                        if ui.add_enabled(sel_count >= 2, egui::Button::new("🔗 Group")).on_hover_text("Group Selected (Ctrl+G)").clicked() {
+                            self.group_selected();
+                        }
+                        if ui.add_enabled(sel_count >= 1, egui::Button::new("🔓 Ungroup")).on_hover_text("Ungroup Selected (Ctrl+Shift+G)").clicked() {
+                            self.ungroup_selected();
+                        }
+                    });
+                    ui.separator();
+
+                    egui::ScrollArea::vertical().max_height(450.0).show(ui, |ui| {
+                        if self.shapes.is_empty() {
+                            ui.label("No shapes on mat.");
+                        }
+                        // Top-to-bottom z-order (highest index first)
+                        for i in (0..self.shapes.len()).rev() {
+                            let is_sel = self.is_selected(i);
+                            let shape = &self.shapes[i];
+                            let kind_label = match shape.kind {
+                                ShapeKind::Rectangle => "Rectangle",
+                                ShapeKind::Ellipse => "Ellipse",
+                                ShapeKind::Line => "Line",
+                                ShapeKind::Freehand => if shape.is_svg_path { "SVG Path" } else { "Freehand" },
+                                ShapeKind::Text => "Text",
+                            };
+                            let group_suffix = if let Some(gid) = shape.group_id {
+                                format!(" [G{}]", gid)
+                            } else {
+                                String::new()
+                            };
+                            let row_label = format!("{}{}", kind_label, group_suffix);
+                            let vis_icon = if shape.is_visible { "👁" } else { "🚫" };
+                            let lock_icon = if shape.is_locked { "🔒" } else { "🔓" };
+
+                            let mut row_clicked = false;
+                            let mut vis_toggled = false;
+                            let mut lock_toggled = false;
+
+                            ui.horizontal(|ui| {
+                                if ui.small_button(vis_icon).clicked() {
+                                    vis_toggled = true;
+                                }
+                                if ui.small_button(lock_icon).clicked() {
+                                    lock_toggled = true;
+                                }
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                let swatch_color = if shape.fill_color.a() > 0 {
+                                    shape.fill_color
+                                } else if let Some(sc) = shape.stroke_color {
+                                    sc
+                                } else {
+                                    egui::Color32::BLACK
+                                };
+                                ui.painter().rect_filled(rect, 2.0, swatch_color);
+                                ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::GRAY));
+
+                                let resp = ui.selectable_label(is_sel, row_label);
+                                if resp.clicked() {
+                                    row_clicked = true;
+                                }
+                            });
+
+                            if vis_toggled {
+                                self.shapes[i].is_visible = !self.shapes[i].is_visible;
+                            }
+                            if lock_toggled {
+                                self.shapes[i].is_locked = !self.shapes[i].is_locked;
+                            }
+                            if row_clicked {
+                                let shift = ui.input(|inp| inp.modifiers.shift);
+                                if shift {
+                                    self.toggle_select_shape(i);
+                                } else {
+                                    self.select_shape(i, false);
+                                }
+                            }
+                        }
+                    });
                 }
                 "Fill" => {
                     ui.heading("Color Fill");
@@ -1590,8 +2021,16 @@ impl eframe::App for StudioApp {
                 )
             };
 
-            // Mat background and grid lines
+            // Mat background and paper image (if loaded)
             painter.rect_filled(mat_rect, 2.0, egui::Color32::WHITE);
+            if let Some(paper_tex) = &self.paper_texture {
+                painter.image(
+                    paper_tex.id(),
+                    mat_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
             painter.rect_stroke(mat_rect, 2.0_f32, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 150, 214)));
             let grid_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(225));
             for c in 1..(self.mat_width_in.ceil() as i32) {
@@ -1615,20 +2054,23 @@ impl eframe::App for StudioApp {
                     match self.active_tool {
                         Tool::Select => {
                             let hit = self.shapes.iter().enumerate().rev().find(|(_, s)| {
-                                s.hit_test(mat_pos, hit_tol)
+                                s.is_visible && s.hit_test(mat_pos, hit_tol)
                             }).map(|(i, _)| i);
-                            self.selected_index = hit;
-                            self.is_dragging_shape = hit.is_some();
+                            let is_shift = ctx.input(|i| i.modifiers.shift);
                             if let Some(idx) = hit {
-                                let s = &self.shapes[idx];
-                                self.fill_color = [
-                                    s.fill_color.r() as f32 / 255.0,
-                                    s.fill_color.g() as f32 / 255.0,
-                                    s.fill_color.b() as f32 / 255.0,
-                                ];
-                                if s.kind == ShapeKind::Text && !s.text.is_empty() {
-                                    self.text_sample = s.text.clone();
+                                if is_shift {
+                                    self.toggle_select_shape(idx);
+                                } else if !self.is_selected(idx) {
+                                    self.select_shape(idx, false);
                                 }
+                                self.is_dragging_shape = !self.shapes[idx].is_locked;
+                                self.marquee_start = None;
+                            } else {
+                                if !is_shift {
+                                    self.clear_selection();
+                                }
+                                self.marquee_start = Some(mat_pos);
+                                self.is_dragging_shape = false;
                             }
                         }
                         Tool::Rectangle | Tool::Ellipse | Tool::Line => {
@@ -1647,10 +2089,12 @@ impl eframe::App for StudioApp {
                 match self.active_tool {
                     Tool::Select => {
                         if self.is_dragging_shape {
-                            if let Some(idx) = self.selected_index {
+                            let delta_in = response.drag_delta() / px_per_in;
+                            for idx in self.all_selected_indices() {
                                 if let Some(shape) = self.shapes.get_mut(idx) {
-                                    let delta_in = response.drag_delta() / px_per_in;
-                                    shape.translate(delta_in);
+                                    if !shape.is_locked {
+                                        shape.translate(delta_in);
+                                    }
                                 }
                             }
                         }
@@ -1722,8 +2166,11 @@ impl eframe::App for StudioApp {
                                 is_svg_path: false,
                                 is_modified: false,
                                 triangles: vec![],
+                                group_id: None,
+                                is_visible: true,
+                                is_locked: false,
                             });
-                            self.selected_index = Some(self.shapes.len() - 1);
+                            self.select_shape(self.shapes.len() - 1, false);
                         }
                         _ => {}
                     }
@@ -1738,6 +2185,24 @@ impl eframe::App for StudioApp {
                 self.is_dragging_shape = false;
                 let curr_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
                 let curr_mat = curr_pos.map(screen_to_mat);
+
+                if let Some(start) = self.marquee_start.take() {
+                    let end = curr_mat.unwrap_or(start);
+                    let min_x = start.x.min(end.x);
+                    let min_y = start.y.min(end.y);
+                    let max_x = start.x.max(end.x);
+                    let max_y = start.y.max(end.y);
+                    if (max_x - min_x) > 0.05 || (max_y - min_y) > 0.05 {
+                        let box_rect = egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
+                        for (i, shape) in self.shapes.iter().enumerate() {
+                            if shape.is_visible && shape.bounding_rect().intersects(box_rect) {
+                                self.selected_indices.insert(i);
+                                self.selected_index = Some(i);
+                            }
+                        }
+                        self.sync_active_properties();
+                    }
+                }
 
                 if let Some(start) = self.drag_start.take() {
                     let end = curr_mat.unwrap_or(start);
@@ -1763,8 +2228,11 @@ impl eframe::App for StudioApp {
                                     is_svg_path: false,
                                     is_modified: false,
                                     triangles: vec![],
+                                    group_id: None,
+                                    is_visible: true,
+                                    is_locked: false,
                                 });
-                                self.selected_index = Some(self.shapes.len() - 1);
+                                self.select_shape(self.shapes.len() - 1, false);
                             }
                         }
                         Tool::Ellipse => {
@@ -1788,8 +2256,11 @@ impl eframe::App for StudioApp {
                                     is_svg_path: false,
                                     is_modified: false,
                                     triangles: vec![],
+                                    group_id: None,
+                                    is_visible: true,
+                                    is_locked: false,
                                 });
-                                self.selected_index = Some(self.shapes.len() - 1);
+                                self.select_shape(self.shapes.len() - 1, false);
                             }
                         }
                         Tool::Line => {
@@ -1814,8 +2285,11 @@ impl eframe::App for StudioApp {
                                     is_svg_path: false,
                                     is_modified: false,
                                     triangles: vec![],
+                                    group_id: None,
+                                    is_visible: true,
+                                    is_locked: false,
                                 });
-                                self.selected_index = Some(self.shapes.len() - 1);
+                                self.select_shape(self.shapes.len() - 1, false);
                             }
                         }
                         _ => {}
@@ -1849,10 +2323,13 @@ impl eframe::App for StudioApp {
                             is_svg_path: false,
                             is_modified: false,
                             triangles: vec![],
+                            group_id: None,
+                            is_visible: true,
+                            is_locked: false,
                         };
                         shape.precompute_triangles();
                         self.shapes.push(shape);
-                        self.selected_index = Some(self.shapes.len() - 1);
+                        self.select_shape(self.shapes.len() - 1, false);
                     } else {
                         self.freehand_points.clear();
                     }
@@ -1877,8 +2354,13 @@ impl eframe::App for StudioApp {
             // Render shapes over the grid using fill_color and stroke settings
             let has_cached_svg = !self.cached_svgs.is_empty();
             let black_stroke = egui::Stroke::new(2.0_f32, egui::Color32::BLACK);
+            let sel_set = self.selected_indices.clone();
+            let sel_single = self.selected_index;
             for (i, shape) in self.shapes.iter_mut().enumerate() {
-                let is_selected = self.selected_index == Some(i);
+                if !shape.is_visible {
+                    continue;
+                }
+                let is_selected = sel_set.contains(&i) || sel_single == Some(i);
 
                 if has_cached_svg && shape.is_svg_path && !shape.is_modified {
                     if is_selected {
@@ -2040,11 +2522,39 @@ impl eframe::App for StudioApp {
                 }
             }
 
-            // Dashed bounding box for selected shape
-            if let Some(idx) = self.selected_index {
-                if let Some(shape) = self.shapes.get(idx) {
-                    let screen_min = mat_to_screen(egui::pos2(shape.x, shape.y));
-                    let screen_size = egui::vec2(shape.width * px_per_in, shape.height * px_per_in);
+            // Live marquee drag selection rectangle
+            if let Some(start) = self.marquee_start {
+                let curr_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+                if let Some(pos) = curr_pos {
+                    let s_r = egui::Rect::from_two_pos(mat_to_screen(start), pos);
+                    painter.rect_filled(s_r, 0.0, egui::Color32::from_rgba_unmultiplied(0, 150, 255, 30));
+                    draw_dashed_rect(&painter, s_r, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0, 150, 255)), 5.0, 3.0);
+                }
+            }
+
+            // Dashed bounding box for all selected shapes (combined bounds for groups/multi-selection)
+            let sel_indices = self.all_selected_indices();
+            if !sel_indices.is_empty() {
+                let mut min_x = f32::MAX;
+                let mut min_y = f32::MAX;
+                let mut max_x = f32::MIN;
+                let mut max_y = f32::MIN;
+                let mut any_visible = false;
+                for &idx in &sel_indices {
+                    if let Some(shape) = self.shapes.get(idx) {
+                        if shape.is_visible {
+                            any_visible = true;
+                            let r = shape.bounding_rect();
+                            min_x = min_x.min(r.min.x);
+                            min_y = min_y.min(r.min.y);
+                            max_x = max_x.max(r.max.x);
+                            max_y = max_y.max(r.max.y);
+                        }
+                    }
+                }
+                if any_visible && max_x > min_x && max_y > min_y {
+                    let screen_min = mat_to_screen(egui::pos2(min_x, min_y));
+                    let screen_size = egui::vec2((max_x - min_x) * px_per_in, (max_y - min_y) * px_per_in);
                     let bounding_rect = egui::Rect::from_min_size(screen_min, screen_size).expand(3.0);
                     let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 120, 215));
                     draw_dashed_rect(&painter, bounding_rect, stroke, 6.0, 4.0);
@@ -2105,6 +2615,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Line,
@@ -2121,6 +2634,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
 
         let tmp_path = std::env::temp_dir().join("test_silhouette_project.json");
@@ -2158,6 +2674,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Ellipse,
@@ -2174,6 +2693,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Line,
@@ -2190,6 +2712,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Freehand,
@@ -2206,6 +2731,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Text,
@@ -2222,6 +2750,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
 
         let svg = app.export_svg_string();
@@ -2279,6 +2810,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
 
         let tmp_png = std::env::temp_dir().join("test_export_mat.png");
@@ -2309,6 +2843,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Ellipse,
@@ -2325,6 +2862,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Line,
@@ -2341,6 +2881,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Freehand,
@@ -2357,6 +2900,9 @@ mod tests {
             is_svg_path: false,
             is_modified: false,
             triangles: vec![],
+            group_id: None,
+            is_visible: true,
+            is_locked: false,
         });
 
         let svg_str = app.export_svg_string();
@@ -2436,5 +2982,81 @@ mod tests {
         assert_eq!(app.shapes.len(), 2);
         assert!(app.shapes[0].is_svg_path);
         assert!(app.shapes[1].is_svg_path);
+    }
+    #[test]
+    fn test_grouping_and_ungrouping() {
+        let mut app = StudioApp::new(None);
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 1.0, y: 1.0, width: 2.0, height: 2.0, points: vec![],
+            text: String::new(), fill_color: egui::Color32::RED, stroke_color: None, stroke_width: 0.0,
+            is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
+            group_id: None, is_visible: true, is_locked: false,
+        });
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Ellipse,
+            x: 4.0, y: 4.0, width: 2.0, height: 2.0, points: vec![],
+            text: String::new(), fill_color: egui::Color32::BLUE, stroke_color: None, stroke_width: 0.0,
+            is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
+            group_id: None, is_visible: true, is_locked: false,
+        });
+
+        app.select_shape(0, false);
+        app.select_shape(1, true); // multi-select
+        assert_eq!(app.all_selected_indices().len(), 2);
+
+        app.group_selected();
+        assert!(app.shapes[0].group_id.is_some());
+        assert_eq!(app.shapes[0].group_id, app.shapes[1].group_id);
+
+        // Selecting shape 0 should now automatically select shape 1 via group_id
+        app.clear_selection();
+        app.select_shape(0, false);
+        assert_eq!(app.all_selected_indices().len(), 2);
+
+        // Ungroup
+        app.ungroup_selected();
+        assert!(app.shapes[0].group_id.is_none());
+        assert!(app.shapes[1].group_id.is_none());
+    }
+
+    #[test]
+    fn test_layer_reordering() {
+        let mut app = StudioApp::new(None);
+        for i in 0..3 {
+            app.shapes.push(CanvasShape {
+                kind: ShapeKind::Rectangle,
+                x: i as f32, y: 0.0, width: 1.0, height: 1.0, points: vec![],
+                text: format!("Shape {}", i), fill_color: egui::Color32::RED, stroke_color: None, stroke_width: 0.0,
+                is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
+                group_id: None, is_visible: true, is_locked: false,
+            });
+        }
+        // Initial order: Shape 0, Shape 1, Shape 2
+        app.select_shape(0, false);
+        app.bring_to_front();
+        assert_eq!(app.shapes[2].text, "Shape 0");
+
+        app.send_to_back();
+        assert_eq!(app.shapes[0].text, "Shape 0");
+
+        app.bring_forward();
+        assert_eq!(app.shapes[1].text, "Shape 0");
+
+        app.send_backward();
+        assert_eq!(app.shapes[0].text, "Shape 0");
+    }
+
+    #[test]
+    fn test_svg_import_grouped() {
+        let mut app = StudioApp::new(None);
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4in" height="4in" viewBox="0 0 400 400">
+            <rect x="10" y="10" width="100" height="100" fill="red" />
+            <circle cx="200" cy="200" r="50" fill="blue" />
+        </svg>"##;
+        app.import_svg_bytes(svg.as_bytes()).unwrap();
+        assert_eq!(app.shapes.len(), 2);
+        assert!(app.shapes[0].group_id.is_some());
+        assert_eq!(app.shapes[0].group_id, app.shapes[1].group_id);
     }
 }
