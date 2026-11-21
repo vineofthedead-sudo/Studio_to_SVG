@@ -331,14 +331,16 @@ fn escape_xml(s: &str) -> String {
 }
 
 pub struct CachedSvg {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    pub group_id: u64,
+    pub init_min_x: f32,
+    pub init_min_y: f32,
+    pub init_width: f32,
+    pub init_height: f32,
+    pub orig_svg_width: f32,
+    pub orig_svg_height: f32,
+    pub orig_shape_count: usize,
     pub pixmap: tiny_skia::Pixmap,
     pub texture: Option<egui::TextureHandle>,
-    pub shape_start_idx: usize,
-    pub shape_count: usize,
 }
 
 pub struct StudioApp {
@@ -354,6 +356,7 @@ pub struct StudioApp {
     pub cached_svgs: Vec<CachedSvg>,
     pub selected_index: Option<usize>,
     pub selected_indices: std::collections::BTreeSet<usize>,
+    pub expanded_groups: std::collections::BTreeSet<u64>,
     pub next_group_id: u64,
     pub drag_start: Option<egui::Pos2>,       // in mat inches
     pub marquee_start: Option<egui::Pos2>,    // in mat inches
@@ -382,6 +385,7 @@ impl StudioApp {
             cached_svgs: Vec::new(),
             selected_index: None,
             selected_indices: std::collections::BTreeSet::new(),
+            expanded_groups: std::collections::BTreeSet::new(),
             next_group_id: 0,
             drag_start: None,
             marquee_start: None,
@@ -506,6 +510,63 @@ impl StudioApp {
         } else {
             self.set_status("No grouped shapes selected");
         }
+    }
+
+    pub fn get_group_bounds(&self, gid: u64) -> Option<(f32, f32, f32, f32, usize, bool)> {
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        let mut count = 0;
+        let mut any_visible = false;
+        for s in &self.shapes {
+            if s.group_id == Some(gid) {
+                count += 1;
+                if s.is_visible {
+                    any_visible = true;
+                    min_x = min_x.min(s.x);
+                    min_y = min_y.min(s.y);
+                    max_x = max_x.max(s.x + s.width);
+                    max_y = max_y.max(s.y + s.height);
+                }
+            }
+        }
+        if count > 0 {
+            Some((min_x, min_y, max_x, max_y, count, any_visible))
+        } else {
+            None
+        }
+    }
+
+    pub fn group_by_color(&mut self) {
+        let targets: Vec<usize> = if self.all_selected_indices().is_empty() {
+            (0..self.shapes.len()).collect()
+        } else {
+            self.all_selected_indices()
+        };
+        if targets.is_empty() {
+            self.set_status("No shapes to group");
+            return;
+        }
+
+        let mut color_groups: std::collections::BTreeMap<([u8; 4], Option<[u8; 4]>), Vec<usize>> = std::collections::BTreeMap::new();
+        for &idx in &targets {
+            let shape = &self.shapes[idx];
+            let fill_arr = [shape.fill_color.r(), shape.fill_color.g(), shape.fill_color.b(), shape.fill_color.a()];
+            let stroke_arr = shape.stroke_color.map(|c| [c.r(), c.g(), c.b(), c.a()]);
+            color_groups.entry((fill_arr, stroke_arr)).or_default().push(idx);
+        }
+
+        let mut num_groups = 0;
+        for (_key, indices) in color_groups {
+            let gid = self.next_group_id();
+            for idx in indices {
+                self.shapes[idx].group_id = Some(gid);
+                self.shapes[idx].is_modified = true;
+            }
+            num_groups += 1;
+        }
+        self.set_status(format!("Grouped {} shapes into {} color layers", targets.len(), num_groups));
     }
 
     pub fn bring_to_front(&mut self) {
@@ -787,12 +848,27 @@ impl StudioApp {
             .or_else(|_| std::fs::read("/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf"))
             .ok();
 
-        // Render cached SVGs (crisp vector rendering with EvenOdd cutouts and gradients)
+        // Render cached SVGs (crisp vector rendering with EvenOdd cutouts and gradients bound to live group transforms)
+        let mut active_cached_groups = std::collections::BTreeSet::new();
         for cached in &self.cached_svgs {
-            let sx = (cached.width * dpi) / cached.pixmap.width() as f32;
-            let sy = (cached.height * dpi) / cached.pixmap.height() as f32;
-            let ts = tiny_skia::Transform::from_scale(sx, sy).post_translate(cached.x * dpi, cached.y * dpi);
-            pixmap.draw_pixmap(0, 0, cached.pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), ts, None);
+            if let Some((min_x, min_y, max_x, max_y, count, any_visible)) = self.get_group_bounds(cached.group_id) {
+                if count == cached.orig_shape_count && any_visible {
+                    active_cached_groups.insert(cached.group_id);
+                    let live_w = (max_x - min_x).max(0.001);
+                    let live_h = (max_y - min_y).max(0.001);
+                    let scale_x = live_w / cached.init_width.max(0.001);
+                    let scale_y = live_h / cached.init_height.max(0.001);
+                    let live_svg_x = min_x - (cached.init_min_x * scale_x);
+                    let live_svg_y = min_y - (cached.init_min_y * scale_y);
+                    let live_svg_w = cached.orig_svg_width * scale_x;
+                    let live_svg_h = cached.orig_svg_height * scale_y;
+
+                    let sx = (live_svg_w * dpi) / cached.pixmap.width() as f32;
+                    let sy = (live_svg_h * dpi) / cached.pixmap.height() as f32;
+                    let ts = tiny_skia::Transform::from_scale(sx, sy).post_translate(live_svg_x * dpi, live_svg_y * dpi);
+                    pixmap.draw_pixmap(0, 0, cached.pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), ts, None);
+                }
+            }
         }
 
         // Render shapes (WITHOUT selection box)
@@ -807,10 +883,14 @@ impl StudioApp {
         black_paint.set_color_rgba8(0, 0, 0, 255);
         black_paint.anti_alias = true;
 
-        let has_cached_svg = !self.cached_svgs.is_empty();
         for shape in &self.shapes {
-            if has_cached_svg && shape.is_svg_path && !shape.is_modified {
+            if !shape.is_visible {
                 continue;
+            }
+            if let Some(gid) = shape.group_id {
+                if active_cached_groups.contains(&gid) {
+                    continue;
+                }
             }
             let mut fill_paint = tiny_skia::Paint::default();
             fill_paint.set_color_rgba8(
@@ -993,24 +1073,37 @@ impl StudioApp {
         if count > 0 {
             let gid = self.next_group_id();
             let start_idx = self.shapes.len();
+            let mut init_min_x = f32::MAX;
+            let mut init_min_y = f32::MAX;
+            let mut init_max_x = f32::MIN;
+            let mut init_max_y = f32::MIN;
             for s in &mut imported {
                 s.is_svg_path = true;
                 s.group_id = Some(gid);
                 s.precompute_triangles();
+                init_min_x = init_min_x.min(s.x);
+                init_min_y = init_min_y.min(s.y);
+                init_max_x = init_max_x.max(s.x + s.width);
+                init_max_y = init_max_y.max(s.y + s.height);
             }
+            let init_w = (init_max_x - init_min_x).max(0.001);
+            let init_h = (init_max_y - init_min_y).max(0.001);
+
             self.shapes.extend(imported);
             self.selected_indices = (start_idx..self.shapes.len()).collect();
             self.selected_index = Some(self.shapes.len() - 1);
 
             self.cached_svgs.push(CachedSvg {
-                x: 0.0,
-                y: 0.0,
-                width: w_in,
-                height: h_in,
+                group_id: gid,
+                init_min_x,
+                init_min_y,
+                init_width: init_w,
+                init_height: init_h,
+                orig_svg_width: w_in,
+                orig_svg_height: h_in,
+                orig_shape_count: count,
                 pixmap,
                 texture: None,
-                shape_start_idx: start_idx,
-                shape_count: count,
             });
         }
         Ok(count)
@@ -1461,14 +1554,14 @@ fn draw_filled_polygon(
 impl eframe::App for StudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Load textures for cached SVGs if not loaded yet
-        for (i, cached) in self.cached_svgs.iter_mut().enumerate() {
+        for cached in &mut self.cached_svgs {
             if cached.texture.is_none() {
                 let img = egui::ColorImage::from_rgba_premultiplied(
                     [cached.pixmap.width() as usize, cached.pixmap.height() as usize],
                     cached.pixmap.data(),
                 );
                 cached.texture = Some(ctx.load_texture(
-                    format!("cached_svg_{}", i),
+                    format!("cached_svg_group_{}", cached.group_id),
                     img,
                     egui::TextureOptions::LINEAR,
                 ));
@@ -1492,7 +1585,7 @@ impl eframe::App for StudioApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             }
             if self.frames_rendered > 120 {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                std::process::exit(0);
             }
         }
         ctx.input(|i| {
@@ -1500,7 +1593,7 @@ impl eframe::App for StudioApp {
                 if let egui::Event::Screenshot { image, .. } = event {
                     if let Some(path) = &self.screenshot_path {
                         let _ = save_png(path, image);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -1797,69 +1890,242 @@ impl eframe::App for StudioApp {
                         if ui.add_enabled(sel_count >= 1, egui::Button::new("🔓 Ungroup")).on_hover_text("Ungroup Selected (Ctrl+Shift+G)").clicked() {
                             self.ungroup_selected();
                         }
+                        if ui.button("🎨 By Color").on_hover_text("Group shapes by fill/stroke color into cardstock layers").clicked() {
+                            self.group_by_color();
+                        }
                     });
                     ui.separator();
 
+                    enum LayerRow {
+                        Group { gid: u64, members: Vec<usize> },
+                        Single { idx: usize },
+                    }
+
+                    let mut rows: Vec<LayerRow> = Vec::new();
+                    let mut seen_groups = std::collections::BTreeSet::new();
+
+                    for i in (0..self.shapes.len()).rev() {
+                        if let Some(gid) = self.shapes[i].group_id {
+                            if !seen_groups.contains(&gid) {
+                                seen_groups.insert(gid);
+                                let members: Vec<usize> = (0..self.shapes.len())
+                                    .rev()
+                                    .filter(|&m| self.shapes[m].group_id == Some(gid))
+                                    .collect();
+                                rows.push(LayerRow::Group { gid, members });
+                            }
+                        } else {
+                            rows.push(LayerRow::Single { idx: i });
+                        }
+                    }
+
+                    enum LayerAction {
+                        ToggleExpand(u64),
+                        ToggleGroupVis(u64, bool),
+                        ToggleGroupLock(u64, bool),
+                        SelectGroup(Vec<usize>, bool),
+                        ToggleShapeVis(usize),
+                        ToggleShapeLock(usize),
+                        SelectShape(usize, bool),
+                    }
+                    let mut actions: Vec<LayerAction> = Vec::new();
+
                     egui::ScrollArea::vertical().max_height(450.0).show(ui, |ui| {
-                        if self.shapes.is_empty() {
+                        if rows.is_empty() {
                             ui.label("No shapes on mat.");
                         }
-                        // Top-to-bottom z-order (highest index first)
-                        for i in (0..self.shapes.len()).rev() {
-                            let is_sel = self.is_selected(i);
-                            let shape = &self.shapes[i];
-                            let kind_label = match shape.kind {
-                                ShapeKind::Rectangle => "Rectangle",
-                                ShapeKind::Ellipse => "Ellipse",
-                                ShapeKind::Line => "Line",
-                                ShapeKind::Freehand => if shape.is_svg_path { "SVG Path" } else { "Freehand" },
-                                ShapeKind::Text => "Text",
-                            };
-                            let group_suffix = if let Some(gid) = shape.group_id {
-                                format!(" [G{}]", gid)
-                            } else {
-                                String::new()
-                            };
-                            let row_label = format!("{}{}", kind_label, group_suffix);
-                            let vis_icon = if shape.is_visible { "👁" } else { "🚫" };
-                            let lock_icon = if shape.is_locked { "🔒" } else { "🔓" };
+                        for row in &rows {
+                            match row {
+                                LayerRow::Group { gid, members } => {
+                                    let is_expanded = self.expanded_groups.contains(gid);
+                                    let all_vis = members.iter().all(|&m| self.shapes[m].is_visible);
+                                    let all_lock = members.iter().all(|&m| self.shapes[m].is_locked);
+                                    let is_sel = members.iter().any(|&m| self.is_selected(m));
 
-                            let mut row_clicked = false;
-                            let mut vis_toggled = false;
-                            let mut lock_toggled = false;
+                                    let swatch_color = members.iter().find_map(|&m| {
+                                        let s = &self.shapes[m];
+                                        if s.fill_color.a() > 0 {
+                                            Some(s.fill_color)
+                                        } else {
+                                            s.stroke_color.filter(|c| c.a() > 0)
+                                        }
+                                    }).unwrap_or(egui::Color32::GRAY);
 
-                            ui.horizontal(|ui| {
-                                if ui.small_button(vis_icon).clicked() {
-                                    vis_toggled = true;
+                                    ui.horizontal(|ui| {
+                                        let expand_symbol = if is_expanded { "▼" } else { "▶" };
+                                        if ui.small_button(expand_symbol).clicked() {
+                                            actions.push(LayerAction::ToggleExpand(*gid));
+                                        }
+
+                                        let vis_icon = if all_vis { "👁" } else { "🚫" };
+                                        if ui.small_button(vis_icon).clicked() {
+                                            actions.push(LayerAction::ToggleGroupVis(*gid, !all_vis));
+                                        }
+
+                                        let lock_icon = if all_lock { "🔒" } else { "🔓" };
+                                        if ui.small_button(lock_icon).clicked() {
+                                            actions.push(LayerAction::ToggleGroupLock(*gid, !all_lock));
+                                        }
+
+                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                        ui.painter().rect_filled(rect, 2.0, swatch_color);
+                                        ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::GRAY));
+
+                                        let group_label = format!("Group {} ({} items)", gid, members.len());
+                                        let resp = ui.selectable_label(is_sel, group_label);
+                                        if resp.clicked() {
+                                            let shift = ui.input(|inp| inp.modifiers.shift);
+                                            actions.push(LayerAction::SelectGroup(members.clone(), shift));
+                                        }
+                                    });
+
+                                    if is_expanded {
+                                        let row_height = 20.0_f32;
+                                        let member_count = members.len();
+                                        egui::ScrollArea::vertical()
+                                            .max_height(200.0)
+                                            .id_source(format!("group_scroll_{}", gid))
+                                            .show_rows(ui, row_height, member_count, |ui, row_range| {
+                                                for r in row_range {
+                                                    let m = members[r];
+                                                    let shape = &self.shapes[m];
+                                                    let s_sel = self.is_selected(m);
+                                                    let kind_label = match shape.kind {
+                                                        ShapeKind::Rectangle => "Rectangle",
+                                                        ShapeKind::Ellipse => "Ellipse",
+                                                        ShapeKind::Line => "Line",
+                                                        ShapeKind::Freehand => if shape.is_svg_path { "SVG Path" } else { "Freehand" },
+                                                        ShapeKind::Text => "Text",
+                                                    };
+                                                    let s_label = format!("  #{} {}", m, kind_label);
+                                                    let s_vis = if shape.is_visible { "👁" } else { "🚫" };
+                                                    let s_lock = if shape.is_locked { "🔒" } else { "🔓" };
+                                                    let s_swatch = if shape.fill_color.a() > 0 {
+                                                        shape.fill_color
+                                                    } else if let Some(sc) = shape.stroke_color {
+                                                        sc
+                                                    } else {
+                                                        egui::Color32::BLACK
+                                                    };
+
+                                                    ui.horizontal(|ui| {
+                                                        ui.add_space(12.0);
+                                                        if ui.small_button(s_vis).clicked() {
+                                                            actions.push(LayerAction::ToggleShapeVis(m));
+                                                        }
+                                                        if ui.small_button(s_lock).clicked() {
+                                                            actions.push(LayerAction::ToggleShapeLock(m));
+                                                        }
+                                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                                                        ui.painter().rect_filled(rect, 2.0, s_swatch);
+                                                        ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::GRAY));
+
+                                                        if ui.selectable_label(s_sel, s_label).clicked() {
+                                                            let shift = ui.input(|inp| inp.modifiers.shift);
+                                                            actions.push(LayerAction::SelectShape(m, shift));
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                    }
                                 }
-                                if ui.small_button(lock_icon).clicked() {
-                                    lock_toggled = true;
+                                LayerRow::Single { idx } => {
+                                    let i = *idx;
+                                    let shape = &self.shapes[i];
+                                    let is_sel = self.is_selected(i);
+                                    let kind_label = match shape.kind {
+                                        ShapeKind::Rectangle => "Rectangle",
+                                        ShapeKind::Ellipse => "Ellipse",
+                                        ShapeKind::Line => "Line",
+                                        ShapeKind::Freehand => if shape.is_svg_path { "SVG Path" } else { "Freehand" },
+                                        ShapeKind::Text => "Text",
+                                    };
+                                    let vis_icon = if shape.is_visible { "👁" } else { "🚫" };
+                                    let lock_icon = if shape.is_locked { "🔒" } else { "🔓" };
+                                    let swatch_color = if shape.fill_color.a() > 0 {
+                                        shape.fill_color
+                                    } else if let Some(sc) = shape.stroke_color {
+                                        sc
+                                    } else {
+                                        egui::Color32::BLACK
+                                    };
+
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(16.0);
+                                        if ui.small_button(vis_icon).clicked() {
+                                            actions.push(LayerAction::ToggleShapeVis(i));
+                                        }
+                                        if ui.small_button(lock_icon).clicked() {
+                                            actions.push(LayerAction::ToggleShapeLock(i));
+                                        }
+                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                        ui.painter().rect_filled(rect, 2.0, swatch_color);
+                                        ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::GRAY));
+
+                                        if ui.selectable_label(is_sel, kind_label).clicked() {
+                                            let shift = ui.input(|inp| inp.modifiers.shift);
+                                            actions.push(LayerAction::SelectShape(i, shift));
+                                        }
+                                    });
                                 }
-                                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                                let swatch_color = if shape.fill_color.a() > 0 {
-                                    shape.fill_color
-                                } else if let Some(sc) = shape.stroke_color {
-                                    sc
+                            }
+                        }
+                    });
+
+                    // Apply actions
+                    for action in actions {
+                        match action {
+                            LayerAction::ToggleExpand(gid) => {
+                                if self.expanded_groups.contains(&gid) {
+                                    self.expanded_groups.remove(&gid);
                                 } else {
-                                    egui::Color32::BLACK
-                                };
-                                ui.painter().rect_filled(rect, 2.0, swatch_color);
-                                ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::GRAY));
-
-                                let resp = ui.selectable_label(is_sel, row_label);
-                                if resp.clicked() {
-                                    row_clicked = true;
+                                    self.expanded_groups.insert(gid);
                                 }
-                            });
-
-                            if vis_toggled {
-                                self.shapes[i].is_visible = !self.shapes[i].is_visible;
                             }
-                            if lock_toggled {
-                                self.shapes[i].is_locked = !self.shapes[i].is_locked;
+                            LayerAction::ToggleGroupVis(gid, new_vis) => {
+                                for s in &mut self.shapes {
+                                    if s.group_id == Some(gid) {
+                                        s.is_visible = new_vis;
+                                    }
+                                }
                             }
-                            if row_clicked {
-                                let shift = ui.input(|inp| inp.modifiers.shift);
+                            LayerAction::ToggleGroupLock(gid, new_lock) => {
+                                for s in &mut self.shapes {
+                                    if s.group_id == Some(gid) {
+                                        s.is_locked = new_lock;
+                                    }
+                                }
+                            }
+                            LayerAction::SelectGroup(members, shift) => {
+                                if shift {
+                                    let any_sel = members.iter().any(|&m| self.is_selected(m));
+                                    for m in &members {
+                                        if any_sel {
+                                            self.selected_indices.remove(m);
+                                        } else {
+                                            self.selected_indices.insert(*m);
+                                        }
+                                    }
+                                } else {
+                                    self.clear_selection();
+                                    for m in &members {
+                                        self.selected_indices.insert(*m);
+                                    }
+                                }
+                                self.selected_index = members.first().copied();
+                                self.sync_active_properties();
+                            }
+                            LayerAction::ToggleShapeVis(i) => {
+                                if let Some(s) = self.shapes.get_mut(i) {
+                                    s.is_visible = !s.is_visible;
+                                }
+                            }
+                            LayerAction::ToggleShapeLock(i) => {
+                                if let Some(s) = self.shapes.get_mut(i) {
+                                    s.is_locked = !s.is_locked;
+                                }
+                            }
+                            LayerAction::SelectShape(i, shift) => {
                                 if shift {
                                     self.toggle_select_shape(i);
                                 } else {
@@ -1867,7 +2133,7 @@ impl eframe::App for StudioApp {
                                 }
                             }
                         }
-                    });
+                    }
                 }
                 "Fill" => {
                     ui.heading("Color Fill");
@@ -2336,23 +2602,37 @@ impl eframe::App for StudioApp {
                 }
             }
 
-            // 0. Render cached SVGs (exact vector rendering with EvenOdd cutouts, gradients, layers at 60 FPS)
+            // 0. Render cached SVGs (exact vector rendering with EvenOdd cutouts, gradients, layers bound to live group transforms)
+            let mut active_cached_groups = std::collections::BTreeSet::new();
             for cached in &self.cached_svgs {
                 if let Some(tex) = &cached.texture {
-                    let screen_min = mat_to_screen(egui::pos2(cached.x, cached.y));
-                    let screen_size = egui::vec2(cached.width * px_per_in, cached.height * px_per_in);
-                    let screen_rect = egui::Rect::from_min_size(screen_min, screen_size);
-                    painter.image(
-                        tex.id(),
-                        screen_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                    if let Some((min_x, min_y, max_x, max_y, count, any_visible)) = self.get_group_bounds(cached.group_id) {
+                        if count == cached.orig_shape_count && any_visible {
+                            active_cached_groups.insert(cached.group_id);
+                            let live_w = (max_x - min_x).max(0.001);
+                            let live_h = (max_y - min_y).max(0.001);
+                            let scale_x = live_w / cached.init_width.max(0.001);
+                            let scale_y = live_h / cached.init_height.max(0.001);
+                            let live_svg_x = min_x - (cached.init_min_x * scale_x);
+                            let live_svg_y = min_y - (cached.init_min_y * scale_y);
+                            let live_svg_w = cached.orig_svg_width * scale_x;
+                            let live_svg_h = cached.orig_svg_height * scale_y;
+
+                            let screen_min = mat_to_screen(egui::pos2(live_svg_x, live_svg_y));
+                            let screen_size = egui::vec2(live_svg_w * px_per_in, live_svg_h * px_per_in);
+                            let screen_rect = egui::Rect::from_min_size(screen_min, screen_size);
+                            painter.image(
+                                tex.id(),
+                                screen_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
                 }
             }
 
             // Render shapes over the grid using fill_color and stroke settings
-            let has_cached_svg = !self.cached_svgs.is_empty();
             let black_stroke = egui::Stroke::new(2.0_f32, egui::Color32::BLACK);
             let sel_set = self.selected_indices.clone();
             let sel_single = self.selected_index;
@@ -2362,7 +2642,8 @@ impl eframe::App for StudioApp {
                 }
                 let is_selected = sel_set.contains(&i) || sel_single == Some(i);
 
-                if has_cached_svg && shape.is_svg_path && !shape.is_modified {
+                let is_in_active_cached_group = shape.group_id.map_or(false, |gid| active_cached_groups.contains(&gid));
+                if is_in_active_cached_group {
                     if is_selected {
                         // Highlight cut contour outline of selected shape over the texture
                         let highlight_stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 150, 255));
@@ -3058,5 +3339,70 @@ mod tests {
         assert_eq!(app.shapes.len(), 2);
         assert!(app.shapes[0].group_id.is_some());
         assert_eq!(app.shapes[0].group_id, app.shapes[1].group_id);
+    }
+
+    #[test]
+    fn test_cached_svg_dynamic_bounds() {
+        let mut app = StudioApp::new(None);
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4in" height="4in" viewBox="0 0 400 400">
+            <rect x="10" y="10" width="100" height="100" fill="red" />
+            <circle cx="200" cy="200" r="50" fill="blue" />
+        </svg>"##;
+        app.import_svg_bytes(svg.as_bytes()).unwrap();
+        assert_eq!(app.cached_svgs.len(), 1);
+        let gid = app.cached_svgs[0].group_id;
+
+        let bounds_before = app.get_group_bounds(gid).expect("group bounds found");
+        let (min_x1, min_y1, max_x1, max_y1, count1, vis1) = bounds_before;
+        assert_eq!(count1, 2);
+        assert!(vis1);
+
+        // Translate the shapes (e.g. user drags the group by 3 inches right, 2 inches down)
+        let delta = egui::vec2(3.0, 2.0);
+        for s in &mut app.shapes {
+            if s.group_id == Some(gid) {
+                s.translate(delta);
+            }
+        }
+
+        let bounds_after = app.get_group_bounds(gid).expect("group bounds found");
+        let (min_x2, min_y2, max_x2, max_y2, count2, vis2) = bounds_after;
+        assert_eq!(count2, 2);
+        assert!(vis2);
+        assert!((min_x2 - (min_x1 + 3.0)).abs() < 0.001);
+        assert!((min_y2 - (min_y1 + 2.0)).abs() < 0.001);
+        assert!((max_x2 - (max_x1 + 3.0)).abs() < 0.001);
+        assert!((max_y2 - (max_y1 + 2.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_group_by_color() {
+        let mut app = StudioApp::new(None);
+        // Create 2 red shapes and 2 blue shapes
+        for i in 0..4 {
+            let col = if i < 2 { egui::Color32::RED } else { egui::Color32::BLUE };
+            app.shapes.push(CanvasShape {
+                kind: ShapeKind::Rectangle,
+                x: i as f32, y: 0.0, width: 1.0, height: 1.0, points: vec![],
+                text: format!("Shape {}", i), fill_color: col, stroke_color: None, stroke_width: 0.0,
+                is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
+                group_id: None, is_visible: true, is_locked: false,
+            });
+        }
+
+        app.group_by_color();
+
+        let gid_red_0 = app.shapes[0].group_id;
+        let gid_red_1 = app.shapes[1].group_id;
+        let gid_blue_0 = app.shapes[2].group_id;
+        let gid_blue_1 = app.shapes[3].group_id;
+
+        assert!(gid_red_0.is_some());
+        assert_eq!(gid_red_0, gid_red_1);
+
+        assert!(gid_blue_0.is_some());
+        assert_eq!(gid_blue_0, gid_blue_1);
+
+        assert_ne!(gid_red_0, gid_blue_0);
     }
 }
