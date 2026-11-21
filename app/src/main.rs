@@ -42,6 +42,9 @@ pub struct CanvasShape {
     pub stroke_color: Option<egui::Color32>,
     pub stroke_width: f32,       // mat-inch stroke width
     pub is_closed: bool,
+    pub is_svg_path: bool,
+    pub is_modified: bool,
+    pub triangles: Vec<[usize; 3]>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -60,6 +63,10 @@ pub struct SerializableShape {
     pub stroke_width: Option<f32>,
     #[serde(default)]
     pub is_closed: bool,
+    #[serde(default)]
+    pub is_svg_path: bool,
+    #[serde(default)]
+    pub is_modified: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -70,6 +77,14 @@ pub struct ProjectData {
 }
 
 impl CanvasShape {
+    pub fn precompute_triangles(&mut self) {
+        if self.kind == ShapeKind::Freehand && self.is_closed && self.points.len() >= 3 && self.fill_color.a() > 0 {
+            self.triangles = triangulate_polygon(&self.points);
+        } else {
+            self.triangles.clear();
+        }
+    }
+
     pub fn to_serializable(&self) -> SerializableShape {
         SerializableShape {
             kind: self.kind,
@@ -88,11 +103,13 @@ impl CanvasShape {
             stroke_color: self.stroke_color.map(|c| [c.r(), c.g(), c.b(), c.a()]),
             stroke_width: Some(self.stroke_width),
             is_closed: self.is_closed,
+            is_svg_path: self.is_svg_path,
+            is_modified: self.is_modified,
         }
     }
 
     pub fn from_serializable(s: SerializableShape) -> Self {
-        CanvasShape {
+        let mut shape = CanvasShape {
             kind: s.kind,
             x: s.x,
             y: s.y,
@@ -113,7 +130,12 @@ impl CanvasShape {
                 }),
             stroke_width: s.stroke_width.unwrap_or(0.05),
             is_closed: s.is_closed,
-        }
+            is_svg_path: s.is_svg_path,
+            is_modified: s.is_modified,
+            triangles: Vec::new(),
+        };
+        shape.precompute_triangles();
+        shape
     }
 
     pub fn bounding_rect(&self) -> egui::Rect {
@@ -147,6 +169,8 @@ impl CanvasShape {
             }
         }
         self.width = new_w;
+        self.is_modified = true;
+        self.precompute_triangles();
     }
 
     pub fn set_height(&mut self, new_h: f32) {
@@ -163,6 +187,8 @@ impl CanvasShape {
             }
         }
         self.height = new_h;
+        self.is_modified = true;
+        self.precompute_triangles();
     }
 
     pub fn translate(&mut self, delta: egui::Vec2) {
@@ -171,6 +197,7 @@ impl CanvasShape {
         for p in &mut self.points {
             *p += delta;
         }
+        self.is_modified = true;
     }
 
     pub fn hit_test(&self, p: egui::Pos2, tolerance: f32) -> bool {
@@ -284,6 +311,17 @@ fn escape_xml(s: &str) -> String {
     out
 }
 
+pub struct CachedSvg {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub pixmap: tiny_skia::Pixmap,
+    pub texture: Option<egui::TextureHandle>,
+    pub shape_start_idx: usize,
+    pub shape_count: usize,
+}
+
 pub struct StudioApp {
     pub active_tool: Tool,
     pub right_panel: &'static str,
@@ -294,6 +332,7 @@ pub struct StudioApp {
     pub fill_color: [f32; 3],
     pub text_sample: String,
     pub shapes: Vec<CanvasShape>,
+    pub cached_svgs: Vec<CachedSvg>,
     pub selected_index: Option<usize>,
     pub drag_start: Option<egui::Pos2>,       // in mat inches
     pub freehand_points: Vec<egui::Pos2>,     // in mat inches
@@ -315,6 +354,7 @@ impl StudioApp {
             fill_color: [0.85, 0.2, 0.35],
             text_sample: "Sample Design".to_string(),
             shapes: Vec::new(),
+            cached_svgs: Vec::new(),
             selected_index: None,
             drag_start: None,
             freehand_points: Vec::new(),
@@ -359,6 +399,7 @@ impl StudioApp {
         self.mat_width_in = data.mat_width_in;
         self.mat_height_in = data.mat_height_in;
         self.shapes = data.shapes.into_iter().map(CanvasShape::from_serializable).collect();
+        self.cached_svgs.clear();
         self.selected_index = None;
         Ok(())
     }
@@ -507,6 +548,14 @@ impl StudioApp {
             .or_else(|_| std::fs::read("/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf"))
             .ok();
 
+        // Render cached SVGs (crisp vector rendering with EvenOdd cutouts and gradients)
+        for cached in &self.cached_svgs {
+            let sx = (cached.width * dpi) / cached.pixmap.width() as f32;
+            let sy = (cached.height * dpi) / cached.pixmap.height() as f32;
+            let ts = tiny_skia::Transform::from_scale(sx, sy).post_translate(cached.x * dpi, cached.y * dpi);
+            pixmap.draw_pixmap(0, 0, cached.pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), ts, None);
+        }
+
         // Render shapes (WITHOUT selection box)
         let stroke_w = (2.0 * (dpi / 40.0)).max(2.0);
         let black_stroke = tiny_skia::Stroke {
@@ -519,7 +568,11 @@ impl StudioApp {
         black_paint.set_color_rgba8(0, 0, 0, 255);
         black_paint.anti_alias = true;
 
+        let has_cached_svg = !self.cached_svgs.is_empty();
         for shape in &self.shapes {
+            if has_cached_svg && shape.is_svg_path && !shape.is_modified {
+                continue;
+            }
             let mut fill_paint = tiny_skia::Paint::default();
             fill_paint.set_color_rgba8(
                 shape.fill_color.r(),
@@ -666,14 +719,57 @@ impl StudioApp {
         Ok(())
     }
 
-    // 4. Import SVG into CanvasShapes
+    // 4. Import SVG into CanvasShapes with cached resvg texture
     pub fn import_svg_file(&mut self, path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
         let content = std::fs::read(path)?;
-        let imported = import_svg_data(&content, self.current_color32());
+        self.import_svg_bytes(&content)
+    }
+
+    pub fn import_svg_bytes(&mut self, bytes: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
+        let opt = usvg::Options::default();
+        let tree = usvg::Tree::from_data(bytes, &opt)?;
+
+        let svg_w = tree.size().width();
+        let svg_h = tree.size().height();
+        let scale_to_in = if svg_w <= 36.0 && svg_h <= 36.0 {
+            1.0
+        } else {
+            1.0 / 96.0
+        };
+        let w_in = svg_w * scale_to_in;
+        let h_in = svg_h * scale_to_in;
+
+        // Render high-resolution pixmap using resvg (150 DPI for crisp 60 FPS viewport)
+        let target_dpi = 150.0_f32;
+        let pix_w = ((w_in * target_dpi).round() as u32).clamp(32, 4096);
+        let pix_h = ((h_in * target_dpi).round() as u32).clamp(32, 4096);
+        let mut pixmap = tiny_skia::Pixmap::new(pix_w, pix_h).ok_or("Failed to allocate Pixmap")?;
+        let sx = pix_w as f32 / svg_w;
+        let sy = pix_h as f32 / svg_h;
+        let ts = tiny_skia::Transform::from_scale(sx, sy);
+        resvg::render(&tree, ts, &mut pixmap.as_mut());
+
+        let mut imported = import_svg_data(bytes, self.current_color32());
         let count = imported.len();
         if count > 0 {
+            let start_idx = self.shapes.len();
+            for s in &mut imported {
+                s.is_svg_path = true;
+                s.precompute_triangles();
+            }
             self.shapes.extend(imported);
             self.selected_index = Some(self.shapes.len() - 1);
+
+            self.cached_svgs.push(CachedSvg {
+                x: 0.0,
+                y: 0.0,
+                width: w_in,
+                height: h_in,
+                pixmap,
+                texture: None,
+                shape_start_idx: start_idx,
+                shape_count: count,
+            });
         }
         Ok(count)
     }
@@ -777,7 +873,7 @@ pub fn import_svg_data(bytes: &[u8], default_color: egui::Color32) -> Vec<Canvas
 
             let (kind, final_points) = classify_subpath(&raw_segments, &sampled_points, is_closed);
 
-            result.push(CanvasShape {
+            let mut shape = CanvasShape {
                 kind,
                 x: min_x,
                 y: min_y,
@@ -789,7 +885,12 @@ pub fn import_svg_data(bytes: &[u8], default_color: egui::Color32) -> Vec<Canvas
                 stroke_color,
                 stroke_width: stroke_width_in,
                 is_closed,
-            });
+                is_svg_path: true,
+                is_modified: false,
+                triangles: Vec::new(),
+            };
+            shape.precompute_triangles();
+            result.push(shape);
         }
     }
 
@@ -1064,6 +1165,7 @@ fn draw_filled_polygon(
     screen_pts: &[egui::Pos2],
     fill_color: egui::Color32,
     stroke: Option<egui::Stroke>,
+    cached_triangles: &[[usize; 3]],
 ) {
     if screen_pts.len() < 3 {
         if let Some(s) = stroke {
@@ -1075,8 +1177,7 @@ fn draw_filled_polygon(
     }
 
     if fill_color.a() > 0 {
-        let triangles = triangulate_polygon(screen_pts);
-        if !triangles.is_empty() {
+        if !cached_triangles.is_empty() {
             let mut mesh = egui::Mesh::default();
             let mut clean_pts = screen_pts;
             if clean_pts.len() >= 4 && (clean_pts[0] - *clean_pts.last().unwrap()).length() < 0.001 {
@@ -1089,8 +1190,10 @@ fn draw_filled_polygon(
                     color: fill_color,
                 });
             }
-            for [i0, i1, i2] in triangles {
-                mesh.add_triangle(i0 as u32, i1 as u32, i2 as u32);
+            for &[i0, i1, i2] in cached_triangles {
+                if i0 < mesh.vertices.len() && i1 < mesh.vertices.len() && i2 < mesh.vertices.len() {
+                    mesh.add_triangle(i0 as u32, i1 as u32, i2 as u32);
+                }
             }
             painter.add(egui::Shape::mesh(mesh));
         } else {
@@ -1112,6 +1215,21 @@ fn draw_filled_polygon(
 }
 impl eframe::App for StudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Load textures for cached SVGs if not loaded yet
+        for (i, cached) in self.cached_svgs.iter_mut().enumerate() {
+            if cached.texture.is_none() {
+                let img = egui::ColorImage::from_rgba_premultiplied(
+                    [cached.pixmap.width() as usize, cached.pixmap.height() as usize],
+                    cached.pixmap.data(),
+                );
+                cached.texture = Some(ctx.load_texture(
+                    format!("cached_svg_{}", i),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+
         if self.screenshot_path.is_some() {
             ctx.request_repaint();
             self.frames_rendered += 1;
@@ -1151,6 +1269,7 @@ impl eframe::App for StudioApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("New Design").clicked() {
                         self.shapes.clear();
+                        self.cached_svgs.clear();
                         self.selected_index = None;
                         self.pan = egui::Vec2::ZERO;
                         self.zoom = 1.0;
@@ -1244,6 +1363,7 @@ impl eframe::App for StudioApp {
                     }
                     if ui.button("Clear All Shapes").clicked() {
                         self.shapes.clear();
+                        self.cached_svgs.clear();
                         self.selected_index = None;
                         ui.close_menu();
                     }
@@ -1599,6 +1719,9 @@ impl eframe::App for StudioApp {
                                 stroke_color: None,
                                 stroke_width: 0.0,
                                 is_closed: false,
+                                is_svg_path: false,
+                                is_modified: false,
+                                triangles: vec![],
                             });
                             self.selected_index = Some(self.shapes.len() - 1);
                         }
@@ -1637,6 +1760,9 @@ impl eframe::App for StudioApp {
                                     stroke_color: Some(egui::Color32::BLACK),
                                     stroke_width: 0.05,
                                     is_closed: true,
+                                    is_svg_path: false,
+                                    is_modified: false,
+                                    triangles: vec![],
                                 });
                                 self.selected_index = Some(self.shapes.len() - 1);
                             }
@@ -1659,6 +1785,9 @@ impl eframe::App for StudioApp {
                                     stroke_color: Some(egui::Color32::BLACK),
                                     stroke_width: 0.05,
                                     is_closed: true,
+                                    is_svg_path: false,
+                                    is_modified: false,
+                                    triangles: vec![],
                                 });
                                 self.selected_index = Some(self.shapes.len() - 1);
                             }
@@ -1682,6 +1811,9 @@ impl eframe::App for StudioApp {
                                     stroke_color: Some(current_fill),
                                     stroke_width: 0.05,
                                     is_closed: false,
+                                    is_svg_path: false,
+                                    is_modified: false,
+                                    triangles: vec![],
                                 });
                                 self.selected_index = Some(self.shapes.len() - 1);
                             }
@@ -1702,7 +1834,7 @@ impl eframe::App for StudioApp {
                             max_x = max_x.max(p.x);
                             max_y = max_y.max(p.y);
                         }
-                        self.shapes.push(CanvasShape {
+                        let mut shape = CanvasShape {
                             kind: ShapeKind::Freehand,
                             x: min_x,
                             y: min_y,
@@ -1714,7 +1846,12 @@ impl eframe::App for StudioApp {
                             stroke_color: Some(current_fill),
                             stroke_width: 0.05,
                             is_closed: false,
-                        });
+                            is_svg_path: false,
+                            is_modified: false,
+                            triangles: vec![],
+                        };
+                        shape.precompute_triangles();
+                        self.shapes.push(shape);
                         self.selected_index = Some(self.shapes.len() - 1);
                     } else {
                         self.freehand_points.clear();
@@ -1722,9 +1859,47 @@ impl eframe::App for StudioApp {
                 }
             }
 
+            // 0. Render cached SVGs (exact vector rendering with EvenOdd cutouts, gradients, layers at 60 FPS)
+            for cached in &self.cached_svgs {
+                if let Some(tex) = &cached.texture {
+                    let screen_min = mat_to_screen(egui::pos2(cached.x, cached.y));
+                    let screen_size = egui::vec2(cached.width * px_per_in, cached.height * px_per_in);
+                    let screen_rect = egui::Rect::from_min_size(screen_min, screen_size);
+                    painter.image(
+                        tex.id(),
+                        screen_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+            }
+
             // Render shapes over the grid using fill_color and stroke settings
+            let has_cached_svg = !self.cached_svgs.is_empty();
             let black_stroke = egui::Stroke::new(2.0_f32, egui::Color32::BLACK);
-            for shape in &mut self.shapes {
+            for (i, shape) in self.shapes.iter_mut().enumerate() {
+                let is_selected = self.selected_index == Some(i);
+
+                if has_cached_svg && shape.is_svg_path && !shape.is_modified {
+                    if is_selected {
+                        // Highlight cut contour outline of selected shape over the texture
+                        let highlight_stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 150, 255));
+                        if shape.points.len() >= 2 {
+                            let screen_pts: Vec<egui::Pos2> = shape.points.iter().map(|&p| mat_to_screen(p)).collect();
+                            if shape.is_closed {
+                                let mut closed = screen_pts;
+                                if let (Some(f), Some(l)) = (closed.first(), closed.last()) {
+                                    if (*f - *l).length() > 0.5 { closed.push(*f); }
+                                }
+                                painter.add(egui::Shape::line(closed, highlight_stroke));
+                            } else {
+                                painter.add(egui::Shape::line(screen_pts, highlight_stroke));
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 let stroke_opt = shape.stroke_color.and_then(|c| {
                     if c.a() > 0 {
                         let sw = (shape.stroke_width * px_per_in).max(1.0);
@@ -1755,8 +1930,8 @@ impl eframe::App for StudioApp {
                         let ry = (screen_size.y * 0.5).abs();
                         if rx > 0.5 && ry > 0.5 {
                             let n = 48;
-                            let pts: Vec<egui::Pos2> = (0..n).map(|i| {
-                                let angle = (i as f32) / (n as f32) * std::f32::consts::TAU;
+                            let pts: Vec<egui::Pos2> = (0..n).map(|k| {
+                                let angle = (k as f32) / (n as f32) * std::f32::consts::TAU;
                                 egui::pos2(center.x + rx * angle.cos(), center.y + ry * angle.sin())
                             }).collect();
                             painter.add(egui::Shape::convex_polygon(
@@ -1784,7 +1959,7 @@ impl eframe::App for StudioApp {
                         if shape.points.len() >= 2 {
                             let screen_pts: Vec<egui::Pos2> = shape.points.iter().map(|&p| mat_to_screen(p)).collect();
                             if shape.is_closed || shape.fill_color.a() > 0 {
-                                draw_filled_polygon(&painter, &screen_pts, shape.fill_color, stroke_opt);
+                                draw_filled_polygon(&painter, &screen_pts, shape.fill_color, stroke_opt, &shape.triangles);
                             } else if let Some(s) = stroke_opt {
                                 painter.add(egui::Shape::line(screen_pts, s));
                             } else {
@@ -1927,6 +2102,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Line,
@@ -1940,6 +2118,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: false,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
 
         let tmp_path = std::env::temp_dir().join("test_silhouette_project.json");
@@ -1974,6 +2155,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Ellipse,
@@ -1987,6 +2171,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Line,
@@ -2000,6 +2187,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: false,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Freehand,
@@ -2013,6 +2203,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: false,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Text,
@@ -2026,6 +2219,9 @@ mod tests {
             stroke_color: None,
             stroke_width: 0.0,
             is_closed: false,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
 
         let svg = app.export_svg_string();
@@ -2080,6 +2276,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
 
         let tmp_png = std::env::temp_dir().join("test_export_mat.png");
@@ -2107,6 +2306,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Ellipse,
@@ -2120,6 +2322,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Line,
@@ -2133,6 +2338,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: false,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Freehand,
@@ -2146,6 +2354,9 @@ mod tests {
             stroke_color: Some(egui::Color32::BLACK),
             stroke_width: 0.05,
             is_closed: false,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
         });
 
         let svg_str = app.export_svg_string();
@@ -2210,4 +2421,20 @@ mod tests {
         assert!((shapes[1].y - 2.0).abs() < 0.05);
     }
 
+    #[test]
+    fn test_cached_svg_rendering() {
+        let mut app = StudioApp::new(None);
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4in" height="4in" viewBox="0 0 400 400">
+            <rect x="50" y="50" width="300" height="300" fill="#ff5500" />
+            <circle cx="200" cy="200" r="80" fill="#00aaff" />
+        </svg>"##;
+        let count = app.import_svg_bytes(svg.as_bytes()).expect("import failed");
+        assert_eq!(count, 2);
+        assert_eq!(app.cached_svgs.len(), 1);
+        assert!(app.cached_svgs[0].pixmap.width() > 0);
+        assert!(app.cached_svgs[0].pixmap.height() > 0);
+        assert_eq!(app.shapes.len(), 2);
+        assert!(app.shapes[0].is_svg_path);
+        assert!(app.shapes[1].is_svg_path);
+    }
 }
