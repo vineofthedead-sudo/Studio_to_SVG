@@ -39,6 +39,9 @@ pub struct CanvasShape {
     pub points: Vec<egui::Pos2>, // mat-inch coordinates for Line or Freehand
     pub text: String,
     pub fill_color: egui::Color32,
+    pub stroke_color: Option<egui::Color32>,
+    pub stroke_width: f32,       // mat-inch stroke width
+    pub is_closed: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -51,6 +54,12 @@ pub struct SerializableShape {
     pub points: Vec<[f32; 2]>,
     pub text: String,
     pub fill_color: [u8; 4], // [r, g, b, a]
+    #[serde(default)]
+    pub stroke_color: Option<[u8; 4]>,
+    #[serde(default)]
+    pub stroke_width: Option<f32>,
+    #[serde(default)]
+    pub is_closed: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -76,6 +85,9 @@ impl CanvasShape {
                 self.fill_color.b(),
                 self.fill_color.a(),
             ],
+            stroke_color: self.stroke_color.map(|c| [c.r(), c.g(), c.b(), c.a()]),
+            stroke_width: Some(self.stroke_width),
+            is_closed: self.is_closed,
         }
     }
 
@@ -94,6 +106,13 @@ impl CanvasShape {
                 s.fill_color[2],
                 s.fill_color[3],
             ),
+            stroke_color: s.stroke_color.map(|c| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
+                .or_else(|| match s.kind {
+                    ShapeKind::Text => None,
+                    _ => Some(egui::Color32::BLACK),
+                }),
+            stroke_width: s.stroke_width.unwrap_or(0.05),
+            is_closed: s.is_closed,
         }
     }
 
@@ -184,6 +203,16 @@ impl CanvasShape {
                 }
             }
             ShapeKind::Freehand => {
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(self.x, self.y),
+                    egui::vec2(self.width, self.height),
+                );
+                if !r.expand(tolerance).contains(p) {
+                    return false;
+                }
+                if self.is_closed && self.fill_color.a() > 0 && point_in_poly(p, &self.points) {
+                    return true;
+                }
                 if self.points.len() >= 2 {
                     self.points.windows(2).any(|w| dist_to_segment(p, w[0], w[1]) <= tolerance)
                 } else if let Some(&first) = self.points.first() {
@@ -346,17 +375,35 @@ impl StudioApp {
         for shape in &self.shapes {
             let hex = format!("#{:02x}{:02x}{:02x}", shape.fill_color.r(), shape.fill_color.g(), shape.fill_color.b());
             let opacity = shape.fill_color.a() as f32 / 255.0;
-            let opacity_str = if opacity < 0.999 {
-                format!(" fill-opacity=\"{:.2}\"", opacity)
+            let fill_str = if shape.fill_color.a() == 0 {
+                " fill=\"none\"".to_string()
+            } else if opacity < 0.999 {
+                format!(" fill=\"{}\" fill-opacity=\"{:.2}\"", hex, opacity)
             } else {
-                String::new()
+                format!(" fill=\"{}\"", hex)
+            };
+
+            let stroke_str = if let Some(sc) = shape.stroke_color {
+                if sc.a() > 0 {
+                    let sc_hex = format!("#{:02x}{:02x}{:02x}", sc.r(), sc.g(), sc.b());
+                    let sw = if shape.stroke_width > 0.0 { shape.stroke_width } else { 0.05 };
+                    if sc.a() < 255 {
+                        format!(" stroke=\"{}\" stroke-width=\"{:.3}\" stroke-opacity=\"{:.2}\"", sc_hex, sw, sc.a() as f32 / 255.0)
+                    } else {
+                        format!(" stroke=\"{}\" stroke-width=\"{:.3}\"", sc_hex, sw)
+                    }
+                } else {
+                    " stroke=\"none\"".to_string()
+                }
+            } else {
+                " stroke=\"none\"".to_string()
             };
 
             match shape.kind {
                 ShapeKind::Rectangle => {
                     out.push_str(&format!(
-                        "  <rect x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" fill=\"{}\"{} stroke=\"#000000\" stroke-width=\"0.05\" />\n",
-                        shape.x, shape.y, shape.width, shape.height, hex, opacity_str
+                        "  <rect x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\"{}{} />\n",
+                        shape.x, shape.y, shape.width, shape.height, fill_str, stroke_str
                     ));
                 }
                 ShapeKind::Ellipse => {
@@ -365,15 +412,15 @@ impl StudioApp {
                     let rx = shape.width * 0.5;
                     let ry = shape.height * 0.5;
                     out.push_str(&format!(
-                        "  <ellipse cx=\"{:.3}\" cy=\"{:.3}\" rx=\"{:.3}\" ry=\"{:.3}\" fill=\"{}\"{} stroke=\"#000000\" stroke-width=\"0.05\" />\n",
-                        cx, cy, rx, ry, hex, opacity_str
+                        "  <ellipse cx=\"{:.3}\" cy=\"{:.3}\" rx=\"{:.3}\" ry=\"{:.3}\"{}{} />\n",
+                        cx, cy, rx, ry, fill_str, stroke_str
                     ));
                 }
                 ShapeKind::Line => {
                     if shape.points.len() >= 2 {
                         out.push_str(&format!(
-                            "  <line x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\" stroke=\"#000000\" stroke-width=\"0.05\" stroke-linecap=\"round\" />\n",
-                            shape.points[0].x, shape.points[0].y, shape.points[1].x, shape.points[1].y
+                            "  <line x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\"{} stroke-linecap=\"round\" />\n",
+                            shape.points[0].x, shape.points[0].y, shape.points[1].x, shape.points[1].y, stroke_str
                         ));
                     }
                 }
@@ -383,9 +430,10 @@ impl StudioApp {
                             .map(|p| format!("{:.3},{:.3}", p.x, p.y))
                             .collect::<Vec<_>>()
                             .join(" ");
+                        let tag = if shape.is_closed { "polygon" } else { "polyline" };
                         out.push_str(&format!(
-                            "  <polyline points=\"{}\" fill=\"none\" stroke=\"#000000\" stroke-width=\"0.05\" stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
-                            pts_str
+                            "  <{} points=\"{}\"{}{} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                            tag, pts_str, fill_str, stroke_str
                         ));
                     }
                 }
@@ -393,8 +441,8 @@ impl StudioApp {
                     let escaped = escape_xml(&shape.text);
                     let y_base = shape.y + shape.height * 0.85;
                     out.push_str(&format!(
-                        "  <text x=\"{:.3}\" y=\"{:.3}\" font-family=\"sans-serif\" font-size=\"{:.3}\" fill=\"{}\"{}>{}</text>\n",
-                        shape.x, y_base, shape.height, hex, opacity_str, escaped
+                        "  <text x=\"{:.3}\" y=\"{:.3}\" font-family=\"sans-serif\" font-size=\"{:.3}\"{}>{}</text>\n",
+                        shape.x, y_base, shape.height, fill_str, escaped
                     ));
                 }
             }
@@ -481,6 +529,18 @@ impl StudioApp {
             );
             fill_paint.anti_alias = true;
 
+            let stroke_paint_and_width = shape.stroke_color.and_then(|sc| {
+                if sc.a() > 0 {
+                    let mut sp = tiny_skia::Paint::default();
+                    sp.set_color_rgba8(sc.r(), sc.g(), sc.b(), sc.a());
+                    sp.anti_alias = true;
+                    let sw = (shape.stroke_width * dpi).max(1.0);
+                    Some((sp, sw))
+                } else {
+                    None
+                }
+            });
+
             match shape.kind {
                 ShapeKind::Rectangle => {
                     if let Some(rect) = tiny_skia::Rect::from_xywh(
@@ -489,9 +549,14 @@ impl StudioApp {
                         shape.width * dpi,
                         shape.height * dpi,
                     ) {
-                        pixmap.fill_rect(rect, &fill_paint, tiny_skia::Transform::identity(), None);
-                        let path = tiny_skia::PathBuilder::from_rect(rect);
-                        pixmap.stroke_path(&path, &black_paint, &black_stroke, tiny_skia::Transform::identity(), None);
+                        if shape.fill_color.a() > 0 {
+                            pixmap.fill_rect(rect, &fill_paint, tiny_skia::Transform::identity(), None);
+                        }
+                        if let Some((sp, sw)) = &stroke_paint_and_width {
+                            let st = tiny_skia::Stroke { width: *sw, ..Default::default() };
+                            let path = tiny_skia::PathBuilder::from_rect(rect);
+                            pixmap.stroke_path(&path, sp, &st, tiny_skia::Transform::identity(), None);
+                        }
                     }
                 }
                 ShapeKind::Ellipse => {
@@ -502,8 +567,13 @@ impl StudioApp {
                         shape.height * dpi,
                     ) {
                         if let Some(path) = tiny_skia::PathBuilder::from_oval(rect) {
-                            pixmap.fill_path(&path, &fill_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
-                            pixmap.stroke_path(&path, &black_paint, &black_stroke, tiny_skia::Transform::identity(), None);
+                            if shape.fill_color.a() > 0 {
+                                pixmap.fill_path(&path, &fill_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                            }
+                            if let Some((sp, sw)) = &stroke_paint_and_width {
+                                let st = tiny_skia::Stroke { width: *sw, ..Default::default() };
+                                pixmap.stroke_path(&path, sp, &st, tiny_skia::Transform::identity(), None);
+                            }
                         }
                     }
                 }
@@ -513,7 +583,15 @@ impl StudioApp {
                         pb.move_to(shape.points[0].x * dpi, shape.points[0].y * dpi);
                         pb.line_to(shape.points[1].x * dpi, shape.points[1].y * dpi);
                         if let Some(path) = pb.finish() {
-                            pixmap.stroke_path(&path, &black_paint, &black_stroke, tiny_skia::Transform::identity(), None);
+                            let (sp, sw) = stroke_paint_and_width.as_ref().cloned().unwrap_or_else(|| {
+                                (black_paint.clone(), stroke_w)
+                            });
+                            let st = tiny_skia::Stroke {
+                                width: sw,
+                                line_cap: tiny_skia::LineCap::Round,
+                                ..Default::default()
+                            };
+                            pixmap.stroke_path(&path, &sp, &st, tiny_skia::Transform::identity(), None);
                         }
                     }
                 }
@@ -524,8 +602,24 @@ impl StudioApp {
                         for p in &shape.points[1..] {
                             pb.line_to(p.x * dpi, p.y * dpi);
                         }
+                        if shape.is_closed {
+                            pb.close();
+                        }
                         if let Some(path) = pb.finish() {
-                            pixmap.stroke_path(&path, &black_paint, &black_stroke, tiny_skia::Transform::identity(), None);
+                            if shape.fill_color.a() > 0 {
+                                pixmap.fill_path(&path, &fill_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                            }
+                            if let Some((sp, sw)) = &stroke_paint_and_width {
+                                let st = tiny_skia::Stroke {
+                                    width: *sw,
+                                    line_cap: tiny_skia::LineCap::Round,
+                                    line_join: tiny_skia::LineJoin::Round,
+                                    ..Default::default()
+                                };
+                                pixmap.stroke_path(&path, sp, &st, tiny_skia::Transform::identity(), None);
+                            } else if !shape.is_closed && shape.fill_color.a() == 0 {
+                                pixmap.stroke_path(&path, &black_paint, &black_stroke, tiny_skia::Transform::identity(), None);
+                            }
                         }
                     }
                 }
@@ -574,8 +668,8 @@ impl StudioApp {
 
     // 4. Import SVG into CanvasShapes
     pub fn import_svg_file(&mut self, path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path)?;
-        let imported = import_svg_str(&content, self.current_color32());
+        let content = std::fs::read(path)?;
+        let imported = import_svg_data(&content, self.current_color32());
         let count = imported.len();
         if count > 0 {
             self.shapes.extend(imported);
@@ -585,607 +679,437 @@ impl StudioApp {
     }
 }
 
-// SVG Import parser
+// SVG Import parser using usvg
 pub fn import_svg_str(xml: &str, default_color: egui::Color32) -> Vec<CanvasShape> {
-    use quick_xml::events::Event;
-    use quick_xml::reader::Reader;
-
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut shapes = Vec::new();
-    let mut scale_to_in = 1.0_f32;
-    let mut buf = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                let tag_name = e.name();
-                let tag = tag_name.as_ref();
-
-                if tag == b"svg" {
-                    let mut vb_w: Option<f32> = None;
-                    let mut vb_h: Option<f32> = None;
-                    let mut w_in: Option<f32> = None;
-
-                    for a in e.attributes().flatten() {
-                        match a.key.as_ref() {
-                            b"viewBox" | b"viewbox" => {
-                                if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
-                                    let nums: Vec<f32> = val
-                                        .split(|c: char| c.is_whitespace() || c == ',')
-                                        .filter_map(|s| s.parse::<f32>().ok())
-                                        .collect();
-                                    if nums.len() >= 4 {
-                                        vb_w = Some(nums[2]);
-                                        vb_h = Some(nums[3]);
-                                    }
-                                }
-                            }
-                            b"width" => {
-                                if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
-                                    if val.ends_with("in") {
-                                        w_in = val[..val.len() - 2].trim().parse::<f32>().ok();
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if let (Some(w), Some(vbw)) = (w_in, vb_w) {
-                        if vbw > 0.0 {
-                            scale_to_in = w / vbw;
-                        }
-                    } else if let Some(vbw) = vb_w {
-                        if vbw <= 36.0 && vb_h.map_or(true, |h| h <= 36.0) {
-                            scale_to_in = 1.0;
-                        } else {
-                            scale_to_in = 1.0 / 96.0;
-                        }
-                    }
-                } else if tag == b"rect" {
-                    let mut x = 0.0;
-                    let mut y = 0.0;
-                    let mut width = 0.0;
-                    let mut height = 0.0;
-                    let mut fill = default_color;
-
-                    for a in e.attributes().flatten() {
-                        let k = a.key.as_ref();
-                        if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
-                            match k {
-                                b"x" => x = parse_svg_length(val, scale_to_in),
-                                b"y" => y = parse_svg_length(val, scale_to_in),
-                                b"width" => width = parse_svg_length(val, scale_to_in),
-                                b"height" => height = parse_svg_length(val, scale_to_in),
-                                b"fill" => fill = parse_svg_color(val, default_color),
-                                _ => {}
-                            }
-                        }
-                    }
-                    if width > 0.01 && height > 0.01 {
-                        shapes.push(CanvasShape {
-                            kind: ShapeKind::Rectangle,
-                            x,
-                            y,
-                            width,
-                            height,
-                            points: vec![],
-                            text: String::new(),
-                            fill_color: fill,
-                        });
-                    }
-                } else if tag == b"circle" {
-                    let mut cx = 0.0;
-                    let mut cy = 0.0;
-                    let mut r = 0.0;
-                    let mut fill = default_color;
-
-                    for a in e.attributes().flatten() {
-                        let k = a.key.as_ref();
-                        if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
-                            match k {
-                                b"cx" => cx = parse_svg_length(val, scale_to_in),
-                                b"cy" => cy = parse_svg_length(val, scale_to_in),
-                                b"r" => r = parse_svg_length(val, scale_to_in),
-                                b"fill" => fill = parse_svg_color(val, default_color),
-                                _ => {}
-                            }
-                        }
-                    }
-                    if r > 0.005 {
-                        shapes.push(CanvasShape {
-                            kind: ShapeKind::Ellipse,
-                            x: cx - r,
-                            y: cy - r,
-                            width: 2.0 * r,
-                            height: 2.0 * r,
-                            points: vec![],
-                            text: String::new(),
-                            fill_color: fill,
-                        });
-                    }
-                } else if tag == b"ellipse" {
-                    let mut cx = 0.0;
-                    let mut cy = 0.0;
-                    let mut rx = 0.0;
-                    let mut ry = 0.0;
-                    let mut fill = default_color;
-
-                    for a in e.attributes().flatten() {
-                        let k = a.key.as_ref();
-                        if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
-                            match k {
-                                b"cx" => cx = parse_svg_length(val, scale_to_in),
-                                b"cy" => cy = parse_svg_length(val, scale_to_in),
-                                b"rx" => rx = parse_svg_length(val, scale_to_in),
-                                b"ry" => ry = parse_svg_length(val, scale_to_in),
-                                b"fill" => fill = parse_svg_color(val, default_color),
-                                _ => {}
-                            }
-                        }
-                    }
-                    if rx > 0.005 && ry > 0.005 {
-                        shapes.push(CanvasShape {
-                            kind: ShapeKind::Ellipse,
-                            x: cx - rx,
-                            y: cy - ry,
-                            width: 2.0 * rx,
-                            height: 2.0 * ry,
-                            points: vec![],
-                            text: String::new(),
-                            fill_color: fill,
-                        });
-                    }
-                } else if tag == b"line" {
-                    let mut x1 = 0.0;
-                    let mut y1 = 0.0;
-                    let mut x2 = 0.0;
-                    let mut y2 = 0.0;
-                    let mut stroke = egui::Color32::BLACK;
-
-                    for a in e.attributes().flatten() {
-                        let k = a.key.as_ref();
-                        if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
-                            match k {
-                                b"x1" => x1 = parse_svg_length(val, scale_to_in),
-                                b"y1" => y1 = parse_svg_length(val, scale_to_in),
-                                b"x2" => x2 = parse_svg_length(val, scale_to_in),
-                                b"y2" => y2 = parse_svg_length(val, scale_to_in),
-                                b"stroke" => stroke = parse_svg_color(val, egui::Color32::BLACK),
-                                _ => {}
-                            }
-                        }
-                    }
-                    shapes.push(CanvasShape {
-                        kind: ShapeKind::Line,
-                        x: x1.min(x2),
-                        y: y1.min(y2),
-                        width: (x1 - x2).abs().max(0.01),
-                        height: (y1 - y2).abs().max(0.01),
-                        points: vec![egui::pos2(x1, y1), egui::pos2(x2, y2)],
-                        text: String::new(),
-                        fill_color: stroke,
-                    });
-                } else if tag == b"polyline" || tag == b"polygon" {
-                    let is_polygon = tag == b"polygon";
-                    let mut pts_str = String::new();
-                    let mut fill = default_color;
-
-                    for a in e.attributes().flatten() {
-                        let k = a.key.as_ref();
-                        if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
-                            match k {
-                                b"points" => pts_str = val.to_string(),
-                                b"fill" => fill = parse_svg_color(val, default_color),
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    let mut points = parse_points_list(&pts_str, scale_to_in);
-                    if is_polygon && points.len() >= 2 {
-                        if (points[0] - *points.last().unwrap()).length() > 0.001 {
-                            points.push(points[0]);
-                        }
-                    }
-                    if points.len() >= 2 {
-                        let mut min_x = points[0].x;
-                        let mut min_y = points[0].y;
-                        let mut max_x = points[0].x;
-                        let mut max_y = points[0].y;
-                        for p in &points {
-                            min_x = min_x.min(p.x);
-                            min_y = min_y.min(p.y);
-                            max_x = max_x.max(p.x);
-                            max_y = max_y.max(p.y);
-                        }
-                        shapes.push(CanvasShape {
-                            kind: ShapeKind::Freehand,
-                            x: min_x,
-                            y: min_y,
-                            width: (max_x - min_x).max(0.05),
-                            height: (max_y - min_y).max(0.05),
-                            points,
-                            text: String::new(),
-                            fill_color: fill,
-                        });
-                    }
-                } else if tag == b"path" {
-                    let mut d_str = String::new();
-                    let mut fill = default_color;
-
-                    for a in e.attributes().flatten() {
-                        let k = a.key.as_ref();
-                        if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
-                            match k {
-                                b"d" => d_str = val.to_string(),
-                                b"fill" => fill = parse_svg_color(val, default_color),
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    let subpaths = parse_svg_path_d(&d_str, scale_to_in);
-                    for sub in subpaths {
-                        if sub.len() >= 2 {
-                            let mut min_x = sub[0].x;
-                            let mut min_y = sub[0].y;
-                            let mut max_x = sub[0].x;
-                            let mut max_y = sub[0].y;
-                            for p in &sub {
-                                min_x = min_x.min(p.x);
-                                min_y = min_y.min(p.y);
-                                max_x = max_x.max(p.x);
-                                max_y = max_y.max(p.y);
-                            }
-                            shapes.push(CanvasShape {
-                                kind: ShapeKind::Freehand,
-                                x: min_x,
-                                y: min_y,
-                                width: (max_x - min_x).max(0.05),
-                                height: (max_y - min_y).max(0.05),
-                                points: sub,
-                                text: String::new(),
-                                fill_color: fill,
-                            });
-                        }
-                    }
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    shapes
+    import_svg_data(xml.as_bytes(), default_color)
 }
 
-fn parse_svg_length(s: &str, scale: f32) -> f32 {
-    let s = s.trim();
-    if s.ends_with("in") {
-        s[..s.len() - 2].trim().parse::<f32>().unwrap_or(0.0)
-    } else if s.ends_with("cm") {
-        s[..s.len() - 2].trim().parse::<f32>().unwrap_or(0.0) / 2.54
-    } else if s.ends_with("mm") {
-        s[..s.len() - 2].trim().parse::<f32>().unwrap_or(0.0) / 25.4
-    } else if s.ends_with("pt") {
-        s[..s.len() - 2].trim().parse::<f32>().unwrap_or(0.0) / 72.0
-    } else if s.ends_with("px") {
-        s[..s.len() - 2].trim().parse::<f32>().unwrap_or(0.0) * scale
+pub fn import_svg_data(bytes: &[u8], default_color: egui::Color32) -> Vec<CanvasShape> {
+    let opt = usvg::Options::default();
+    let tree = match usvg::Tree::from_data(bytes, &opt) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let svg_w = tree.size().width();
+    let svg_h = tree.size().height();
+    let scale_to_in = if svg_w <= 36.0 && svg_h <= 36.0 {
+        1.0
     } else {
-        s.parse::<f32>().unwrap_or(0.0) * scale
-    }
-}
+        1.0 / 96.0
+    };
 
-fn parse_svg_color(s: &str, default: egui::Color32) -> egui::Color32 {
-    let s = s.trim();
-    if s == "none" || s == "transparent" {
-        return egui::Color32::TRANSPARENT;
-    }
-    if s.starts_with('#') {
-        let hex = &s[1..];
-        if hex.len() == 3 {
-            let r = u8::from_str_radix(&hex[0..1], 16).unwrap_or(0) * 17;
-            let g = u8::from_str_radix(&hex[1..2], 16).unwrap_or(0) * 17;
-            let b = u8::from_str_radix(&hex[2..3], 16).unwrap_or(0) * 17;
-            return egui::Color32::from_rgb(r, g, b);
-        } else if hex.len() >= 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
-            let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
-            let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
-            return egui::Color32::from_rgb(r, g, b);
-        }
-    } else if s.starts_with("rgb(") && s.ends_with(')') {
-        let inner = &s[4..s.len() - 1];
-        let parts: Vec<u8> = inner
-            .split(',')
-            .filter_map(|p| p.trim().parse::<u8>().ok())
-            .collect();
-        if parts.len() >= 3 {
-            return egui::Color32::from_rgb(parts[0], parts[1], parts[2]);
-        }
-    }
-    match s.to_lowercase().as_str() {
-        "black" => egui::Color32::BLACK,
-        "white" => egui::Color32::WHITE,
-        "red" => egui::Color32::from_rgb(255, 0, 0),
-        "green" => egui::Color32::from_rgb(0, 180, 0),
-        "blue" => egui::Color32::from_rgb(0, 100, 255),
-        "yellow" => egui::Color32::from_rgb(255, 230, 0),
-        "cyan" => egui::Color32::from_rgb(0, 220, 220),
-        "magenta" => egui::Color32::from_rgb(230, 0, 230),
-        "gray" | "grey" => egui::Color32::from_gray(128),
-        "orange" => egui::Color32::from_rgb(255, 140, 0),
-        "purple" => egui::Color32::from_rgb(128, 0, 128),
-        _ => default,
-    }
-}
+    let mut usvg_paths = Vec::new();
+    collect_group_paths(tree.root(), &mut usvg_paths);
 
-fn parse_points_list(s: &str, scale: f32) -> Vec<egui::Pos2> {
-    let mut numbers = Vec::new();
-    let mut current = String::new();
-    for c in s.chars() {
-        if c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E' {
-            current.push(c);
-        } else if !current.is_empty() {
-            if let Ok(num) = current.parse::<f32>() {
-                numbers.push(num);
-            }
-            current.clear();
-        }
-    }
-    if !current.is_empty() {
-        if let Ok(num) = current.parse::<f32>() {
-            numbers.push(num);
-        }
-    }
+    let mut result = Vec::new();
 
-    let mut points = Vec::new();
-    for chunk in numbers.chunks_exact(2) {
-        points.push(egui::pos2(chunk[0] * scale, chunk[1] * scale));
-    }
-    points
-}
-
-enum PathToken {
-    Cmd(char),
-    Num(f32),
-}
-
-fn tokenize_path_d(d: &str) -> Vec<PathToken> {
-    let mut tokens = Vec::new();
-    let mut chars = d.chars().peekable();
-
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() || c == ',' {
-            chars.next();
+    for path in usvg_paths {
+        let is_both_none = path.fill().is_none() && path.stroke().is_none();
+        if !path.is_visible() && !is_both_none {
             continue;
         }
-        if c.is_ascii_alphabetic() {
-            chars.next();
-            tokens.push(PathToken::Cmd(c));
-            continue;
-        }
-        if c.is_ascii_digit() || c == '-' || c == '+' || c == '.' {
-            let mut num_str = String::new();
-            if let Some(&sign) = chars.peek() {
-                if sign == '-' || sign == '+' {
-                    num_str.push(chars.next().unwrap());
+
+        let fill_color = if let Some(fill) = path.fill() {
+            match fill.paint() {
+                usvg::Paint::Color(c) => {
+                    let a = (fill.opacity().get() * 255.0).round() as u8;
+                    egui::Color32::from_rgba_unmultiplied(c.red, c.green, c.blue, a)
                 }
-            }
-            let mut has_dot = false;
-            while let Some(&nc) = chars.peek() {
-                if nc.is_ascii_digit() {
-                    num_str.push(chars.next().unwrap());
-                } else if nc == '.' && !has_dot {
-                    has_dot = true;
-                    num_str.push(chars.next().unwrap());
-                } else if (nc == 'e' || nc == 'E') && !num_str.ends_with('e') && !num_str.ends_with('E') {
-                    num_str.push(chars.next().unwrap());
-                    if let Some(&sc) = chars.peek() {
-                        if sc == '+' || sc == '-' {
-                            num_str.push(chars.next().unwrap());
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-            if let Ok(val) = num_str.parse::<f32>() {
-                tokens.push(PathToken::Num(val));
+                _ => default_color,
             }
         } else {
-            chars.next();
-        }
-    }
-    tokens
-}
-
-fn parse_svg_path_d(d: &str, scale: f32) -> Vec<Vec<egui::Pos2>> {
-    let tokens = tokenize_path_d(d);
-    let mut subpaths: Vec<Vec<egui::Pos2>> = Vec::new();
-    let mut current_subpath: Vec<egui::Pos2> = Vec::new();
-
-    let mut cur_x = 0.0_f32;
-    let mut cur_y = 0.0_f32;
-    let mut start_x = 0.0_f32;
-    let mut start_y = 0.0_f32;
-    let mut last_cmd = ' ';
-
-    let mut i = 0;
-    while i < tokens.len() {
-        let cmd = match tokens[i] {
-            PathToken::Cmd(c) => {
-                i += 1;
-                last_cmd = c;
-                c
-            }
-            PathToken::Num(_) => {
-                if last_cmd == 'M' {
-                    'L'
-                } else if last_cmd == 'm' {
-                    'l'
-                } else {
-                    last_cmd
-                }
-            }
+            egui::Color32::TRANSPARENT
         };
 
-        match cmd {
-            'M' | 'm' => {
-                let is_rel = cmd == 'm';
-                if i + 1 < tokens.len() {
-                    if let (PathToken::Num(x), PathToken::Num(y)) = (&tokens[i], &tokens[i + 1]) {
-                        if !current_subpath.is_empty() {
-                            subpaths.push(std::mem::take(&mut current_subpath));
-                        }
-                        if is_rel {
-                            cur_x += x * scale;
-                            cur_y += y * scale;
-                        } else {
-                            cur_x = x * scale;
-                            cur_y = y * scale;
-                        }
-                        start_x = cur_x;
-                        start_y = cur_y;
-                        current_subpath.push(egui::pos2(cur_x, cur_y));
-                        i += 2;
-                    } else { i += 1; }
-                } else { i += 1; }
-            }
-            'L' | 'l' => {
-                let is_rel = cmd == 'l';
-                if i + 1 < tokens.len() {
-                    if let (PathToken::Num(x), PathToken::Num(y)) = (&tokens[i], &tokens[i + 1]) {
-                        if is_rel {
-                            cur_x += x * scale;
-                            cur_y += y * scale;
-                        } else {
-                            cur_x = x * scale;
-                            cur_y = y * scale;
-                        }
-                        current_subpath.push(egui::pos2(cur_x, cur_y));
-                        i += 2;
-                    } else { i += 1; }
-                } else { i += 1; }
-            }
-            'H' | 'h' => {
-                let is_rel = cmd == 'h';
-                if i < tokens.len() {
-                    if let PathToken::Num(x) = &tokens[i] {
-                        if is_rel { cur_x += x * scale; } else { cur_x = x * scale; }
-                        current_subpath.push(egui::pos2(cur_x, cur_y));
-                        i += 1;
-                    } else { i += 1; }
-                } else { i += 1; }
-            }
-            'V' | 'v' => {
-                let is_rel = cmd == 'v';
-                if i < tokens.len() {
-                    if let PathToken::Num(y) = &tokens[i] {
-                        if is_rel { cur_y += y * scale; } else { cur_y = y * scale; }
-                        current_subpath.push(egui::pos2(cur_x, cur_y));
-                        i += 1;
-                    } else { i += 1; }
-                } else { i += 1; }
-            }
-            'C' | 'c' => {
-                let is_rel = cmd == 'c';
-                if i + 5 < tokens.len() {
-                    if let (
-                        PathToken::Num(x1), PathToken::Num(y1),
-                        PathToken::Num(x2), PathToken::Num(y2),
-                        PathToken::Num(x), PathToken::Num(y)
-                    ) = (&tokens[i], &tokens[i+1], &tokens[i+2], &tokens[i+3], &tokens[i+4], &tokens[i+5]) {
-                        let (p1x, p1y, p2x, p2y, target_x, target_y) = if is_rel {
-                            (cur_x + x1*scale, cur_y + y1*scale, cur_x + x2*scale, cur_y + y2*scale, cur_x + x*scale, cur_y + y*scale)
-                        } else {
-                            (x1*scale, y1*scale, x2*scale, y2*scale, x*scale, y*scale)
-                        };
-                        let p0 = egui::pos2(cur_x, cur_y);
-                        let p1 = egui::pos2(p1x, p1y);
-                        let p2 = egui::pos2(p2x, p2y);
-                        let p3 = egui::pos2(target_x, target_y);
-                        for step in 1..=4 {
-                            let t = step as f32 / 4.0;
-                            let it = 1.0 - t;
-                            let pt = p0 * (it * it * it) + p1.to_vec2() * (3.0 * it * it * t) + p2.to_vec2() * (3.0 * it * t * t) + p3.to_vec2() * (t * t * t);
-                            current_subpath.push(pt);
-                        }
-                        cur_x = target_x;
-                        cur_y = target_y;
-                        i += 6;
-                    } else { i += 1; }
-                } else { i += 1; }
-            }
-            'S' | 's' | 'Q' | 'q' => {
-                let is_rel = cmd == 's' || cmd == 'q';
-                if i + 3 < tokens.len() {
-                    if let (
-                        PathToken::Num(x1), PathToken::Num(y1),
-                        PathToken::Num(x), PathToken::Num(y)
-                    ) = (&tokens[i], &tokens[i+1], &tokens[i+2], &tokens[i+3]) {
-                        let (p1x, p1y, target_x, target_y) = if is_rel {
-                            (cur_x + x1*scale, cur_y + y1*scale, cur_x + x*scale, cur_y + y*scale)
-                        } else {
-                            (x1*scale, y1*scale, x*scale, y*scale)
-                        };
-                        let p0 = egui::pos2(cur_x, cur_y);
-                        let p1 = egui::pos2(p1x, p1y);
-                        let p2 = egui::pos2(target_x, target_y);
-                        for step in 1..=3 {
-                            let t = step as f32 / 3.0;
-                            let it = 1.0 - t;
-                            let pt = p0 * (it * it) + p1.to_vec2() * (2.0 * it * t) + p2.to_vec2() * (t * t);
-                            current_subpath.push(pt);
-                        }
-                        cur_x = target_x;
-                        cur_y = target_y;
-                        i += 4;
-                    } else { i += 1; }
-                } else { i += 1; }
-            }
-            'A' | 'a' => {
-                let is_rel = cmd == 'a';
-                if i + 6 < tokens.len() {
-                    if let (PathToken::Num(_), PathToken::Num(_), PathToken::Num(_), PathToken::Num(_), PathToken::Num(_), PathToken::Num(x), PathToken::Num(y)) =
-                        (&tokens[i], &tokens[i+1], &tokens[i+2], &tokens[i+3], &tokens[i+4], &tokens[i+5], &tokens[i+6]) {
-                        if is_rel {
-                            cur_x += x * scale;
-                            cur_y += y * scale;
-                        } else {
-                            cur_x = x * scale;
-                            cur_y = y * scale;
-                        }
-                        current_subpath.push(egui::pos2(cur_x, cur_y));
-                        i += 7;
-                    } else { i += 1; }
-                } else { i += 1; }
-            }
-            'Z' | 'z' => {
-                if (cur_x - start_x).abs() > 0.001 || (cur_y - start_y).abs() > 0.001 {
-                    current_subpath.push(egui::pos2(start_x, start_y));
+        let (stroke_color, stroke_width_in) = if let Some(stroke) = path.stroke() {
+            let col = match stroke.paint() {
+                usvg::Paint::Color(c) => {
+                    let a = (stroke.opacity().get() * 255.0).round() as u8;
+                    egui::Color32::from_rgba_unmultiplied(c.red, c.green, c.blue, a)
                 }
-                cur_x = start_x;
-                cur_y = start_y;
+                _ => egui::Color32::BLACK,
+            };
+            let w_in = (stroke.width().get() * scale_to_in).max(0.01);
+            (Some(col), w_in)
+        } else if is_both_none {
+            // Cutting files with fill="none" and no stroke attribute default to a cut stroke
+            (Some(default_color), 0.05)
+        } else {
+            (None, 0.0)
+        };
+
+        if fill_color.a() == 0 && stroke_color.is_none() {
+            continue;
+        }
+
+        let ts = path.abs_transform();
+        let transformed = if ts.is_identity() {
+            Some(path.data().clone())
+        } else {
+            path.data().clone().transform(ts)
+        };
+
+        let data = match transformed {
+            Some(d) => d,
+            None => continue,
+        };
+
+        let subpaths = extract_subpaths(&data, scale_to_in);
+
+        for (raw_segments, sampled_points, is_closed) in subpaths {
+            if sampled_points.len() < 2 {
+                continue;
             }
-            _ => {
-                i += 1;
+
+            let mut min_x = sampled_points[0].x;
+            let mut min_y = sampled_points[0].y;
+            let mut max_x = sampled_points[0].x;
+            let mut max_y = sampled_points[0].y;
+            for p in &sampled_points {
+                min_x = min_x.min(p.x);
+                min_y = min_y.min(p.y);
+                max_x = max_x.max(p.x);
+                max_y = max_y.max(p.y);
+            }
+            let width = (max_x - min_x).max(0.01);
+            let height = (max_y - min_y).max(0.01);
+
+            let (kind, final_points) = classify_subpath(&raw_segments, &sampled_points, is_closed);
+
+            result.push(CanvasShape {
+                kind,
+                x: min_x,
+                y: min_y,
+                width,
+                height,
+                points: final_points,
+                text: String::new(),
+                fill_color,
+                stroke_color,
+                stroke_width: stroke_width_in,
+                is_closed,
+            });
+        }
+    }
+
+    result
+}
+
+fn collect_group_paths<'a>(g: &'a usvg::Group, out: &mut Vec<&'a usvg::Path>) {
+    for child in g.children() {
+        match child {
+            usvg::Node::Group(sub_g) => collect_group_paths(sub_g, out),
+            usvg::Node::Path(p) => {
+                out.push(p);
+            }
+            usvg::Node::Text(t) => {
+                collect_group_paths(t.flattened(), out);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+enum RawSegment {
+    MoveTo(egui::Pos2),
+    LineTo(egui::Pos2),
+    QuadTo(egui::Pos2, egui::Pos2),
+    CubicTo(egui::Pos2, egui::Pos2, egui::Pos2),
+    Close,
+}
+
+fn extract_subpaths(
+    data: &usvg::tiny_skia_path::Path,
+    scale: f32,
+) -> Vec<(Vec<RawSegment>, Vec<egui::Pos2>, bool)> {
+    let mut result = Vec::new();
+
+    let mut cur_raw = Vec::new();
+    let mut cur_pts = Vec::new();
+    let mut cur_pt = egui::pos2(0.0, 0.0);
+    let mut start_pt = egui::pos2(0.0, 0.0);
+    let mut is_closed = false;
+
+    let finish_subpath = |raw: &mut Vec<RawSegment>, pts: &mut Vec<egui::Pos2>, closed: &mut bool, res: &mut Vec<(Vec<RawSegment>, Vec<egui::Pos2>, bool)>| {
+        if pts.len() >= 2 {
+            res.push((std::mem::take(raw), std::mem::take(pts), *closed));
+        } else {
+            raw.clear();
+            pts.clear();
+        }
+        *closed = false;
+    };
+
+    for seg in data.segments() {
+        match seg {
+            usvg::tiny_skia_path::PathSegment::MoveTo(p) => {
+                if !cur_pts.is_empty() {
+                    finish_subpath(&mut cur_raw, &mut cur_pts, &mut is_closed, &mut result);
+                }
+                cur_pt = egui::pos2(p.x * scale, p.y * scale);
+                start_pt = cur_pt;
+                cur_raw.push(RawSegment::MoveTo(cur_pt));
+                cur_pts.push(cur_pt);
+            }
+            usvg::tiny_skia_path::PathSegment::LineTo(p) => {
+                cur_pt = egui::pos2(p.x * scale, p.y * scale);
+                cur_raw.push(RawSegment::LineTo(cur_pt));
+                cur_pts.push(cur_pt);
+            }
+            usvg::tiny_skia_path::PathSegment::QuadTo(p1, p2) => {
+                let q1 = egui::pos2(p1.x * scale, p1.y * scale);
+                let q2 = egui::pos2(p2.x * scale, p2.y * scale);
+                cur_raw.push(RawSegment::QuadTo(q1, q2));
+                for step in 1..=8 {
+                    let t = step as f32 / 8.0;
+                    let it = 1.0 - t;
+                    let pt = cur_pt * (it * it) + q1.to_vec2() * (2.0 * it * t) + q2.to_vec2() * (t * t);
+                    cur_pts.push(pt);
+                }
+                cur_pt = q2;
+            }
+            usvg::tiny_skia_path::PathSegment::CubicTo(p1, p2, p3) => {
+                let c1 = egui::pos2(p1.x * scale, p1.y * scale);
+                let c2 = egui::pos2(p2.x * scale, p2.y * scale);
+                let c3 = egui::pos2(p3.x * scale, p3.y * scale);
+                cur_raw.push(RawSegment::CubicTo(c1, c2, c3));
+                for step in 1..=12 {
+                    let t = step as f32 / 12.0;
+                    let it = 1.0 - t;
+                    let pt = cur_pt * (it * it * it)
+                        + c1.to_vec2() * (3.0 * it * it * t)
+                        + c2.to_vec2() * (3.0 * it * t * t)
+                        + c3.to_vec2() * (t * t * t);
+                    cur_pts.push(pt);
+                }
+                cur_pt = c3;
+            }
+            usvg::tiny_skia_path::PathSegment::Close => {
+                cur_raw.push(RawSegment::Close);
+                is_closed = true;
+                if (cur_pt - start_pt).length() > 0.001 {
+                    cur_pts.push(start_pt);
+                    cur_pt = start_pt;
+                }
             }
         }
     }
 
-    if !current_subpath.is_empty() {
-        subpaths.push(current_subpath);
+    if !cur_pts.is_empty() {
+        finish_subpath(&mut cur_raw, &mut cur_pts, &mut is_closed, &mut result);
     }
 
-    subpaths
+    result
 }
 
+fn classify_subpath(
+    raw: &[RawSegment],
+    pts: &[egui::Pos2],
+    is_closed: bool,
+) -> (ShapeKind, Vec<egui::Pos2>) {
+    // 1. Line: MoveTo + 1 LineTo (open)
+    if raw.len() == 2 && !is_closed {
+        if let (RawSegment::MoveTo(p0), RawSegment::LineTo(p1)) = (&raw[0], &raw[1]) {
+            return (ShapeKind::Line, vec![*p0, *p1]);
+        }
+    }
+
+    // 2. Axis-aligned Rectangle: MoveTo + 3 LineTo + Close
+    if is_closed && raw.len() == 5 {
+        if let (
+            RawSegment::MoveTo(p0),
+            RawSegment::LineTo(p1),
+            RawSegment::LineTo(p2),
+            RawSegment::LineTo(p3),
+            RawSegment::Close,
+        ) = (&raw[0], &raw[1], &raw[2], &raw[3], &raw[4]) {
+            let is_axis_aligned =
+                ((p0.y - p1.y).abs() < 0.01 && (p1.x - p2.x).abs() < 0.01 && (p2.y - p3.y).abs() < 0.01 && (p3.x - p0.x).abs() < 0.01)
+                || ((p0.x - p1.x).abs() < 0.01 && (p1.y - p2.y).abs() < 0.01 && (p2.x - p3.x).abs() < 0.01 && (p3.y - p0.y).abs() < 0.01);
+            if is_axis_aligned {
+                return (ShapeKind::Rectangle, vec![]);
+            }
+        }
+    }
+
+    // 3. Ellipse / Circle: MoveTo + 4 CubicTo + Close
+    if is_closed && raw.len() == 6 {
+        if let (
+            RawSegment::MoveTo(_),
+            RawSegment::CubicTo(_, _, _),
+            RawSegment::CubicTo(_, _, _),
+            RawSegment::CubicTo(_, _, _),
+            RawSegment::CubicTo(_, _, _),
+            RawSegment::Close,
+        ) = (&raw[0], &raw[1], &raw[2], &raw[3], &raw[4], &raw[5]) {
+            return (ShapeKind::Ellipse, vec![]);
+        }
+    }
+
+    // 4. Default: Freehand polygon/polyline
+    (ShapeKind::Freehand, pts.to_vec())
+}
+
+fn point_in_poly(p: egui::Pos2, poly: &[egui::Pos2]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let pi = poly[i];
+        let pj = poly[j];
+        if ((pi.y > p.y) != (pj.y > p.y))
+            && (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y + 1e-6) + pi.x)
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+fn triangulate_polygon(pts: &[egui::Pos2]) -> Vec<[usize; 3]> {
+    let mut clean_pts = pts;
+    if clean_pts.len() >= 4 && (clean_pts[0] - *clean_pts.last().unwrap()).length() < 0.001 {
+        clean_pts = &clean_pts[..clean_pts.len() - 1];
+    }
+
+    let n = clean_pts.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    if n == 3 {
+        return vec![[0, 1, 2]];
+    }
+
+    let mut area = 0.0_f32;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        area += clean_pts[i].x * clean_pts[j].y - clean_pts[j].x * clean_pts[i].y;
+    }
+    if area.abs() < 1e-6 {
+        return Vec::new();
+    }
+    let ccw = area > 0.0;
+
+    let is_convex = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| -> bool {
+        let cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        if ccw { cross > 1e-6 } else { cross < -1e-6 }
+    };
+
+    let point_in_triangle = |p: egui::Pos2, a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| -> bool {
+        let cp1 = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        let cp2 = (c.x - b.x) * (p.y - b.y) - (c.y - b.y) * (p.x - b.x);
+        let cp3 = (a.x - c.x) * (p.y - c.y) - (a.y - c.y) * (p.x - c.x);
+        if ccw {
+            cp1 >= -1e-6 && cp2 >= -1e-6 && cp3 >= -1e-6
+        } else {
+            cp1 <= 1e-6 && cp2 <= 1e-6 && cp3 <= 1e-6
+        }
+    };
+
+    let mut indices: Vec<usize> = (0..n).collect();
+    let mut triangles = Vec::with_capacity(n - 2);
+
+    let mut count = 2 * indices.len();
+    let mut i = 0;
+    while indices.len() > 3 && count > 0 {
+        count -= 1;
+        let len = indices.len();
+        let prev = indices[(i + len - 1) % len];
+        let curr = indices[i % len];
+        let next = indices[(i + 1) % len];
+
+        let p_prev = clean_pts[prev];
+        let p_curr = clean_pts[curr];
+        let p_next = clean_pts[next];
+
+        if is_convex(p_prev, p_curr, p_next) {
+            let mut is_ear = true;
+            for &idx in &indices {
+                if idx != prev && idx != curr && idx != next {
+                    if point_in_triangle(clean_pts[idx], p_prev, p_curr, p_next) {
+                        is_ear = false;
+                        break;
+                    }
+                }
+            }
+            if is_ear {
+                triangles.push([prev, curr, next]);
+                indices.remove(i % len);
+                count = 2 * indices.len();
+                continue;
+            }
+        }
+        i = (i + 1) % indices.len();
+    }
+
+    if indices.len() == 3 {
+        triangles.push([indices[0], indices[1], indices[2]]);
+    } else if indices.len() > 3 {
+        for k in 1..indices.len() - 1 {
+            triangles.push([indices[0], indices[k], indices[k + 1]]);
+        }
+    }
+
+    triangles
+}
+
+fn draw_filled_polygon(
+    painter: &egui::Painter,
+    screen_pts: &[egui::Pos2],
+    fill_color: egui::Color32,
+    stroke: Option<egui::Stroke>,
+) {
+    if screen_pts.len() < 3 {
+        if let Some(s) = stroke {
+            if screen_pts.len() >= 2 {
+                painter.add(egui::Shape::line(screen_pts.to_vec(), s));
+            }
+        }
+        return;
+    }
+
+    if fill_color.a() > 0 {
+        let triangles = triangulate_polygon(screen_pts);
+        if !triangles.is_empty() {
+            let mut mesh = egui::Mesh::default();
+            let mut clean_pts = screen_pts;
+            if clean_pts.len() >= 4 && (clean_pts[0] - *clean_pts.last().unwrap()).length() < 0.001 {
+                clean_pts = &clean_pts[..clean_pts.len() - 1];
+            }
+            for &pt in clean_pts {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: pt,
+                    uv: egui::epaint::WHITE_UV,
+                    color: fill_color,
+                });
+            }
+            for [i0, i1, i2] in triangles {
+                mesh.add_triangle(i0 as u32, i1 as u32, i2 as u32);
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        } else {
+            painter.add(egui::Shape::convex_polygon(screen_pts.to_vec(), fill_color, egui::Stroke::NONE));
+        }
+    }
+
+    if let Some(s) = stroke {
+        if s.width > 0.0 && s.color.a() > 0 {
+            let mut closed_pts = screen_pts.to_vec();
+            if let (Some(first), Some(last)) = (closed_pts.first(), closed_pts.last()) {
+                if (*first - *last).length() > 0.5 {
+                    closed_pts.push(*first);
+                }
+            }
+            painter.add(egui::Shape::line(closed_pts, s));
+        }
+    }
+}
 impl eframe::App for StudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.screenshot_path.is_some() {
@@ -1672,6 +1596,9 @@ impl eframe::App for StudioApp {
                                 points: vec![],
                                 text,
                                 fill_color: current_fill,
+                                stroke_color: None,
+                                stroke_width: 0.0,
+                                is_closed: false,
                             });
                             self.selected_index = Some(self.shapes.len() - 1);
                         }
@@ -1707,6 +1634,9 @@ impl eframe::App for StudioApp {
                                     points: vec![],
                                     text: String::new(),
                                     fill_color: current_fill,
+                                    stroke_color: Some(egui::Color32::BLACK),
+                                    stroke_width: 0.05,
+                                    is_closed: true,
                                 });
                                 self.selected_index = Some(self.shapes.len() - 1);
                             }
@@ -1726,6 +1656,9 @@ impl eframe::App for StudioApp {
                                     points: vec![],
                                     text: String::new(),
                                     fill_color: current_fill,
+                                    stroke_color: Some(egui::Color32::BLACK),
+                                    stroke_width: 0.05,
+                                    is_closed: true,
                                 });
                                 self.selected_index = Some(self.shapes.len() - 1);
                             }
@@ -1745,7 +1678,10 @@ impl eframe::App for StudioApp {
                                     height: h,
                                     points: vec![start, end],
                                     text: String::new(),
-                                    fill_color: current_fill,
+                                    fill_color: egui::Color32::TRANSPARENT,
+                                    stroke_color: Some(current_fill),
+                                    stroke_width: 0.05,
+                                    is_closed: false,
                                 });
                                 self.selected_index = Some(self.shapes.len() - 1);
                             }
@@ -1774,7 +1710,10 @@ impl eframe::App for StudioApp {
                             height: (max_y - min_y).max(0.05),
                             points: std::mem::take(&mut self.freehand_points),
                             text: String::new(),
-                            fill_color: current_fill,
+                            fill_color: egui::Color32::TRANSPARENT,
+                            stroke_color: Some(current_fill),
+                            stroke_width: 0.05,
+                            is_closed: false,
                         });
                         self.selected_index = Some(self.shapes.len() - 1);
                     } else {
@@ -1783,17 +1722,30 @@ impl eframe::App for StudioApp {
                 }
             }
 
-            // Render shapes over the grid using fill_color and 2px black stroke
+            // Render shapes over the grid using fill_color and stroke settings
             let black_stroke = egui::Stroke::new(2.0_f32, egui::Color32::BLACK);
             for shape in &mut self.shapes {
+                let stroke_opt = shape.stroke_color.and_then(|c| {
+                    if c.a() > 0 {
+                        let sw = (shape.stroke_width * px_per_in).max(1.0);
+                        Some(egui::Stroke::new(sw, c))
+                    } else {
+                        None
+                    }
+                });
+
                 match shape.kind {
                     ShapeKind::Rectangle => {
                         let screen_r = egui::Rect::from_min_size(
                             mat_to_screen(egui::pos2(shape.x, shape.y)),
                             egui::vec2(shape.width * px_per_in, shape.height * px_per_in),
                         );
-                        painter.rect_filled(screen_r, 0.0, shape.fill_color);
-                        painter.rect_stroke(screen_r, 0.0, black_stroke);
+                        if shape.fill_color.a() > 0 {
+                            painter.rect_filled(screen_r, 0.0, shape.fill_color);
+                        }
+                        if let Some(s) = stroke_opt {
+                            painter.rect_stroke(screen_r, 0.0, s);
+                        }
                     }
                     ShapeKind::Ellipse => {
                         let screen_min = mat_to_screen(egui::pos2(shape.x, shape.y));
@@ -1810,7 +1762,7 @@ impl eframe::App for StudioApp {
                             painter.add(egui::Shape::convex_polygon(
                                 pts,
                                 shape.fill_color,
-                                black_stroke,
+                                stroke_opt.unwrap_or(egui::Stroke::NONE),
                             ));
                         }
                     }
@@ -1818,19 +1770,30 @@ impl eframe::App for StudioApp {
                         if shape.points.len() >= 2 {
                             let p1 = mat_to_screen(shape.points[0]);
                             let p2 = mat_to_screen(shape.points[1]);
-                            painter.line_segment([p1, p2], black_stroke);
+                            let s = stroke_opt.unwrap_or_else(|| {
+                                if shape.fill_color.a() > 0 {
+                                    egui::Stroke::new(2.0_f32, shape.fill_color)
+                                } else {
+                                    egui::Stroke::new(2.0_f32, egui::Color32::BLACK)
+                                }
+                            });
+                            painter.line_segment([p1, p2], s);
                         }
                     }
                     ShapeKind::Freehand => {
                         if shape.points.len() >= 2 {
                             let screen_pts: Vec<egui::Pos2> = shape.points.iter().map(|&p| mat_to_screen(p)).collect();
-                            painter.add(egui::Shape::line(
-                                screen_pts,
-                                black_stroke,
-                            ));
+                            if shape.is_closed || shape.fill_color.a() > 0 {
+                                draw_filled_polygon(&painter, &screen_pts, shape.fill_color, stroke_opt);
+                            } else if let Some(s) = stroke_opt {
+                                painter.add(egui::Shape::line(screen_pts, s));
+                            } else {
+                                painter.add(egui::Shape::line(screen_pts, black_stroke));
+                            }
                         } else if let Some(&p) = shape.points.first() {
                             let sp = mat_to_screen(p);
-                            painter.circle_filled(sp, 2.0_f32, egui::Color32::BLACK);
+                            let col = shape.stroke_color.unwrap_or(shape.fill_color);
+                            painter.circle_filled(sp, 2.0_f32, col);
                         }
                     }
                     ShapeKind::Text => {
@@ -1961,6 +1924,9 @@ mod tests {
             points: vec![],
             text: String::new(),
             fill_color: egui::Color32::RED,
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: true,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Line,
@@ -1970,7 +1936,10 @@ mod tests {
             height: 5.0,
             points: vec![egui::pos2(0.0, 0.0), egui::pos2(5.0, 5.0)],
             text: String::new(),
-            fill_color: egui::Color32::BLACK,
+            fill_color: egui::Color32::TRANSPARENT,
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: false,
         });
 
         let tmp_path = std::env::temp_dir().join("test_silhouette_project.json");
@@ -2002,6 +1971,9 @@ mod tests {
             points: vec![],
             text: String::new(),
             fill_color: egui::Color32::RED,
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: true,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Ellipse,
@@ -2012,6 +1984,9 @@ mod tests {
             points: vec![],
             text: String::new(),
             fill_color: egui::Color32::BLUE,
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: true,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Line,
@@ -2021,7 +1996,10 @@ mod tests {
             height: 0.0,
             points: vec![egui::pos2(1.0, 5.0), egui::pos2(4.0, 5.0)],
             text: String::new(),
-            fill_color: egui::Color32::BLACK,
+            fill_color: egui::Color32::TRANSPARENT,
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Freehand,
@@ -2031,7 +2009,10 @@ mod tests {
             height: 2.0,
             points: vec![egui::pos2(2.0, 6.0), egui::pos2(3.0, 7.0), egui::pos2(4.0, 6.0)],
             text: String::new(),
-            fill_color: egui::Color32::BLACK,
+            fill_color: egui::Color32::TRANSPARENT,
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Text,
@@ -2042,6 +2023,9 @@ mod tests {
             points: vec![],
             text: "Hello Silhouette".to_string(),
             fill_color: egui::Color32::BLACK,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: false,
         });
 
         let svg = app.export_svg_string();
@@ -2093,6 +2077,9 @@ mod tests {
             points: vec![],
             text: String::new(),
             fill_color: egui::Color32::from_rgb(200, 50, 50),
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: true,
         });
 
         let tmp_png = std::env::temp_dir().join("test_export_mat.png");
@@ -2117,6 +2104,9 @@ mod tests {
             points: vec![],
             text: String::new(),
             fill_color: egui::Color32::from_rgb(255, 0, 0),
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: true,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Ellipse,
@@ -2127,6 +2117,9 @@ mod tests {
             points: vec![],
             text: String::new(),
             fill_color: egui::Color32::from_rgb(0, 255, 0),
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: true,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Line,
@@ -2136,7 +2129,10 @@ mod tests {
             height: 2.0,
             points: vec![egui::pos2(1.0, 1.0), egui::pos2(3.0, 3.0)],
             text: String::new(),
-            fill_color: egui::Color32::BLACK,
+            fill_color: egui::Color32::TRANSPARENT,
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: false,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Freehand,
@@ -2146,7 +2142,10 @@ mod tests {
             height: 2.0,
             points: vec![egui::pos2(0.0, 0.0), egui::pos2(1.0, 2.0), egui::pos2(2.0, 1.0)],
             text: String::new(),
-            fill_color: egui::Color32::BLACK,
+            fill_color: egui::Color32::from_rgb(0, 0, 0),
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: false,
         });
 
         let svg_str = app.export_svg_string();
@@ -2167,4 +2166,48 @@ mod tests {
         assert_eq!(imported[2].kind, ShapeKind::Line);
         assert_eq!(imported[3].kind, ShapeKind::Freehand);
     }
+
+    #[test]
+    fn test_import_complex_layered_svg() {
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12in\" height=\"12in\" viewBox=\"0 0 1152 1152\">\
+            <style>\
+                .red-fill { fill: #e6194b; }\
+                .no-stroke { stroke: none; }\
+            </style>\
+            <!-- Layer 1: Background banner with group transform -->\
+            <g transform=\"translate(96, 96) scale(1.0)\">\
+                <path class=\"red-fill no-stroke\" d=\"M 0 0 C 96 192, 192 192, 288 0 C 384 192, 480 192, 576 0 L 576 384 L 0 384 Z\" />\
+            </g>\
+            <!-- Layer 2: Foreground detail with nested transform and CSS stroke -->\
+            <g transform=\"translate(192, 192)\">\
+                <g transform=\"rotate(0)\">\
+                    <path d=\"M 0 0 L 192 192 L 0 192 Z\" fill=\"#3cb44b\" stroke=\"#000075\" stroke-width=\"9.6\" />\
+                </g>\
+            </g>\
+        </svg>";
+
+        let shapes = import_svg_str(svg, egui::Color32::GRAY);
+        assert_eq!(shapes.len(), 2);
+
+        // Layer 1
+        assert_eq!(shapes[0].kind, ShapeKind::Freehand);
+        assert_eq!(shapes[0].fill_color, egui::Color32::from_rgb(0xe6, 0x19, 0x4b));
+        // Verify stroke is None because of stroke: none
+        assert_eq!(shapes[0].stroke_color, None);
+        assert!(shapes[0].is_closed);
+        // Bounds in inches (96px = 1.0in, 576px = 6.0in)
+        assert!((shapes[0].x - 1.0).abs() < 0.05);
+        assert!((shapes[0].y - 1.0).abs() < 0.05);
+        assert!((shapes[0].width - 6.0).abs() < 0.05);
+
+        // Layer 2
+        assert_eq!(shapes[1].kind, ShapeKind::Freehand);
+        assert_eq!(shapes[1].fill_color, egui::Color32::from_rgb(0x3c, 0xb4, 0x4b));
+        assert_eq!(shapes[1].stroke_color, Some(egui::Color32::from_rgb(0x00, 0x00, 0x75)));
+        // 9.6px / 96 = 0.1in stroke width
+        assert!((shapes[1].stroke_width - 0.1).abs() < 0.01);
+        assert!((shapes[1].x - 2.0).abs() < 0.05);
+        assert!((shapes[1].y - 2.0).abs() < 0.05);
+    }
+
 }
