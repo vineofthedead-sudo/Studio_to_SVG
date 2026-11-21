@@ -410,6 +410,23 @@ pub struct CachedSvg {
     pub texture: Option<egui::TextureHandle>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Clone)]
+pub struct CanvasSnapshot {
+    pub shapes: Vec<CanvasShape>,
+    pub group_names: std::collections::BTreeMap<u64, String>,
+    pub next_group_id: u64,
+    pub selected_indices: std::collections::BTreeSet<usize>,
+    pub selected_index: Option<usize>,
+}
+
 pub struct StudioApp {
     pub active_tool: Tool,
     pub right_panel: &'static str,
@@ -430,6 +447,11 @@ pub struct StudioApp {
     pub marquee_start: Option<egui::Pos2>,    // in mat inches
     pub freehand_points: Vec<egui::Pos2>,     // in mat inches
     pub is_dragging_shape: bool,
+    pub active_resize_corner: Option<ResizeCorner>,
+    pub resize_initial_rect: Option<egui::Rect>,
+    pub resize_initial_shapes: Vec<(usize, CanvasShape)>,
+    pub undo_stack: Vec<CanvasSnapshot>,
+    pub redo_stack: Vec<CanvasSnapshot>,
     pub paper_texture: Option<egui::TextureHandle>,
     pub paper_image: Option<egui::ColorImage>,
     pub paper_bytes: Option<Vec<u8>>,
@@ -644,6 +666,11 @@ impl StudioApp {
             marquee_start: None,
             freehand_points: Vec::new(),
             is_dragging_shape: false,
+            active_resize_corner: None,
+            resize_initial_rect: None,
+            resize_initial_shapes: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             paper_texture: None,
             paper_image: None,
             paper_bytes: None,
@@ -651,6 +678,122 @@ impl StudioApp {
             screenshot_path,
             frames_rendered: 0,
         }
+    }
+
+    pub fn push_undo(&mut self) {
+        let snapshot = CanvasSnapshot {
+            shapes: self.shapes.clone(),
+            group_names: self.group_names.clone(),
+            next_group_id: self.next_group_id,
+            selected_indices: self.selected_indices.clone(),
+            selected_index: self.selected_index,
+        };
+        self.undo_stack.push(snapshot);
+        if self.undo_stack.len() > 50 {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            let current = CanvasSnapshot {
+                shapes: self.shapes.clone(),
+                group_names: self.group_names.clone(),
+                next_group_id: self.next_group_id,
+                selected_indices: self.selected_indices.clone(),
+                selected_index: self.selected_index,
+            };
+            self.redo_stack.push(current);
+            if self.redo_stack.len() > 50 {
+                self.redo_stack.remove(0);
+            }
+
+            self.shapes = snapshot.shapes;
+            self.group_names = snapshot.group_names;
+            self.next_group_id = snapshot.next_group_id;
+            self.selected_indices = snapshot.selected_indices;
+            self.selected_index = snapshot.selected_index;
+            self.sync_active_properties();
+            self.set_status("Undo");
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            let current = CanvasSnapshot {
+                shapes: self.shapes.clone(),
+                group_names: self.group_names.clone(),
+                next_group_id: self.next_group_id,
+                selected_indices: self.selected_indices.clone(),
+                selected_index: self.selected_index,
+            };
+            self.undo_stack.push(current);
+            if self.undo_stack.len() > 50 {
+                self.undo_stack.remove(0);
+            }
+
+            self.shapes = snapshot.shapes;
+            self.group_names = snapshot.group_names;
+            self.next_group_id = snapshot.next_group_id;
+            self.selected_indices = snapshot.selected_indices;
+            self.selected_index = snapshot.selected_index;
+            self.sync_active_properties();
+            self.set_status("Redo");
+        }
+    }
+
+    pub fn get_selection_bounds(&self) -> Option<egui::Rect> {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() {
+            return None;
+        }
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        let mut any = false;
+        for &idx in &sel {
+            if let Some(s) = self.shapes.get(idx) {
+                if s.is_visible {
+                    any = true;
+                    let r = s.bounding_rect();
+                    min_x = min_x.min(r.min.x);
+                    min_y = min_y.min(r.min.y);
+                    max_x = max_x.max(r.max.x);
+                    max_y = max_y.max(r.max.y);
+                }
+            }
+        }
+        if any && max_x > min_x && max_y > min_y {
+            Some(egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y)))
+        } else {
+            None
+        }
+    }
+
+    pub fn hit_test_resize_handle(
+        &self,
+        mouse_screen: egui::Pos2,
+        sel_mat_rect: egui::Rect,
+        mat_to_screen: impl Fn(egui::Pos2) -> egui::Pos2,
+    ) -> Option<ResizeCorner> {
+        let hit_radius = 12.0_f32;
+        let s_min = mat_to_screen(sel_mat_rect.min);
+        let s_max = mat_to_screen(sel_mat_rect.max);
+        let screen_rect = egui::Rect::from_min_max(s_min, s_max).expand(3.0);
+        let corners = [
+            (ResizeCorner::TopLeft, screen_rect.left_top()),
+            (ResizeCorner::TopRight, screen_rect.right_top()),
+            (ResizeCorner::BottomLeft, screen_rect.left_bottom()),
+            (ResizeCorner::BottomRight, screen_rect.right_bottom()),
+        ];
+        for (corner, pt) in corners {
+            if (mouse_screen - pt).length() <= hit_radius {
+                return Some(corner);
+            }
+        }
+        None
     }
 
     pub fn is_selected(&self, idx: usize) -> bool {
@@ -741,6 +884,7 @@ impl StudioApp {
     pub fn group_selected(&mut self) {
         let sel = self.all_selected_indices();
         if sel.len() >= 2 {
+            self.push_undo();
             let gid = self.next_group_id();
             self.group_names.insert(gid, format!("Group {}", gid));
             for &idx in &sel {
@@ -779,6 +923,7 @@ impl StudioApp {
             return;
         }
 
+        self.push_undo();
         let mut dissolved_count = 0;
         for s in &mut self.shapes {
             let matches = if let Some(&top_gid) = s.group_path.first() {
@@ -844,6 +989,7 @@ impl StudioApp {
             return;
         }
 
+        self.push_undo();
         let mut color_groups: std::collections::BTreeMap<([u8; 4], Option<[u8; 4]>), Vec<usize>> = std::collections::BTreeMap::new();
         for &idx in &targets {
             let shape = &self.shapes[idx];
@@ -877,6 +1023,7 @@ impl StudioApp {
         if sel.is_empty() || sel.len() == self.shapes.len() {
             return;
         }
+        self.push_undo();
         let mut selected_shapes = Vec::new();
         let mut unselected_shapes = Vec::new();
         for (i, shape) in self.shapes.drain(..).enumerate() {
@@ -899,6 +1046,7 @@ impl StudioApp {
         if sel.is_empty() || sel.len() == self.shapes.len() {
             return;
         }
+        self.push_undo();
         let mut selected_shapes = Vec::new();
         let mut unselected_shapes = Vec::new();
         for (i, shape) in self.shapes.drain(..).enumerate() {
@@ -921,6 +1069,7 @@ impl StudioApp {
         if sel.is_empty() {
             return;
         }
+        self.push_undo();
         let mut new_sel = std::collections::BTreeSet::new();
         for &idx in sel.iter().rev() {
             if idx + 1 < self.shapes.len() && !sel.contains(&(idx + 1)) {
@@ -940,6 +1089,7 @@ impl StudioApp {
         if sel.is_empty() {
             return;
         }
+        self.push_undo();
         let mut new_sel = std::collections::BTreeSet::new();
         for &idx in &sel {
             if idx > 0 && !sel.contains(&(idx - 1)) {
@@ -985,6 +1135,7 @@ impl StudioApp {
     pub fn open_project_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let data: ProjectData = serde_json::from_str(&content)?;
+        self.push_undo();
         self.mat_width_in = data.mat_width_in;
         self.mat_height_in = data.mat_height_in;
         self.shapes = data.shapes.into_iter().map(CanvasShape::from_serializable).collect();
@@ -1392,6 +1543,7 @@ impl StudioApp {
 
         let count = imported.len();
         if count > 0 {
+            self.push_undo();
             let start_idx = self.shapes.len();
             let mut init_min_x = f32::MAX;
             let mut init_min_y = f32::MAX;
@@ -2083,15 +2235,26 @@ impl eframe::App for StudioApp {
 
         // Keyboard shortcuts
         if !ctx.wants_keyboard_input() {
+            // Undo: Ctrl+Z (without Shift)
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
+                self.undo();
+            }
+            // Redo: Ctrl+Y or Ctrl+Shift+Z
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z)))) {
+                self.redo();
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
                 let mut to_remove = self.all_selected_indices();
-                to_remove.sort_unstable();
-                for &idx in to_remove.iter().rev() {
-                    if idx < self.shapes.len() && !self.shapes[idx].is_locked {
-                        self.shapes.remove(idx);
+                if !to_remove.is_empty() {
+                    self.push_undo();
+                    to_remove.sort_unstable();
+                    for &idx in to_remove.iter().rev() {
+                        if idx < self.shapes.len() && !self.shapes[idx].is_locked {
+                            self.shapes.remove(idx);
+                        }
                     }
+                    self.clear_selection();
                 }
-                self.clear_selection();
             }
             if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::G)) {
                 self.group_selected();
@@ -2106,11 +2269,14 @@ impl eframe::App for StudioApp {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New Design").clicked() {
-                        self.shapes.clear();
-                        self.cached_svgs.clear();
-                        self.clear_selection();
-                        self.pan = egui::Vec2::ZERO;
-                        self.zoom = 1.0;
+                        if !self.shapes.is_empty() {
+                            self.push_undo();
+                            self.shapes.clear();
+                            self.cached_svgs.clear();
+                            self.clear_selection();
+                            self.pan = egui::Vec2::ZERO;
+                            self.zoom = 1.0;
+                        }
                         ui.close_menu();
                     }
                     ui.separator();
@@ -2184,6 +2350,17 @@ impl eframe::App for StudioApp {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
+                    let can_undo = !self.undo_stack.is_empty();
+                    if ui.add_enabled(can_undo, egui::Button::new("Undo (Ctrl+Z)")).clicked() {
+                        self.undo();
+                        ui.close_menu();
+                    }
+                    let can_redo = !self.redo_stack.is_empty();
+                    if ui.add_enabled(can_redo, egui::Button::new("Redo (Ctrl+Y)")).clicked() {
+                        self.redo();
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Reset View").clicked() {
                         self.zoom = 1.0;
                         self.pan = egui::Vec2::ZERO;
@@ -2220,19 +2397,25 @@ impl eframe::App for StudioApp {
                     let has_sel = sel_count > 0;
                     if ui.add_enabled(has_sel, egui::Button::new("Delete Selected")).clicked() {
                         let mut to_remove = self.all_selected_indices();
-                        to_remove.sort_unstable();
-                        for &idx in to_remove.iter().rev() {
-                            if idx < self.shapes.len() && !self.shapes[idx].is_locked {
-                                self.shapes.remove(idx);
+                        if !to_remove.is_empty() {
+                            self.push_undo();
+                            to_remove.sort_unstable();
+                            for &idx in to_remove.iter().rev() {
+                                if idx < self.shapes.len() && !self.shapes[idx].is_locked {
+                                    self.shapes.remove(idx);
+                                }
                             }
+                            self.clear_selection();
                         }
-                        self.clear_selection();
                         ui.close_menu();
                     }
                     if ui.button("Clear All Shapes").clicked() {
-                        self.shapes.clear();
-                        self.cached_svgs.clear();
-                        self.clear_selection();
+                        if !self.shapes.is_empty() {
+                            self.push_undo();
+                            self.shapes.clear();
+                            self.cached_svgs.clear();
+                            self.clear_selection();
+                        }
                         ui.close_menu();
                     }
                 });
@@ -2575,28 +2758,6 @@ impl eframe::App for StudioApp {
                 }
             }
 
-            // Set cursor icon based on active tool
-            if response.hovered() {
-                match self.active_tool {
-                    Tool::Select => {
-                        if self.is_dragging_shape {
-                            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                        } else {
-                            ctx.set_cursor_icon(egui::CursorIcon::Default);
-                        }
-                    }
-                    Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Freehand => {
-                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-                    }
-                    Tool::Text => {
-                        ctx.set_cursor_icon(egui::CursorIcon::Text);
-                    }
-                }
-            }
-
-            // Background canvas fill
-            painter.rect_filled(rect, 0.0, egui::Color32::from_gray(42));
-
             let px_per_in = 40.0 * self.zoom;
             let mat_size = egui::vec2(self.mat_width_in * px_per_in, self.mat_height_in * px_per_in);
             let mat_min = rect.center() - mat_size * 0.5 + self.pan;
@@ -2615,6 +2776,46 @@ impl eframe::App for StudioApp {
                     mat_rect.min.y + pos.y * px_per_in,
                 )
             };
+
+            // Set cursor icon based on active tool
+            if response.hovered() {
+                match self.active_tool {
+                    Tool::Select => {
+                        let active_corner = self.active_resize_corner.or_else(|| {
+                            let mouse_pos = ctx.input(|i| i.pointer.latest_pos());
+                            if let (Some(m_pos), Some(sel_rect)) = (mouse_pos, self.get_selection_bounds()) {
+                                self.hit_test_resize_handle(m_pos, sel_rect, &mat_to_screen)
+                            } else {
+                                None
+                            }
+                        });
+
+                        if let Some(corner) = active_corner {
+                            match corner {
+                                ResizeCorner::TopLeft | ResizeCorner::BottomRight => {
+                                    ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                                }
+                                ResizeCorner::TopRight | ResizeCorner::BottomLeft => {
+                                    ctx.set_cursor_icon(egui::CursorIcon::ResizeNeSw);
+                                }
+                            }
+                        } else if self.is_dragging_shape {
+                            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                        } else {
+                            ctx.set_cursor_icon(egui::CursorIcon::Default);
+                        }
+                    }
+                    Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Freehand => {
+                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    }
+                    Tool::Text => {
+                        ctx.set_cursor_icon(egui::CursorIcon::Text);
+                    }
+                }
+            }
+
+            // Background canvas fill
+            painter.rect_filled(rect, 0.0, egui::Color32::from_gray(42));
 
             // Mat background and paper image (if loaded)
             painter.rect_filled(mat_rect, 2.0, egui::Color32::WHITE);
@@ -2648,24 +2849,46 @@ impl eframe::App for StudioApp {
                     let mat_pos = screen_to_mat(pos);
                     match self.active_tool {
                         Tool::Select => {
-                            let hit = self.shapes.iter().enumerate().rev().find(|(_, s)| {
-                                s.is_visible && s.hit_test(mat_pos, hit_tol)
-                            }).map(|(i, _)| i);
-                            let is_shift = ctx.input(|i| i.modifiers.shift);
-                            if let Some(idx) = hit {
-                                if is_shift {
-                                    self.toggle_select_shape(idx);
-                                } else if !self.is_selected(idx) {
-                                    self.select_shape(idx, false);
-                                }
-                                self.is_dragging_shape = !self.shapes[idx].is_locked;
+                            let handle_hit = if let Some(sel_rect) = self.get_selection_bounds() {
+                                self.hit_test_resize_handle(pos, sel_rect, &mat_to_screen)
+                            } else {
+                                None
+                            };
+
+                            if let Some(corner) = handle_hit {
+                                self.push_undo();
+                                self.active_resize_corner = Some(corner);
+                                self.resize_initial_rect = self.get_selection_bounds();
+                                self.resize_initial_shapes = self.all_selected_indices().into_iter().filter_map(|idx| {
+                                    self.shapes.get(idx).map(|s| (idx, s.clone()))
+                                }).collect();
+                                self.is_dragging_shape = false;
                                 self.marquee_start = None;
                             } else {
-                                if !is_shift {
-                                    self.clear_selection();
+                                let hit = self.shapes.iter().enumerate().rev().find(|(_, s)| {
+                                    s.is_visible && s.hit_test(mat_pos, hit_tol)
+                                }).map(|(i, _)| i);
+                                let is_shift = ctx.input(|i| i.modifiers.shift);
+                                if let Some(idx) = hit {
+                                    if is_shift {
+                                        self.toggle_select_shape(idx);
+                                    } else if !self.is_selected(idx) {
+                                        self.select_shape(idx, false);
+                                    }
+                                    if !self.shapes[idx].is_locked {
+                                        self.push_undo();
+                                        self.is_dragging_shape = true;
+                                    } else {
+                                        self.is_dragging_shape = false;
+                                    }
+                                    self.marquee_start = None;
+                                } else {
+                                    if !is_shift {
+                                        self.clear_selection();
+                                    }
+                                    self.marquee_start = Some(mat_pos);
+                                    self.is_dragging_shape = false;
                                 }
-                                self.marquee_start = Some(mat_pos);
-                                self.is_dragging_shape = false;
                             }
                         }
                         Tool::Rectangle | Tool::Ellipse | Tool::Line => {
@@ -2683,7 +2906,83 @@ impl eframe::App for StudioApp {
             if response.dragged_by(egui::PointerButton::Primary) {
                 match self.active_tool {
                     Tool::Select => {
-                        if self.is_dragging_shape {
+                        if let (Some(corner), Some(init_rect)) = (self.active_resize_corner, self.resize_initial_rect) {
+                            let curr_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+                            if let Some(pos) = curr_pos {
+                                let mouse_mat = screen_to_mat(pos);
+                                let is_shift = ctx.input(|i| i.modifiers.shift);
+                                let init_w = init_rect.width().max(0.001);
+                                let init_h = init_rect.height().max(0.001);
+
+                                let (anchor, mut new_w, mut new_h, anchor_at_min_x, anchor_at_min_y) = match corner {
+                                    ResizeCorner::TopLeft => {
+                                        let a = init_rect.max;
+                                        let w = (a.x - mouse_mat.x).max(0.05);
+                                        let h = (a.y - mouse_mat.y).max(0.05);
+                                        (a, w, h, false, false)
+                                    }
+                                    ResizeCorner::TopRight => {
+                                        let a = egui::pos2(init_rect.min.x, init_rect.max.y);
+                                        let w = (mouse_mat.x - a.x).max(0.05);
+                                        let h = (a.y - mouse_mat.y).max(0.05);
+                                        (a, w, h, true, false)
+                                    }
+                                    ResizeCorner::BottomLeft => {
+                                        let a = egui::pos2(init_rect.max.x, init_rect.min.y);
+                                        let w = (a.x - mouse_mat.x).max(0.05);
+                                        let h = (mouse_mat.y - a.y).max(0.05);
+                                        (a, w, h, false, true)
+                                    }
+                                    ResizeCorner::BottomRight => {
+                                        let a = init_rect.min;
+                                        let w = (mouse_mat.x - a.x).max(0.05);
+                                        let h = (mouse_mat.y - a.y).max(0.05);
+                                        (a, w, h, true, true)
+                                    }
+                                };
+
+                                if is_shift {
+                                    let scale = (new_w / init_w).max(new_h / init_h).max(0.01);
+                                    new_w = init_w * scale;
+                                    new_h = init_h * scale;
+                                }
+
+                                let new_min_x = if anchor_at_min_x { anchor.x } else { anchor.x - new_w };
+                                let new_max_x = if anchor_at_min_x { anchor.x + new_w } else { anchor.x };
+                                let new_min_y = if anchor_at_min_y { anchor.y } else { anchor.y - new_h };
+                                let new_max_y = if anchor_at_min_y { anchor.y + new_h } else { anchor.y };
+                                let new_rect = egui::Rect::from_min_max(egui::pos2(new_min_x, new_min_y), egui::pos2(new_max_x, new_max_y));
+
+                                for (idx, orig_shape) in &self.resize_initial_shapes {
+                                    if let Some(shape) = self.shapes.get_mut(*idx) {
+                                        if shape.is_locked {
+                                            continue;
+                                        }
+                                        let u_x = (orig_shape.x - init_rect.min.x) / init_w;
+                                        let u_y = (orig_shape.y - init_rect.min.y) / init_h;
+                                        let u_w = orig_shape.width / init_w;
+                                        let u_h = orig_shape.height / init_h;
+
+                                        shape.x = new_rect.min.x + u_x * new_rect.width();
+                                        shape.y = new_rect.min.y + u_y * new_rect.height();
+                                        shape.width = (u_w * new_rect.width()).max(0.01);
+                                        shape.height = (u_h * new_rect.height()).max(0.01);
+
+                                        if !orig_shape.points.is_empty() {
+                                            shape.points = orig_shape.points.iter().map(|&pt| {
+                                                let pt_u_x = (pt.x - init_rect.min.x) / init_w;
+                                                let pt_u_y = (pt.y - init_rect.min.y) / init_h;
+                                                egui::pos2(
+                                                    new_rect.min.x + pt_u_x * new_rect.width(),
+                                                    new_rect.min.y + pt_u_y * new_rect.height(),
+                                                )
+                                            }).collect();
+                                        }
+                                        shape.is_modified = true;
+                                    }
+                                }
+                            }
+                        } else if self.is_dragging_shape {
                             let delta_in = response.drag_delta() / px_per_in;
                             for idx in self.all_selected_indices() {
                                 if let Some(shape) = self.shapes.get_mut(idx) {
@@ -2721,56 +3020,66 @@ impl eframe::App for StudioApp {
 
             // Click handling
             if response.clicked() {
-                let click_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
-                if let Some(pos) = click_pos {
-                    let mat_pos = screen_to_mat(pos);
-                    match self.active_tool {
-                        Tool::Select => {
-                            let hit = self.shapes.iter().enumerate().rev().find(|(_, s)| {
-                                s.hit_test(mat_pos, hit_tol)
-                            }).map(|(i, _)| i);
-                            self.selected_index = hit;
-                            if let Some(idx) = hit {
-                                let s = &self.shapes[idx];
-                                self.fill_color = [
-                                    s.fill_color.r() as f32 / 255.0,
-                                    s.fill_color.g() as f32 / 255.0,
-                                    s.fill_color.b() as f32 / 255.0,
-                                ];
-                                if s.kind == ShapeKind::Text && !s.text.is_empty() {
-                                    self.text_sample = s.text.clone();
+                let clicked_handle = if let Some(sel_rect) = self.get_selection_bounds() {
+                    let click_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+                    click_pos.and_then(|p| self.hit_test_resize_handle(p, sel_rect, &mat_to_screen))
+                } else {
+                    None
+                };
+
+                if clicked_handle.is_none() {
+                    let click_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+                    if let Some(pos) = click_pos {
+                        let mat_pos = screen_to_mat(pos);
+                        match self.active_tool {
+                            Tool::Select => {
+                                let hit = self.shapes.iter().enumerate().rev().find(|(_, s)| {
+                                    s.hit_test(mat_pos, hit_tol)
+                                }).map(|(i, _)| i);
+                                self.selected_index = hit;
+                                if let Some(idx) = hit {
+                                    let s = &self.shapes[idx];
+                                    self.fill_color = [
+                                        s.fill_color.r() as f32 / 255.0,
+                                        s.fill_color.g() as f32 / 255.0,
+                                        s.fill_color.b() as f32 / 255.0,
+                                    ];
+                                    if s.kind == ShapeKind::Text && !s.text.is_empty() {
+                                        self.text_sample = s.text.clone();
+                                    }
                                 }
                             }
+                            Tool::Text => {
+                                self.push_undo();
+                                let text = if self.text_sample.is_empty() { "Sample Design".to_string() } else { self.text_sample.clone() };
+                                let initial_w = (text.len() as f32 * 0.35).max(0.8);
+                                let initial_h = 0.6;
+                                self.shapes.push(CanvasShape {
+                                    kind: ShapeKind::Text,
+                                    x: mat_pos.x,
+                                    y: mat_pos.y,
+                                    width: initial_w,
+                                    height: initial_h,
+                                    points: vec![],
+                                    text,
+                                    fill_color: current_fill,
+                                    stroke_color: None,
+                                    stroke_width: 0.0,
+                                    is_closed: false,
+                                    is_svg_path: false,
+                                    is_modified: false,
+                                    triangles: vec![],
+                                    group_id: None,
+                                    group_path: Vec::new(),
+                                    is_visible: true,
+                                    is_locked: false,
+                                    pixmap: None,
+                                    texture: None,
+                                });
+                                self.select_shape(self.shapes.len() - 1, false);
+                            }
+                            _ => {}
                         }
-                        Tool::Text => {
-                            let text = if self.text_sample.is_empty() { "Sample Design".to_string() } else { self.text_sample.clone() };
-                            let initial_w = (text.len() as f32 * 0.35).max(0.8);
-                            let initial_h = 0.6;
-                            self.shapes.push(CanvasShape {
-                                kind: ShapeKind::Text,
-                                x: mat_pos.x,
-                                y: mat_pos.y,
-                                width: initial_w,
-                                height: initial_h,
-                                points: vec![],
-                                text,
-                                fill_color: current_fill,
-                                stroke_color: None,
-                                stroke_width: 0.0,
-                                is_closed: false,
-                                is_svg_path: false,
-                                is_modified: false,
-                                triangles: vec![],
-                                group_id: None,
-                                group_path: Vec::new(),
-                                is_visible: true,
-                                is_locked: false,
-                                pixmap: None,
-                                texture: None,
-                            });
-                            self.select_shape(self.shapes.len() - 1, false);
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -2780,6 +3089,16 @@ impl eframe::App for StudioApp {
                 || ctx.input(|i| i.pointer.primary_released());
 
             if primary_released {
+                if self.active_resize_corner.is_some() {
+                    self.active_resize_corner = None;
+                    self.resize_initial_rect = None;
+                    for (idx, _) in &self.resize_initial_shapes {
+                        if let Some(shape) = self.shapes.get_mut(*idx) {
+                            shape.precompute_triangles();
+                        }
+                    }
+                    self.resize_initial_shapes.clear();
+                }
                 self.is_dragging_shape = false;
                 let curr_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
                 let curr_mat = curr_pos.map(screen_to_mat);
@@ -2811,6 +3130,7 @@ impl eframe::App for StudioApp {
                             let w = (start.x - end.x).abs();
                             let h = (start.y - end.y).abs();
                             if w > 0.05 || h > 0.05 {
+                                self.push_undo();
                                 self.shapes.push(CanvasShape {
                                     kind: ShapeKind::Rectangle,
                                     x: min_x,
@@ -2842,6 +3162,7 @@ impl eframe::App for StudioApp {
                             let w = (start.x - end.x).abs();
                             let h = (start.y - end.y).abs();
                             if w > 0.05 || h > 0.05 {
+                                self.push_undo();
                                 self.shapes.push(CanvasShape {
                                     kind: ShapeKind::Ellipse,
                                     x: min_x,
@@ -2874,6 +3195,7 @@ impl eframe::App for StudioApp {
                                 let min_y = start.y.min(end.y);
                                 let w = (start.x - end.x).abs().max(0.01);
                                 let h = (start.y - end.y).abs().max(0.01);
+                                self.push_undo();
                                 self.shapes.push(CanvasShape {
                                     kind: ShapeKind::Line,
                                     x: min_x,
@@ -2938,6 +3260,7 @@ impl eframe::App for StudioApp {
                             texture: None,
                         };
                         shape.precompute_triangles();
+                        self.push_undo();
                         self.shapes.push(shape);
                         self.select_shape(self.shapes.len() - 1, false);
                     } else {
@@ -2978,32 +3301,13 @@ impl eframe::App for StudioApp {
 
             // Render shapes over the grid using fill_color and stroke settings
             let black_stroke = egui::Stroke::new(2.0_f32, egui::Color32::BLACK);
-            let sel_set = self.selected_indices.clone();
-            let sel_single = self.selected_index;
-            for (i, shape) in self.shapes.iter_mut().enumerate() {
+            for shape in self.shapes.iter_mut() {
                 if !shape.is_visible {
                     continue;
                 }
-                let is_selected = sel_set.contains(&i) || sel_single == Some(i);
 
                 let is_in_active_cached_group = shape.group_id.map_or(false, |gid| active_cached_groups.contains(&gid));
                 if is_in_active_cached_group {
-                    if is_selected {
-                        // Highlight cut contour outline of selected shape over the texture
-                        let highlight_stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 150, 255));
-                        if shape.points.len() >= 2 {
-                            let screen_pts: Vec<egui::Pos2> = shape.points.iter().map(|&p| mat_to_screen(p)).collect();
-                            if shape.is_closed {
-                                let mut closed = screen_pts;
-                                if let (Some(f), Some(l)) = (closed.first(), closed.last()) {
-                                    if (*f - *l).length() > 0.5 { closed.push(*f); }
-                                }
-                                painter.add(egui::Shape::line(closed, highlight_stroke));
-                            } else {
-                                painter.add(egui::Shape::line(screen_pts, highlight_stroke));
-                            }
-                        }
-                    }
                     continue;
                 }
 
@@ -3017,24 +3321,6 @@ impl eframe::App for StudioApp {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
-
-                    if is_selected {
-                        let highlight_stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 150, 255));
-                        if shape.points.len() >= 2 {
-                            let screen_pts: Vec<egui::Pos2> = shape.points.iter().map(|&p| mat_to_screen(p)).collect();
-                            if shape.is_closed {
-                                let mut closed = screen_pts;
-                                if let (Some(f), Some(l)) = (closed.first(), closed.last()) {
-                                    if (*f - *l).length() > 0.5 { closed.push(*f); }
-                                }
-                                painter.add(egui::Shape::line(closed, highlight_stroke));
-                            } else {
-                                painter.add(egui::Shape::line(screen_pts, highlight_stroke));
-                            }
-                        } else {
-                            painter.rect_stroke(screen_rect, 0.0, highlight_stroke);
-                        }
-                    }
                     continue;
                 }
 
@@ -3189,42 +3475,32 @@ impl eframe::App for StudioApp {
             }
 
             // Dashed bounding box for all selected shapes (combined bounds for groups/multi-selection)
-            let sel_indices = self.all_selected_indices();
-            if !sel_indices.is_empty() {
-                let mut min_x = f32::MAX;
-                let mut min_y = f32::MAX;
-                let mut max_x = f32::MIN;
-                let mut max_y = f32::MIN;
-                let mut any_visible = false;
-                for &idx in &sel_indices {
-                    if let Some(shape) = self.shapes.get(idx) {
-                        if shape.is_visible {
-                            any_visible = true;
-                            let r = shape.bounding_rect();
-                            min_x = min_x.min(r.min.x);
-                            min_y = min_y.min(r.min.y);
-                            max_x = max_x.max(r.max.x);
-                            max_y = max_y.max(r.max.y);
-                        }
-                    }
-                }
-                if any_visible && max_x > min_x && max_y > min_y {
-                    let screen_min = mat_to_screen(egui::pos2(min_x, min_y));
-                    let screen_size = egui::vec2((max_x - min_x) * px_per_in, (max_y - min_y) * px_per_in);
-                    let bounding_rect = egui::Rect::from_min_size(screen_min, screen_size).expand(3.0);
-                    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 120, 215));
-                    draw_dashed_rect(&painter, bounding_rect, stroke, 6.0, 4.0);
+            if let Some(sel_rect) = self.get_selection_bounds() {
+                let screen_min = mat_to_screen(sel_rect.min);
+                let screen_max = mat_to_screen(sel_rect.max);
+                let bounding_rect = egui::Rect::from_min_max(screen_min, screen_max).expand(3.0);
+                let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 120, 215));
+                draw_dashed_rect(&painter, bounding_rect, stroke, 6.0, 4.0);
 
-                    let handle_size = 6.0;
-                    for pt in [
-                        bounding_rect.left_top(),
-                        bounding_rect.right_top(),
-                        bounding_rect.left_bottom(),
-                        bounding_rect.right_bottom(),
-                    ] {
-                        let hr = egui::Rect::from_center_size(pt, egui::vec2(handle_size, handle_size));
-                        painter.rect_filled(hr, 0.0, egui::Color32::WHITE);
-                        painter.rect_stroke(hr, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0, 120, 215)));
+                let mouse_pos = ctx.input(|i| i.pointer.latest_pos());
+                let hovered_corner = mouse_pos.and_then(|p| self.hit_test_resize_handle(p, sel_rect, &mat_to_screen));
+
+                let handle_size = 8.0_f32;
+                let corners = [
+                    (ResizeCorner::TopLeft, bounding_rect.left_top()),
+                    (ResizeCorner::TopRight, bounding_rect.right_top()),
+                    (ResizeCorner::BottomLeft, bounding_rect.left_bottom()),
+                    (ResizeCorner::BottomRight, bounding_rect.right_bottom()),
+                ];
+                for (corner, pt) in corners {
+                    let hr = egui::Rect::from_center_size(pt, egui::vec2(handle_size, handle_size));
+                    let is_active = self.active_resize_corner == Some(corner) || hovered_corner == Some(corner);
+                    if is_active {
+                        painter.rect_filled(hr, 1.0, egui::Color32::from_rgb(210, 235, 255));
+                        painter.rect_stroke(hr, 1.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 120, 215)));
+                    } else {
+                        painter.rect_filled(hr, 1.0, egui::Color32::WHITE);
+                        painter.rect_stroke(hr, 1.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0, 120, 215)));
                     }
                 }
             }
@@ -3899,5 +4175,127 @@ mod tests {
         let tree = build_layer_tree(&indices, 0, &app.shapes);
         // At depth 0, we have 3 groups: Mickey, Dress, Bow
         assert_eq!(tree.len(), 3);
+    }
+
+    #[test]
+    fn test_undo_redo_stack() {
+        let mut app = StudioApp::new(None);
+        assert_eq!(app.shapes.len(), 0);
+
+        // 1. Add first shape with undo snapshot
+        app.push_undo();
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 1.0, y: 1.0, width: 2.0, height: 2.0, points: vec![],
+            text: String::new(), fill_color: egui::Color32::RED, stroke_color: None, stroke_width: 0.0,
+            is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
+            group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
+            pixmap: None, texture: None,
+        });
+        assert_eq!(app.shapes.len(), 1);
+
+        // 2. Add second shape with undo snapshot
+        app.push_undo();
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Ellipse,
+            x: 4.0, y: 4.0, width: 2.0, height: 2.0, points: vec![],
+            text: String::new(), fill_color: egui::Color32::BLUE, stroke_color: None, stroke_width: 0.0,
+            is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
+            group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
+            pixmap: None, texture: None,
+        });
+        assert_eq!(app.shapes.len(), 2);
+
+        // 3. Undo: second shape is removed
+        app.undo();
+        assert_eq!(app.shapes.len(), 1);
+        assert_eq!(app.shapes[0].kind, ShapeKind::Rectangle);
+
+        // 4. Undo: first shape is removed
+        app.undo();
+        assert_eq!(app.shapes.len(), 0);
+
+        // 5. Redo: first shape restored
+        app.redo();
+        assert_eq!(app.shapes.len(), 1);
+        assert_eq!(app.shapes[0].kind, ShapeKind::Rectangle);
+
+        // 6. Redo: second shape restored
+        app.redo();
+        assert_eq!(app.shapes.len(), 2);
+        assert_eq!(app.shapes[1].kind, ShapeKind::Ellipse);
+    }
+
+    #[test]
+    fn test_corner_resize_scaling() {
+        let mut app = StudioApp::new(None);
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 2.0, y: 2.0, width: 4.0, height: 4.0,
+            points: vec![egui::pos2(2.0, 2.0), egui::pos2(6.0, 2.0), egui::pos2(6.0, 6.0), egui::pos2(2.0, 6.0)],
+            text: String::new(), fill_color: egui::Color32::RED, stroke_color: None, stroke_width: 0.0,
+            is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
+            group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
+            pixmap: None, texture: None,
+        });
+        app.select_shape(0, false);
+
+        let sel_rect = app.get_selection_bounds().expect("selection bounds exist");
+        assert_eq!(sel_rect.min, egui::pos2(2.0, 2.0));
+        assert_eq!(sel_rect.max, egui::pos2(6.0, 6.0));
+
+        // Test hit test for resize handles with realistic screen scale (e.g. 50 px/in)
+        let mat_to_screen = |p: egui::Pos2| egui::pos2(p.x * 50.0, p.y * 50.0);
+        let s_min = mat_to_screen(sel_rect.min);
+        let s_max = mat_to_screen(sel_rect.max);
+        let s_rect = egui::Rect::from_min_max(s_min, s_max).expand(3.0);
+
+        let top_left = s_rect.left_top();
+        let hit = app.hit_test_resize_handle(top_left, sel_rect, mat_to_screen);
+        assert_eq!(hit, Some(ResizeCorner::TopLeft));
+
+        let top_right = s_rect.right_top();
+        let hit_tr = app.hit_test_resize_handle(top_right, sel_rect, mat_to_screen);
+        assert_eq!(hit_tr, Some(ResizeCorner::TopRight));
+
+        let bottom_left = s_rect.left_bottom();
+        let hit_bl = app.hit_test_resize_handle(bottom_left, sel_rect, mat_to_screen);
+        assert_eq!(hit_bl, Some(ResizeCorner::BottomLeft));
+
+        let bottom_right = s_rect.right_bottom();
+        let hit_br = app.hit_test_resize_handle(bottom_right, sel_rect, mat_to_screen);
+        assert_eq!(hit_br, Some(ResizeCorner::BottomRight));
+
+        // Simulate resizing from BottomRight: double size to (2.0, 2.0) -> (10.0, 10.0)
+        let init_rect = sel_rect;
+        let init_w = init_rect.width();
+        let init_h = init_rect.height();
+        let orig_shape = app.shapes[0].clone();
+        let new_rect = egui::Rect::from_min_max(egui::pos2(2.0, 2.0), egui::pos2(10.0, 10.0));
+
+        let shape = &mut app.shapes[0];
+        let u_x = (orig_shape.x - init_rect.min.x) / init_w;
+        let u_y = (orig_shape.y - init_rect.min.y) / init_h;
+        let u_w = orig_shape.width / init_w;
+        let u_h = orig_shape.height / init_h;
+
+        shape.x = new_rect.min.x + u_x * new_rect.width();
+        shape.y = new_rect.min.y + u_y * new_rect.height();
+        shape.width = u_w * new_rect.width();
+        shape.height = u_h * new_rect.height();
+        shape.points = orig_shape.points.iter().map(|&pt| {
+            let pt_u_x = (pt.x - init_rect.min.x) / init_w;
+            let pt_u_y = (pt.y - init_rect.min.y) / init_h;
+            egui::pos2(
+                new_rect.min.x + pt_u_x * new_rect.width(),
+                new_rect.min.y + pt_u_y * new_rect.height(),
+            )
+        }).collect();
+
+        assert_eq!(shape.x, 2.0);
+        assert_eq!(shape.y, 2.0);
+        assert_eq!(shape.width, 8.0);
+        assert_eq!(shape.height, 8.0);
+        assert_eq!(shape.points[2], egui::pos2(10.0, 10.0));
     }
 }

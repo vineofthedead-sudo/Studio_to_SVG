@@ -8,7 +8,23 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ### Completed Tonight
 
-#### 1. SVG Group Hierarchy Preservation & Multi-Level Ungrouping (Inkscape Parity)
+#### 1. Interactive Corner Resize Handles & Shift Aspect-Ratio Lock
+- **Draggable 4-Corner Handles**: Interactive 8px square handles at all 4 corners (`TopLeft`, `TopRight`, `BottomLeft`, `BottomRight`) on the selection bounding box for live mouse-driven scaling of individual shapes or entire multi-shape groups.
+- **Directional Cursor Icons**: Hovering or dragging over corners dynamically updates the cursor to `ResizeNwSe` or `ResizeNeSw`.
+- **Shift Key Aspect Ratio Lock**: Holding `Shift` while dragging any corner constrains scaling to preserve the selection's original aspect ratio.
+- **Normalized Multi-Shape Scaling**: Scales child shape positions `(x, y)`, dimensions `(width, height)`, and polygon vertices smoothly relative to the opposite anchor corner with zero distortion.
+- **Active & Hover Highlighting**: Corner handles highlight with active fill (`#D2EBFF`) and high-contrast outline (`#0078D7`) when hovered or actively dragged.
+
+#### 2. Clean Selection Bounding Box (No Diagonal Compound-Path Artifacts)
+- **Eliminated Diagonal Cross-Lines**: Removed raw polyline stroke rendering across compound SVG paths (`M ... Z M ... Z`), ensuring complex multi-layer designs (like characters with cutouts, eyes, or inner contours) select cleanly with only an outer dashed bounding rectangle.
+- **Tight Visual Framing**: Selected shapes display a clean dashed border with 4 corner drag handles, matching professional vector editors (Inkscape, Illustrator, Silhouette Studio).
+
+#### 3. Bounded Undo / Redo History Stack (`Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z`)
+- **Full Canvas State Snapshots**: Automatically records state snapshots (`shapes`, `group_names`, `next_group_id`, selection) up to 50 levels deep before destructive or transformative actions (move, resize, delete, clear, group, ungroup, layer reorder, import, shape creation).
+- **Standard Keyboard Shortcuts**: Full support for `Ctrl+Z` (Undo), `Ctrl+Y` (Redo), and `Ctrl+Shift+Z` (Redo).
+- **Edit Menu Integration**: Enabled/disabled "Undo (Ctrl+Z)" and "Redo (Ctrl+Y)" menu items in the top menu bar with live status bar feedback.
+
+#### 4. SVG Group Hierarchy Preservation & Multi-Level Ungrouping (Inkscape Parity)
 - **Nested `<g>` Hierarchy (`group_path: Vec<u64>`)**: Instead of flattening complex SVGs into an unorganized flat group of loose paths, the full nested `<g>` group structure is preserved through an ancestor stack (`group_path`).
 - **Semantic Subgroup Naming**: Inherits XML group IDs (e.g. `Minnie`, `Mickey`, `Presents`, `Bow`, `Dress`) directly into `StudioApp::group_names` for clear layer hierarchy.
 - **Multi-Level Ungrouping**:
@@ -84,11 +100,9 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 1. **`.studio` / `.studio3` Legacy Format Support**:
    - Reverse-engineer and parse proprietary Silhouette Studio v2/v3/v4 binary container formats (encrypted ZIP / zlib streams containing proprietary shape vectors, text styles, and cut settings) to allow opening existing library files directly on Linux.
-2. **Interactive Corner Transform Handles**:
-   - Interactive bounding box drag handles for proportional and non-proportional mouse-driven scaling and rotation directly on the cutting mat.
-3. **Cardstock Offset / Contour Tool**:
+2. **Cardstock Offset / Contour Tool**:
    - Polygon buffering algorithm to create exterior or interior cut lines (offsets) around text and shapes for stickers, vinyl decals, and layered cardstock backing.
-4. **Undo / Redo Stack**:
-   - Command-pattern or snapshot-based state management (`Ctrl+Z` / `Ctrl+Y`) for seamless rollback of canvas edits, movements, deletions, and layer reordering.
-5. **Direct USB Cutter Device Communication**:
+3. **Rotation Transform Handle & Angle Readout**:
+   - Top center rotation stalk handle for mouse-driven angular rotation of selections on the cutting mat with Shift-snapping (15-degree increments).
+4. **Direct USB Cutter Device Communication**:
    - `libusb` interface for Silhouette Cameo (1-5), Portrait (1-4), and Curio cutters to send G-code / GP-GL commands directly over USB on Linux without Windows emulation.
