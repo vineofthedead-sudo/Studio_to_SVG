@@ -11,16 +11,21 @@ All notable changes, architectural implementations, and roadmap milestones for t
 #### 1. Silhouette Studio Binary Format Parser & Converter (`.studio` / `.studio3`)
 - **Dedicated Parser Module (`app/src/studio_format.rs`)**:
   - Full reverse-engineered binary container decoding for both legacy `.studio` (v2-v4) and modern `.studio3` (v4-v5) proprietary formats without requiring Windows or Silhouette Studio.
-- **Binary Header & Stream Detection**:
-  - `.studio` (`silhouette04;`): Serialized object stream detected directly at byte offset `0x0000`.
-  - `.studio3` (`silhouette05;`): 1,024-byte (`0x0400`) header with section offset table, followed by serialized `silhouette05;` object stream at `0x0400` (or stream offset designated in header table).
+- **Zero Panics & Safe Bounds Checking**:
+  - Replaced all unchecked slice indexing, naked `unwrap()` calls, and unchecked allocations with safe `.get()` slice access and saturating bounds checking (`read_u8`, `read_u32_le`, `read_u64_le`, `read_f32_le`).
+  - Gracefully handles malformed, truncated, or massive files without risking memory corruption or panics.
+- **Vector Document Stream Isolation**:
+  - Detects embedded PNG preview raster chunks (`89 50 4E 47`) and confines vector stream decoding strictly to the document vector slice (`[0x0400..png_start]`), preventing false-positive marker matches and avoiding unnecessary scanning of large multi-megabyte thumbnail data.
+- **Resilient 34-Byte Bézier Record & Transform Extraction**:
+  - Decodes the official Silhouette Studio 34-byte record layout (`ax, ay, tag1, h1x, h1y, tag2, h2x, h2y, tail`) where control handles are relative tangent vectors when tagged, falling back to flat 24-byte coordinate fixtures for synthetic test data.
+  - Recovers trailing 2D affine transform matrices `[a, b, tx, c, d, ty]` applied to shapes.
+  - Normalizes, scales, and centers extracted vector paths directly onto the mat canvas.
+- **Real-File Verification Suite**:
+  - Added integration tests directly verifying real `.studio` and `.studio3` files (`Peeker Bears.studio` yielding 27 complex paths and `DISNEY HEARTS.studio3` yielding 2,640 paths), asserting finite non-zero bounding boxes and valid SVG generation.
+  - Ensured `test_samples/` is ignored in `.gitignore`.
 - **Document Metadata & Units**:
   - Parses mat dimensions (`12x12`, `letter`, `12x24`, `portrait`, `A4` in points: 72 pt = 1 in) and automatically configures the canvas mat size.
   - Extracts semantic layer names (`Default Layer`, `Layer 1`, etc.) and maps them directly into `StudioApp::group_names`.
-- **Cubic Bézier Path Vertex Records (`01 21 00 00 00`)**:
-  - Decodes `01 21 00 00 00` marker records containing anchor coordinates `(x, y)` and incoming/outgoing control handles `(cx1, cy1)`, `(cx2, cy2)` as little-endian IEEE-754 `f32` values.
-  - Handles 2D affine transform matrices `[a, b, tx, c, d, ty]` applied to vertices.
-  - Preserves RGBA stroke colors (defaulting to standard `#FF0000` cut lines) and fill colors.
 - **Adaptive de Casteljau Subdivision**:
   - Recursively subdivides cubic Bézier curves until chord deviation is within tolerance, generating smooth polylines with zero unnecessary points on straight segments.
   - Generates `CanvasShape`s with precomputed polygon mesh triangulation for full-color on-mat rendering, vector SVG export, and high-DPI PNG export.
