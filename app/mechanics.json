@@ -1,0 +1,1 @@
+{"version": 1, "values": [{"name": "walk speed", "group": "movement", "value": 4.5, "unit": "m/s", "source": "function address"}, {"name": "crouch", "group": "controls", "value": "hold", "estimated": true}]}

@@ -1,0 +1,304 @@
+{
+  "id": "ev_d4499fe7b136523fc9a96ff31c3cb85e24f317da2e9a4c13c7663f45efcb4c6f",
+  "subject": {
+    "kind": "pe",
+    "sha256": "79216b0f1418716453b180c2af84f883bca56b2bc5467ea20772e6c4d20be77f",
+    "name": "SS_V5.0.556.001_W6R.exe"
+  },
+  "operation": "native_strings_find",
+  "params": {
+    "case_sensitive": false,
+    "limit": 500,
+    "mode": "literal",
+    "offset": 0,
+    "pattern": "text"
+  },
+  "result": {
+    "matches": [
+      {
+        "address": "0x4e978c",
+        "references": [
+          {
+            "from": "0x4e93d0",
+            "function": null
+          },
+          {
+            "from": "0x520668",
+            "function": null
+          },
+          {
+            "from": "0x52069c",
+            "function": null
+          },
+          {
+            "from": "0x520700",
+            "function": null
+          },
+          {
+            "from": "0x52071c",
+            "function": null
+          },
+          {
+            "from": "0x52074c",
+            "function": null
+          },
+          {
+            "from": "0x520874",
+            "function": null
+          }
+        ],
+        "section": ".rdata",
+        "text": "Text"
+      },
+      {
+        "address": "0x4e981c",
+        "references": [
+          {
+            "from": "0x4e9398",
+            "function": null
+          },
+          {
+            "from": "0x4e93d4",
+            "function": null
+          }
+        ],
+        "section": ".rdata",
+        "text": "GlassText"
+      },
+      {
+        "address": "0x4e9ac0",
+        "references": [],
+        "section": ".rdata",
+        "text": "AI_CF_TITLE_TEXT_STYLE"
+      },
+      {
+        "address": "0x4ea198",
+        "references": [],
+        "section": ".rdata",
+        "text": "ScrollableText"
+      },
+      {
+        "address": "0x4ea610",
+        "references": [],
+        "section": ".rdata",
+        "text": "AI_HIDE_CAPTION_ICON_AND_TEXT_ALL"
+      },
+      {
+        "address": "0x4ea654",
+        "references": [],
+        "section": ".rdata",
+        "text": "AI_HIDE_CAPTION_ICON_AND_TEXT"
+      },
+      {
+        "address": "0x4eaf80",
+        "references": [
+          {
+            "from": "0x520760",
+            "function": null
+          }
+        ],
+        "section": ".rdata",
+        "text": "TextStyle"
+      },
+      {
+        "address": "0x4eb0ca",
+        "references": [],
+        "section": ".rdata",
+        "text": "ATextControlEventHandler"
+      },
+      {
+        "address": "0x4eb9cc",
+        "references": [
+          {
+            "from": "0x4242ae",
+            "function": "sub_42428e"
+          }
+        ],
+        "section": ".rdata",
+        "text": "DrawThemeText"
+      },
+      {
+        "address": "0x4ecfce",
+        "references": [],
+        "section": ".rdata",
+        "text": "Bcontrols\\ScrollableTextControl.cpp"
+      },
+      {
+        "address": "0x4ed3f4",
+        "references": [
+          {
+            "from": "0x43063b",
+            "function": "sub_43062f"
+          }
+        ],
+        "section": ".rdata",
+        "text": "UIText"
+      },
+      {
+        "address": "0x4ef010",
+        "references": [],
+        "section": ".rdata",
+        "text": "MsiGetBytesCountText"
+      },
+      {
+        "address": "0x4ef0ee",
+        "references": [],
+        "section": ".rdata",
+        "text": "CAI_COLOR_DISABLED_TEXT"
+      },
+      {
+        "address": "0x4ef560",
+        "references": [],
+        "section": ".rdata",
+        "text": "AI_BTN_HIDE_TEXT_"
+      },
+      {
+        "address": "0x4ef5f4",
+        "references": [],
+        "section": ".rdata",
+        "text": "AI_IMAGE_BTN_TEXT_ALIGNMENT_"
+      },
+      {
+        "address": "0x4f236c",
+        "references": [
+          {
+            "from": "0x465d2f",
+            "function": "sub_465d1f"
+          },
+          {
+            "from": "0x520474",
+            "function": null
+          }
+        ],
+        "section": ".rdata",
+        "text": "InterbootContext"
+      },
+      {
+        "address": "0x4fa558",
+        "references": [
+          {
+            "from": "0x47e4b3",
+            "function": "sub_47e47f"
+          }
+        ],
+        "section": ".rdata",
+        "text": "InitExtraction"
+      },
+      {
+        "address": "0x4fc148",
+        "references": [
+          {
+            "from": "0x51f9f0",
+            "function": null
+          }
+        ],
+        "section": ".rdata",
+        "text": "ActionText"
+      },
+      {
+        "address": "0x4fca88",
+        "references": [
+          {
+            "from": "0x49cb3a",
+            "function": "sub_49c159"
+          },
+          {
+            "from": "0x49cb81",
+            "function": "sub_49c159"
+          }
+        ],
+        "section": ".rdata",
+        "text": "ButtonText_Next"
+      },
+      {
+        "address": "0x51a376",
+        "references": [],
+        "section": ".rdata",
+        "text": "GdipGetImageGraphicsContext"
+      },
+      {
+        "address": "0x51a7d6",
+        "references": [],
+        "section": ".rdata",
+        "text": "DrawThemeTextEx"
+      },
+      {
+        "address": "0x51ba3c",
+        "references": [],
+        "section": ".rdata",
+        "text": "GetWindowTextW"
+      },
+      {
+        "address": "0x51ba4e",
+        "references": [],
+        "section": ".rdata",
+        "text": "GetWindowTextLengthW"
+      },
+      {
+        "address": "0x51bb3c",
+        "references": [],
+        "section": ".rdata",
+        "text": "SetWindowTextW"
+      },
+      {
+        "address": "0x51bc0e",
+        "references": [],
+        "section": ".rdata",
+        "text": "DrawTextW"
+      },
+      {
+        "address": "0x51c07a",
+        "references": [],
+        "section": ".rdata",
+        "text": "DrawTextExW"
+      },
+      {
+        "address": "0x51c1f8",
+        "references": [],
+        "section": ".rdata",
+        "text": "SetTextColor"
+      },
+      {
+        "address": "0x51c298",
+        "references": [],
+        "section": ".rdata",
+        "text": "ExtTextOutW"
+      },
+      {
+        "address": "0x51c8da",
+        "references": [],
+        "section": ".rdata",
+        "text": "SetConsoleTextAttribute"
+      },
+      {
+        "address": "0x57c650",
+        "references": [],
+        "section": ".rsrc",
+        "text": "Please read the following text carefully."
+      }
+    ],
+    "total": 30
+  },
+  "summary": "30 strings match \"text\".",
+  "confidence": "observed",
+  "authority": "original-files",
+  "environment": {
+    "clean_room": false,
+    "engine": "builtin",
+    "engine_version": "0.6.1",
+    "host": "linux-x86_64"
+  },
+  "limitations": [
+    {
+      "code": "data_sections_only",
+      "message": "only strings stored in the file are searched (absence is not proof)"
+    }
+  ],
+  "coverage": {
+    "status": "complete",
+    "examined": 30,
+    "total": 30
+  },
+  "locations": [],
+  "links": []
+}

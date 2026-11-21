@@ -1,0 +1,13 @@
+{
+  "name": "silhouette-studio-rebuild",
+  "version": "1.0.0",
+  "description": "Rebuilt version of the Silhouette Studio app using web technologies.",
+  "main": "index.js",
+  "scripts": {
+    "start": "echo 'Development server placeholder'",
+    "build": "echo 'Build script placeholder'"
+  },
+  "keywords": ["silhouette", "design", "rebuild"],
+  "author": "",
+  "license": "ISC"
+}
