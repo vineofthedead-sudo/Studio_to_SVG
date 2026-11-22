@@ -167,6 +167,10 @@ pub struct ProjectData {
 impl CanvasShape {
     pub fn precompute_triangles(&mut self) {
         if self.kind == ShapeKind::Freehand && self.is_closed && self.points.len() >= 3 && self.fill_color.a() > 0 {
+            if self.is_svg_path && self.text.matches('M').count() > 1 {
+                self.triangles.clear();
+                return;
+            }
             self.triangles = triangulate_polygon(&self.points);
         } else {
             self.triangles.clear();
@@ -402,6 +406,11 @@ impl CanvasShape {
         self.y += delta.y;
         for p in &mut self.points {
             *p += delta;
+        }
+        if self.is_svg_path && !self.text.is_empty() {
+            self.text = crate::studio_format::transform_svg_path_data(
+                &self.text, 1.0, 0.0, 0.0, delta.x, delta.y,
+            );
         }
         self.is_modified = true;
     }

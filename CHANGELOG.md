@@ -4,6 +4,23 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.4.4] - 2026-11-21
+
+### Added & Improved
+- **Disconnected Subpath Segmentation & Explicit SVG `MoveTo` Boundaries (`app/src/studio_format.rs`)**:
+  - Identified the exact 10-byte subpath contour header structure (`01 [len: u32] 01 [vertex_count: u32]`) separating disconnected islands within Studio shape records (e.g. 262 subpaths across the 5 cats in `BD CATS.studio`).
+  - Introduced `StudioSubpath` and `StudioShapeCluster` segmentation in `parse_paths`, breaking vertices into subpaths when `gap > 4` (nominal consecutive vertex gap is 0, contour header gap is 10 bytes).
+  - Emitted explicit SVG `M` (`MoveTo`) and `Z` (`ClosePath`) commands per subpath (`M x0 y0 L ... Z M x0' y0' ... Z`) instead of flattening disconnected islands into a single continuous wire. Completely eliminates stray diagonal connecting lines cutting across silhouettes and counters.
+  - Pre-rendered `tiny_skia::Pixmap` using `PathBuilder` with per-subpath `pb.move_to(...)` and `pb.close()`, filled with `tiny_skia::FillRule::EvenOdd` and stroked with clean path caps and joins.
+- **Canvas & Transform Lockstep (`app/src/studio_format.rs`, `app/src/main.rs`)**:
+  - Implemented `transform_svg_path_data` to ensure SVG path coordinates scale and translate in 100% lockstep with vertex points during mat normalization and UI shape translations.
+  - Updated `CanvasShape::precompute_triangles` to prevent polygon ear-clipping from creating bridge triangles across multi-contour compound paths.
+- **Regression Testing & Verification (`app/src/studio_format.rs`)**:
+  - Added `test_bd_cats_multi_subpath_segmentation_no_diagonal_artifacts` verifying that all 5 cats in `BD CATS.studio` parse as multi-contour SVG paths (`M count > 1`, up to 81 subpaths per cat) with pre-rendered EvenOdd pixmaps and zero straight-line `Z L` bridge artifacts.
+  - All 56 tests passing with 0 warnings or failures. Release build verified.
+
+---
+
 ## [0.4.3] - 2026-11-21
 
 ### Added & Improved

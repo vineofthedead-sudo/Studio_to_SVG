@@ -171,6 +171,14 @@ pub struct StudioBezierVertex {
     pub handle_out: egui::Pos2, // (cx2, cy2)
 }
 
+/// A subpath contour within a Studio shape record, bounded by MoveTo boundaries.
+#[derive(Debug, Clone)]
+pub struct StudioSubpath {
+    pub start_pos: usize,
+    pub end_pos: usize,
+    pub vertices: Vec<StudioBezierVertex>,
+}
+
 /// Parsed Silhouette Studio Document containing metadata and `CanvasShape`s.
 #[derive(Debug, Clone)]
 pub struct ParsedStudioDocument {
@@ -362,12 +370,69 @@ fn normalize_shapes_onto_mat(shapes: &mut [CanvasShape], mat_w_in: f32, mat_h_in
             pt.y = target_cy + (pt.y - orig_cy) * scale;
         }
 
+        if shape.is_svg_path && !shape.text.is_empty() {
+            shape.text = transform_svg_path_data(&shape.text, scale, orig_cx, orig_cy, target_cx, target_cy);
+        }
+
         let (s_min_x, s_min_y, s_max_x, s_max_y) = compute_bounds(&shape.points);
         shape.x = s_min_x;
         shape.y = s_min_y;
         shape.width = (s_max_x - s_min_x).max(0.005);
         shape.height = (s_max_y - s_min_y).max(0.005);
         shape.precompute_triangles();
+    }
+}
+
+/// Transforms 2D coordinates within SVG path data string (`d`) using scale and offset.
+pub fn transform_svg_path_data(
+    text: &str,
+    scale: f32,
+    orig_cx: f32,
+    orig_cy: f32,
+    target_cx: f32,
+    target_cy: f32,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut tokens = text.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        if tok == "M" || tok == "L" {
+            if let (Some(x_str), Some(y_str)) = (tokens.next(), tokens.next()) {
+                if let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) {
+                    let tx = target_cx + (x - orig_cx) * scale;
+                    let ty = target_cy + (y - orig_cy) * scale;
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(&format!("{} {:.4} {:.4}", tok, tx, ty));
+                    continue;
+                }
+            }
+        } else if tok == "Z" {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str("Z");
+            continue;
+        } else if let Some((x_str, y_str)) = tok.split_once(',') {
+            if let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) {
+                let tx = target_cx + (x - orig_cx) * scale;
+                let ty = target_cy + (y - orig_cy) * scale;
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&format!("{:.4},{:.4}", tx, ty));
+                continue;
+            }
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(tok);
+    }
+    if out.is_empty() {
+        text.to_string()
+    } else {
+        out
     }
 }
 
@@ -749,39 +814,40 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         return shapes;
     }
 
-    // Cluster consecutive vertices into paths based on stream proximity (nominal stride = 26 or 34 bytes)
-    struct PathCluster {
-        start_pos: usize,
-        end_pos: usize,
-        vertices: Vec<StudioBezierVertex>,
-    }
-
-    let mut path_clusters: Vec<PathCluster> = Vec::new();
-    let mut cur_cluster: Vec<(usize, usize, StudioBezierVertex)> = Vec::new();
+    let mut subpaths: Vec<StudioSubpath> = Vec::new();
+    let mut cur_subpath_verts: Vec<StudioBezierVertex> = Vec::new();
+    let mut cur_sub_start = 0;
+    let mut cur_sub_end = 0;
 
     for (pos, rec_len, vert) in vertices_with_pos {
-        if let Some(&(prev_pos, prev_len, _)) = cur_cluster.last() {
-            let gap = pos.saturating_sub(prev_pos + prev_len);
-            if gap > 48 {
-                if cur_cluster.len() >= 2 {
-                    let start_pos = cur_cluster.first().map(|p| p.0).unwrap_or(0);
-                    let end_pos = cur_cluster.last().map(|p| p.0 + p.1).unwrap_or(start_pos);
-                    let vertices = cur_cluster.into_iter().map(|p| p.2).collect();
-                    path_clusters.push(PathCluster { start_pos, end_pos, vertices });
+        if !cur_subpath_verts.is_empty() {
+            let gap = pos.saturating_sub(cur_sub_end);
+            if gap > 4 {
+                if cur_subpath_verts.len() >= 2 {
+                    subpaths.push(StudioSubpath {
+                        start_pos: cur_sub_start,
+                        end_pos: cur_sub_end,
+                        vertices: cur_subpath_verts,
+                    });
                 }
-                cur_cluster = Vec::new();
+                cur_subpath_verts = Vec::new();
+                cur_sub_start = pos;
             }
+        } else {
+            cur_sub_start = pos;
         }
-        cur_cluster.push((pos, rec_len, vert));
+        cur_subpath_verts.push(vert);
+        cur_sub_end = pos + rec_len;
     }
-    if cur_cluster.len() >= 2 {
-        let start_pos = cur_cluster.first().map(|p| p.0).unwrap_or(0);
-        let end_pos = cur_cluster.last().map(|p| p.0 + p.1).unwrap_or(start_pos);
-        let vertices = cur_cluster.into_iter().map(|p| p.2).collect();
-        path_clusters.push(PathCluster { start_pos, end_pos, vertices });
+    if cur_subpath_verts.len() >= 2 {
+        subpaths.push(StudioSubpath {
+            start_pos: cur_sub_start,
+            end_pos: cur_sub_end,
+            vertices: cur_subpath_verts,
+        });
     }
 
-    if path_clusters.is_empty() {
+    if subpaths.is_empty() {
         return shapes;
     }
 
@@ -828,14 +894,60 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         s_idx = s_idx.saturating_add(1);
     }
 
+    // Group consecutive subpaths into shapes.
+    // Consecutive subpaths belonging to the same compound path are separated by 10-byte contour headers (gap <= 48)
+    // and share the same style record. Different shapes are separated by gap > 48 or by style records.
+    #[derive(Debug, Clone)]
+    struct StudioShapeCluster {
+        start_pos: usize,
+        end_pos: usize,
+        subpaths: Vec<StudioSubpath>,
+    }
+
+    let mut shape_clusters: Vec<StudioShapeCluster> = Vec::new();
+    let mut cur_cluster_subs: Vec<StudioSubpath> = Vec::new();
+
+    for sub in subpaths {
+        if let Some(prev) = cur_cluster_subs.last() {
+            let gap = sub.start_pos.saturating_sub(prev.end_pos);
+            let has_style_boundary = style_records.iter().any(|sr| sr.pos > prev.start_pos && sr.pos <= sub.start_pos);
+            if gap > 48 || has_style_boundary {
+                if !cur_cluster_subs.is_empty() {
+                    let start_pos = cur_cluster_subs.first().map(|s| s.start_pos).unwrap_or(0);
+                    let end_pos = cur_cluster_subs.last().map(|s| s.end_pos).unwrap_or(start_pos);
+                    shape_clusters.push(StudioShapeCluster {
+                        start_pos,
+                        end_pos,
+                        subpaths: cur_cluster_subs,
+                    });
+                }
+                cur_cluster_subs = Vec::new();
+            }
+        }
+        cur_cluster_subs.push(sub);
+    }
+    if !cur_cluster_subs.is_empty() {
+        let start_pos = cur_cluster_subs.first().map(|s| s.start_pos).unwrap_or(0);
+        let end_pos = cur_cluster_subs.last().map(|s| s.end_pos).unwrap_or(start_pos);
+        shape_clusters.push(StudioShapeCluster {
+            start_pos,
+            end_pos,
+            subpaths: cur_cluster_subs,
+        });
+    }
+
+    if shape_clusters.is_empty() {
+        return shapes;
+    }
+
     // Determine matrix and fill for each cluster
     let mut cluster_data: Vec<(AffineTransform2D, egui::Color32)> = Vec::new();
     let mut last_valid_xfm = AffineTransform2D::default();
     let mut last_valid_fill = egui::Color32::TRANSPARENT;
 
-    for idx in 0..path_clusters.len() {
-        let cluster = &path_clusters[idx];
-        let next_start = path_clusters.get(idx + 1).map(|p| p.start_pos).unwrap_or(stream.len());
+    for idx in 0..shape_clusters.len() {
+        let cluster = &shape_clusters[idx];
+        let next_start = shape_clusters.get(idx + 1).map(|p| p.start_pos).unwrap_or(stream.len());
 
         let cur_style = style_records.iter().rev().find(|sr| sr.pos <= cluster.start_pos);
         let next_style_pos = style_records
@@ -907,26 +1019,24 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
 
     // Document-wide unit check: check maximum transformed coordinate
     let mut doc_max_coord: f32 = 0.0;
-    for (cluster, (xfm, _)) in path_clusters.iter().zip(cluster_data.iter()) {
-        for v in &cluster.vertices {
-            let p_tx = xfm.apply(v.anchor);
-            doc_max_coord = doc_max_coord.max(p_tx.x.abs().max(p_tx.y.abs()));
+    for (cluster, (xfm, _)) in shape_clusters.iter().zip(cluster_data.iter()) {
+        for sub in &cluster.subpaths {
+            for v in &sub.vertices {
+                let p_tx = xfm.apply(v.anchor);
+                doc_max_coord = doc_max_coord.max(p_tx.x.abs().max(p_tx.y.abs()));
+            }
         }
     }
 
-    // In Silhouette Studio, document coordinates and lengths are stored in millimeters (mm).
-    // 1 inch = 25.4 mm.
-    // If transformed coords exceed 24.0 (the largest physical cutting mat size in inches),
-    // they are in millimeters and must be scaled by 1.0 / 25.4 (not 1.0 / 72.0, which shrinks to 1/3 scale).
     let scale_to_in = if doc_max_coord > 24.0 { 1.0 / 25.4 } else { 1.0 };
 
     let current_stroke = egui::Color32::from_rgb(255, 38, 38); // Silhouette cut line: Red (#ff2626)
     let current_stroke_width = 0.02_f32; // ~1.5 pt
     let current_layer_id = 1_u64;
 
-    for (cluster, (xfm, fill)) in path_clusters.into_iter().zip(cluster_data.into_iter()) {
-        if let Some(shape) = create_canvas_shape_from_vertices(
-            &cluster.vertices,
+    for (cluster, (xfm, fill)) in shape_clusters.into_iter().zip(cluster_data.into_iter()) {
+        if let Some(shape) = create_canvas_shape_from_subpaths(
+            &cluster.subpaths,
             current_layer_id,
             Some(&xfm),
             fill,
@@ -950,7 +1060,7 @@ fn parse_structured_paths(stream: &[u8]) -> Option<Vec<CanvasShape>> {
         if stream.get(i..i + 4) == Some(&TAG_PATH_BLOCK) {
             let header_start = i + 4;
             let num_vertices = read_u32_le(stream, header_start)? as usize;
-            let is_closed = read_u8(stream, header_start + 4)? != 0;
+            let _is_closed = read_u8(stream, header_start + 4)? != 0;
             let layer_id = read_u32_le(stream, header_start + 5)? as u64;
 
             let fill_rgba = [
@@ -1012,36 +1122,15 @@ fn parse_structured_paths(stream: &[u8]) -> Option<Vec<CanvasShape>> {
                     .fold(0.0_f32, f32::max);
                 let scale_to_in = if max_coord > 24.0 { 1.0 / 25.4 } else { 1.0 };
 
-                let polyline = path_vertices_to_polyline(&vertices, is_closed, Some(&transform), scale_to_in, 0.002);
-                if polyline.len() >= 2 {
-                    let (min_x, min_y, max_x, max_y) = compute_bounds(&polyline);
-                    let w = (max_x - min_x).max(0.005);
-                    let h = (max_y - min_y).max(0.005);
-
-                    let mut shape = CanvasShape {
-                        kind: ShapeKind::Freehand,
-                        x: min_x,
-                        y: min_y,
-                        width: w,
-                        height: h,
-                        points: polyline,
-                        text: String::new(),
-                        fill_color,
-                        stroke_color: Some(stroke_color),
-                        stroke_width: stroke_width.max(0.01),
-                        is_closed,
-                        is_svg_path: true,
-                        is_modified: false,
-                        triangles: Vec::new(),
-                        group_id: Some(layer_id),
-                        group_path: vec![layer_id],
-                        is_visible: true,
-                        is_locked: false,
-                        name: None,
-                        pixmap: None,
-                        texture: None,
-                    };
-                    shape.precompute_triangles();
+                if let Some(shape) = create_canvas_shape_from_vertices(
+                    &vertices,
+                    layer_id,
+                    Some(&transform),
+                    fill_color,
+                    stroke_color,
+                    stroke_width,
+                    scale_to_in,
+                ) {
                     shapes.push(shape);
                 }
             }
@@ -1267,6 +1356,136 @@ fn is_plausible_coord(val: f32) -> bool {
     val.is_finite() && val.abs() < 50_000.0
 }
 
+fn create_canvas_shape_from_subpaths(
+    subpaths: &[StudioSubpath],
+    layer_id: u64,
+    transform: Option<&AffineTransform2D>,
+    fill_color: egui::Color32,
+    stroke_color: egui::Color32,
+    stroke_width: f32,
+    scale_to_in: f32,
+) -> Option<CanvasShape> {
+    if subpaths.is_empty() {
+        return None;
+    }
+
+    let mut subpath_polylines = Vec::new();
+    for sub in subpaths {
+        if sub.vertices.len() < 2 {
+            continue;
+        }
+        let first = sub.vertices.first()?;
+        let last = sub.vertices.last()?;
+        let d = (first.anchor.x - last.anchor.x).hypot(first.anchor.y - last.anchor.y);
+        let is_closed = d < 1.0 || sub.vertices.len() >= 3;
+
+        let polyline = path_vertices_to_polyline(&sub.vertices, is_closed, transform, scale_to_in, 0.002);
+        if polyline.len() >= 2 {
+            subpath_polylines.push(polyline);
+        }
+    }
+
+    if subpath_polylines.is_empty() {
+        return None;
+    }
+
+    let mut all_points = Vec::new();
+    for poly in &subpath_polylines {
+        all_points.extend_from_slice(poly);
+    }
+
+    let (min_x, min_y, max_x, max_y) = compute_bounds(&all_points);
+    let w = (max_x - min_x).max(0.005);
+    let h = (max_y - min_y).max(0.005);
+
+    // Build compound SVG path d string: M {x0} {y0} L {x1} {y1} ... Z M {x0'} {y0'} ... Z
+    let mut svg_d = String::new();
+    for poly in &subpath_polylines {
+        if let Some(p0) = poly.first() {
+            if !svg_d.is_empty() {
+                svg_d.push(' ');
+            }
+            svg_d.push_str(&format!("M {:.4} {:.4}", p0.x, p0.y));
+            for p in poly.iter().skip(1) {
+                svg_d.push_str(&format!(" L {:.4} {:.4}", p.x, p.y));
+            }
+            svg_d.push_str(" Z");
+        }
+    }
+
+    // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so multi-subpaths and holes render cleanly
+    let dpi = 150.0_f32;
+    let pix_w = ((w * dpi).ceil() as u32).max(16);
+    let pix_h = ((h * dpi).ceil() as u32).max(16);
+
+    let mut pixmap = None;
+    if let Some(mut pm) = tiny_skia::Pixmap::new(pix_w, pix_h) {
+        let pad = 2.0_f32;
+        let sx = (pix_w as f32 - pad * 2.0) / w.max(0.001);
+        let sy = (pix_h as f32 - pad * 2.0) / h.max(0.001);
+
+        let mut pb = tiny_skia::PathBuilder::new();
+        for poly in &subpath_polylines {
+            if let Some(p0) = poly.first() {
+                pb.move_to((p0.x - min_x) * sx + pad, (p0.y - min_y) * sy + pad);
+                for p in poly.iter().skip(1) {
+                    pb.line_to((p.x - min_x) * sx + pad, (p.y - min_y) * sy + pad);
+                }
+                pb.close();
+            }
+        }
+
+        if let Some(path) = pb.finish() {
+            if fill_color.a() > 0 {
+                let mut fill_paint = tiny_skia::Paint::default();
+                fill_paint.set_color_rgba8(fill_color.r(), fill_color.g(), fill_color.b(), fill_color.a());
+                fill_paint.anti_alias = true;
+                pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+            }
+
+            if stroke_color.a() > 0 {
+                let mut stroke_paint = tiny_skia::Paint::default();
+                stroke_paint.set_color_rgba8(stroke_color.r(), stroke_color.g(), stroke_color.b(), stroke_color.a());
+                stroke_paint.anti_alias = true;
+                let st = tiny_skia::Stroke {
+                    width: (stroke_width * sx).max(1.0),
+                    line_cap: tiny_skia::LineCap::Round,
+                    line_join: tiny_skia::LineJoin::Round,
+                    ..Default::default()
+                };
+                pm.stroke_path(&path, &stroke_paint, &st, tiny_skia::Transform::identity(), None);
+            }
+            pixmap = Some(pm);
+        }
+    }
+
+    let mut shape = CanvasShape {
+        kind: ShapeKind::Freehand,
+        x: min_x,
+        y: min_y,
+        width: w,
+        height: h,
+        points: all_points,
+        text: svg_d,
+        fill_color,
+        stroke_color: Some(stroke_color),
+        stroke_width: stroke_width.max(0.01),
+        is_closed: true,
+        is_svg_path: true,
+        is_modified: false,
+        triangles: Vec::new(),
+        group_id: Some(layer_id),
+        group_path: vec![layer_id],
+        is_visible: true,
+        is_locked: false,
+        name: None,
+        pixmap,
+        texture: None,
+    };
+    shape.precompute_triangles();
+    Some(shape)
+}
+
 fn create_canvas_shape_from_vertices(
     vertices: &[StudioBezierVertex],
     layer_id: u64,
@@ -1276,50 +1495,20 @@ fn create_canvas_shape_from_vertices(
     stroke_width: f32,
     scale_to_in: f32,
 ) -> Option<CanvasShape> {
-    if vertices.len() < 2 {
-        return None;
-    }
-
-    // Detect if closed: either endpoints are coincident or standard closed shape (>= 3 vertices)
-    let first = vertices.first()?;
-    let last = vertices.last()?;
-    let d = (first.anchor.x - last.anchor.x).hypot(first.anchor.y - last.anchor.y);
-    let is_closed = d < 1.0 || vertices.len() >= 3;
-
-    let polyline = path_vertices_to_polyline(vertices, is_closed, transform, scale_to_in, 0.002);
-    if polyline.len() < 2 {
-        return None;
-    }
-
-    let (min_x, min_y, max_x, max_y) = compute_bounds(&polyline);
-    let w = (max_x - min_x).max(0.005);
-    let h = (max_y - min_y).max(0.005);
-
-    let mut shape = CanvasShape {
-        kind: ShapeKind::Freehand,
-        x: min_x,
-        y: min_y,
-        width: w,
-        height: h,
-        points: polyline,
-        text: String::new(),
-        fill_color,
-        stroke_color: Some(stroke_color),
-        stroke_width: stroke_width.max(0.01),
-        is_closed,
-        is_svg_path: true,
-        is_modified: false,
-        triangles: Vec::new(),
-        group_id: Some(layer_id),
-        group_path: vec![layer_id],
-        is_visible: true,
-        is_locked: false,
-        name: None,
-        pixmap: None,
-        texture: None,
+    let sub = StudioSubpath {
+        start_pos: 0,
+        end_pos: 0,
+        vertices: vertices.to_vec(),
     };
-    shape.precompute_triangles();
-    Some(shape)
+    create_canvas_shape_from_subpaths(
+        &[sub],
+        layer_id,
+        transform,
+        fill_color,
+        stroke_color,
+        stroke_width,
+        scale_to_in,
+    )
 }
 
 fn find_transform_in_slice(slice: &[u8]) -> Option<AffineTransform2D> {
@@ -1999,7 +2188,7 @@ mod tests {
         assert!(svg.contains("<svg"));
         assert!(svg.contains("viewBox=\"0 0 12.00 12.00\""));
         assert!(svg.contains("<g id=\"Cut Layer\">"));
-        assert!(svg.contains("<polygon points="));
+        assert!(svg.contains("<polygon points=") || svg.contains("<path d="));
         assert!(svg.contains("fill=\"#ff6432\""));
         assert!(svg.contains("stroke=\"#c80000\""));
     }
@@ -2059,7 +2248,7 @@ mod tests {
             let svg1 = convert_studio_to_svg(&std::fs::read(path1).unwrap()).expect("Convert Peeker Bears to SVG");
             assert!(svg1.contains("<svg"));
             assert!(svg1.contains("fill-rule=\"evenodd\"") || svg1.contains("<path"));
-            assert!(svg1.contains("<polygon") || svg1.contains("<polyline"));
+            assert!(svg1.contains("<polygon") || svg1.contains("<polyline") || svg1.contains("<path"));
         }
 
         if let Some(path2) = p2 {
@@ -2086,6 +2275,69 @@ mod tests {
             assert!(svg2.contains("href=\"data:image/png;base64,"));
             assert!(svg2.contains("<polygon") || svg2.contains("<polyline") || svg2.contains("<path"));
         }
+    }
+
+    #[test]
+    fn test_bd_cats_multi_subpath_segmentation_no_diagonal_artifacts() {
+        let cats_candidates = [
+            Path::new("../test_samples/BD CATS.studio"),
+            Path::new("test_samples/BD CATS.studio"),
+        ];
+        let p_cats = match cats_candidates.iter().find(|p| p.exists()) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let data = std::fs::read(p_cats).expect("Read BD CATS.studio");
+        let doc = parse_studio_data(&data).expect("Parse BD CATS.studio");
+
+        assert_eq!(doc.version, StudioFormatVersion::StudioV4);
+        assert!(doc.shapes.len() >= 5, "Expected >= 5 cats in BD CATS, got {}", doc.shapes.len());
+
+        for (i, shape) in doc.shapes.iter().enumerate() {
+            assert!(shape.is_svg_path, "Cat #{} must be an SVG path", i);
+            let m_count = shape.text.matches('M').count();
+            assert!(
+                m_count > 1,
+                "Cat #{} must have multiple MoveTo commands for disconnected contours, got {}",
+                i,
+                m_count
+            );
+            assert!(
+                shape.pixmap.is_some(),
+                "Cat #{} must have pre-rendered tiny_skia pixmap with EvenOdd fill/stroke",
+                i
+            );
+
+            // Verify no straight line connects the end of one subpath to the start of the next:
+            // Every subpath ends with "Z" and the next subpath immediately begins with "M".
+            // There must never be a "Z L" or "Z <number>" diagonal bridge.
+            assert!(!shape.text.contains("Z L"), "Cat #{} contains stray diagonal bridge 'Z L'", i);
+
+            let subpaths: Vec<&str> = shape.text.split('M').filter(|s| !s.trim().is_empty()).collect();
+            assert_eq!(subpaths.len(), m_count);
+            for (sub_idx, sub) in subpaths.iter().enumerate() {
+                let trimmed = sub.trim();
+                assert!(trimmed.ends_with('Z'), "Subpath {} in Cat #{} must end with 'Z', got {:?}", sub_idx, i, trimmed);
+                let nums: Vec<f32> = trimmed
+                    .split(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                    .filter_map(|s| s.parse::<f32>().ok())
+                    .collect();
+                assert!(nums.len() >= 4, "Subpath {} in Cat #{} must have at least 2 points (4 coordinates)", sub_idx, i);
+            }
+
+            // Verify tiny_skia pixmap is valid and has drawn pixels
+            let pm = shape.pixmap.as_ref().unwrap();
+            assert!(pm.width() >= 16 && pm.height() >= 16);
+            let non_zero_pixels = pm.data().iter().filter(|&&b| b > 0).count();
+            assert!(non_zero_pixels > 0, "Cat #{} pixmap must contain non-transparent rendered artwork", i);
+        }
+
+        // Verify SVG export contains compound path markup with evenodd fill rule
+        let svg = convert_studio_to_svg(&data).expect("Convert BD CATS to SVG");
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("fill-rule=\"evenodd\""));
+        assert!(svg.contains("<path d=\"M "));
     }
 
     #[test]
