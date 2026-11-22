@@ -4,6 +4,31 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.4.5] - 2026-11-22
+
+### Added & Improved
+- **Multi-Tab Document Workspaces (`app/src/main.rs`, `app/src/project_file.rs`)**:
+  - Implemented `DocumentTab` encapsulating isolated per-tab document states: `title`, `source_path: Option<PathBuf>`, `project_path: Option<PathBuf>`, `is_dirty: bool`, `shapes: Vec<CanvasShape>`, `cached_svgs`, `mat_width_in`, `mat_height_in`, `registration_marks`, `paper_background`, `zoom`, `pan`, and `undo_stack` / `redo_stack`.
+  - Added sleek document tab bar directly above canvas (and below the top toolbar) showing each open document's title, a `•` dirty indicator when unsaved edits exist, an `×` close button per tab, and a `+` new tab button (`Ctrl+T` / `File -> New Design Tab`) opening a fresh blank `12.0" × 12.0"` default grid tab.
+  - Implemented `sync_active_tab_to_storage` and `sync_active_tab_from_storage` ensuring zero borrow-checker conflicts and 100% backward compatibility with all existing test suites.
+- **Smart Open / Import Into Tabs & Unsaved Changes Confirmation Modal (`app/src/main.rs`)**:
+  - When opening or importing a `.studio`, `.studio3`, `.svg`, or `.craft` file (`File -> Open / Import...`, `Ctrl+O`, or CLI arguments), files open into a new tab titled with the file's original stem/filename and record `source_path`. If the initial tab is blank and unmodified, it is replaced directly without leaving an empty tab behind.
+  - CLI argument handling in `main()` loads multiple input files across separate tabs sequentially.
+  - Closing a modified tab (`is_dirty == true`, via `×` or `Ctrl+W`) triggers an **"Unsaved Changes"** modal dialog: *"Save changes to '<tab_title>' before closing?"* with **`Save`**, **`Don't Save`**, and **`Cancel`** buttons.
+- **Automatic Source Filename & Directory Retention on Export / Save (`app/src/main.rs`, `app/src/project_file.rs`)**:
+  - Track original filename stems and directories across document lifecycles.
+  - Pre-populates `File -> Export SVG...` with `<original_stem>.svg`, `File -> Export PNG (High-DPI)...` with `<original_stem>.png`, and `File -> Save Project As (.craft)` with `<original_stem>.craft`.
+  - Sets the initial directory of save/export dialogs to the source file's parent directory when valid, falling back to user Documents or Home directory.
+  - Added optional `title` and `source_path` fields (`#[serde(default)]`) to `CraftProject` in `.craft` JSON projects, preserving source provenance across save and reload.
+- **Unit Testing & Verification (`app/src/main.rs`, `app/src/project_file.rs`)**:
+  - Added `test_tab_creation_and_defaults`: verifies 12x12 default dimensions, tab count, initial clean state, and switching.
+  - Added `test_open_multiple_files_into_separate_tabs_with_stems`: verifies opening `Peeker Bears.studio` and `BD CATS.studio` into separate tabs, preserving titles, source paths, and independent shape counts.
+  - Added `test_tab_dirty_flag_tracking_and_confirmation`: verifies dirty tracking on modification, close confirmation triggering, and reset.
+  - Added `test_default_export_filename_generation`: verifies smart export stems for `.svg`, `.png`, and `.craft` exports.
+  - All 60 unit and integration tests passing (`cargo test`), release binary cleanly compiled.
+
+---
+
 ## [0.4.4] - 2026-11-21
 
 ### Added & Improved

@@ -128,6 +128,14 @@ pub struct CraftProject {
     /// Inset from the mat edge for registration marks (inches).
     #[serde(default = "default_reg_inset")]
     pub reg_mark_inset_in: f32,
+
+    /// Document / tab title.
+    #[serde(default)]
+    pub title: Option<String>,
+
+    /// Original source file path (e.g. imported .studio or .svg file).
+    #[serde(default)]
+    pub source_path: Option<String>,
 }
 
 // ── Base64 codec (no external crates) ─────────────────────────────────────────
@@ -377,6 +385,8 @@ mod tests {
             paper_image_b64: None,
             show_reg_marks: false,
             reg_mark_inset_in: 0.25,
+            title: Some("Roundtrip Design".to_string()),
+            source_path: Some("/tmp/sample.studio".to_string()),
         };
 
         // Write to a temp file.

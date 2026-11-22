@@ -8,14 +8,14 @@ use std::path::Path;
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut screenshot_path = None;
-    let mut initial_file = None;
+    let mut initial_files = Vec::new();
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--screenshot" && i + 1 < args.len() {
             screenshot_path = Some(args[i + 1].clone());
             i += 2;
-        } else if !args[i].starts_with("--") && initial_file.is_none() {
-            initial_file = Some(args[i].clone());
+        } else if !args[i].starts_with("--") {
+            initial_files.push(args[i].clone());
             i += 1;
         } else {
             i += 1;
@@ -26,7 +26,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("Silhouette Studio", options, Box::new(move |_cc| {
         let mut app = StudioApp::new(screenshot_path);
-        if let Some(file) = initial_file {
+        for file in initial_files {
             app.load_file(Path::new(&file));
         }
         Box::new(app)
@@ -557,6 +557,7 @@ fn escape_xml(s: &str) -> String {
     out
 }
 
+#[derive(Clone)]
 pub struct CachedSvg {
     pub group_id: u64,
     pub init_min_x: f32,
@@ -593,7 +594,139 @@ pub struct CanvasSnapshot {
     pub selected_index: Option<usize>,
 }
 
+#[derive(Clone)]
+pub struct DocumentTab {
+    pub title: String,
+    pub source_path: Option<std::path::PathBuf>,
+    pub project_path: Option<std::path::PathBuf>,
+    pub is_dirty: bool,
+    pub shapes: Vec<CanvasShape>,
+    pub cached_svgs: Vec<CachedSvg>,
+    pub mat_width_in: f32,
+    pub mat_height_in: f32,
+    pub show_reg_marks: bool,
+    pub reg_mark_inset_in: f32,
+    pub reg_mark_thickness_in: f32,
+    pub reg_mark_size_in: f32,
+    pub paper_texture: Option<egui::TextureHandle>,
+    pub paper_image: Option<egui::ColorImage>,
+    pub paper_bytes: Option<Vec<u8>>,
+    pub zoom: f32,
+    pub pan: egui::Vec2,
+    pub undo_stack: Vec<CanvasSnapshot>,
+    pub redo_stack: Vec<CanvasSnapshot>,
+    pub selected_index: Option<usize>,
+    pub selected_indices: std::collections::BTreeSet<usize>,
+    pub expanded_groups: std::collections::BTreeSet<u64>,
+    pub group_names: std::collections::BTreeMap<u64, String>,
+    pub next_group_id: u64,
+}
+
+impl DocumentTab {
+    pub fn new_default(title: String) -> Self {
+        Self {
+            title,
+            source_path: None,
+            project_path: None,
+            is_dirty: false,
+            shapes: Vec::new(),
+            cached_svgs: Vec::new(),
+            mat_width_in: 12.0,
+            mat_height_in: 12.0,
+            show_reg_marks: false,
+            reg_mark_inset_in: 0.25,
+            reg_mark_thickness_in: 0.02,
+            reg_mark_size_in: 0.20,
+            paper_texture: None,
+            paper_image: None,
+            paper_bytes: None,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            selected_index: None,
+            selected_indices: std::collections::BTreeSet::new(),
+            expanded_groups: std::collections::BTreeSet::new(),
+            group_names: std::collections::BTreeMap::new(),
+            next_group_id: 0,
+        }
+    }
+
+    pub fn is_blank_and_unmodified(&self) -> bool {
+        !self.is_dirty
+            && self.shapes.is_empty()
+            && self.undo_stack.is_empty()
+            && self.source_path.is_none()
+            && self.project_path.is_none()
+            && self.paper_bytes.is_none()
+    }
+
+    pub fn default_filename_stem(&self) -> String {
+        if let Some(p) = &self.source_path {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if !stem.is_empty() {
+                    return stem.to_string();
+                }
+            }
+        }
+        if let Some(p) = &self.project_path {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if !stem.is_empty() {
+                    return stem.to_string();
+                }
+            }
+        }
+        let clean = self.title
+            .trim_end_matches(".studio3")
+            .trim_end_matches(".studio")
+            .trim_end_matches(".craft")
+            .trim_end_matches(".svg")
+            .trim_end_matches(".json")
+            .trim();
+        if !clean.is_empty() {
+            return clean.to_string();
+        }
+        "design".to_string()
+    }
+
+    pub fn default_export_filename(&self, ext: &str) -> String {
+        format!("{}.{}", self.default_filename_stem(), ext.trim_start_matches('.'))
+    }
+
+    pub fn default_export_directory(&self) -> Option<std::path::PathBuf> {
+        if let Some(p) = &self.source_path {
+            if let Some(parent) = p.parent() {
+                if parent.is_dir() {
+                    return Some(parent.to_path_buf());
+                }
+            }
+        }
+        if let Some(p) = &self.project_path {
+            if let Some(parent) = p.parent() {
+                if parent.is_dir() {
+                    return Some(parent.to_path_buf());
+                }
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let docs = std::path::PathBuf::from(&home).join("Documents");
+            if docs.is_dir() {
+                return Some(docs);
+            }
+            let home_path = std::path::PathBuf::from(&home);
+            if home_path.is_dir() {
+                return Some(home_path);
+            }
+        }
+        std::env::current_dir().ok()
+    }
+}
+
 pub struct StudioApp {
+    pub tabs: Vec<DocumentTab>,
+    pub active_tab_index: usize,
+    pub next_tab_number: usize,
+    pub close_confirm_tab_index: Option<usize>,
     pub active_tool: Tool,
     pub right_panel: &'static str,
     pub zoom: f32,
@@ -883,7 +1016,12 @@ pub fn render_layer_nodes(
 
 impl StudioApp {
     pub fn new(screenshot_path: Option<String>) -> Self {
+        let default_tab = DocumentTab::new_default("Design 1".to_string());
         Self {
+            tabs: vec![default_tab],
+            active_tab_index: 0,
+            next_tab_number: 2,
+            close_confirm_tab_index: None,
             active_tool: Tool::Select,
             right_panel: "Page Setup",
             zoom: 1.0,
@@ -945,33 +1083,291 @@ impl StudioApp {
         self.set_status(format!("Fit mat to view ({:.0}%)", self.zoom * 100.0));
     }
 
-    pub fn load_file(&mut self, path: &Path) {
-        if !path.exists() {
+    pub fn mark_dirty(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
+            tab.is_dirty = true;
+        }
+    }
+
+    pub fn sync_active_tab_to_storage(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
+            tab.shapes = self.shapes.clone();
+            tab.cached_svgs = self.cached_svgs.clone();
+            tab.mat_width_in = self.mat_width_in;
+            tab.mat_height_in = self.mat_height_in;
+            tab.show_reg_marks = self.show_reg_marks;
+            tab.reg_mark_inset_in = self.reg_mark_inset_in;
+            tab.reg_mark_thickness_in = self.reg_mark_thickness_in;
+            tab.reg_mark_size_in = self.reg_mark_size_in;
+            tab.paper_texture = self.paper_texture.clone();
+            tab.paper_image = self.paper_image.clone();
+            tab.paper_bytes = self.paper_bytes.clone();
+            tab.zoom = self.zoom;
+            tab.pan = self.pan;
+            tab.undo_stack = self.undo_stack.clone();
+            tab.redo_stack = self.redo_stack.clone();
+            tab.selected_index = self.selected_index;
+            tab.selected_indices = self.selected_indices.clone();
+            tab.expanded_groups = self.expanded_groups.clone();
+            tab.group_names = self.group_names.clone();
+            tab.next_group_id = self.next_group_id;
+            tab.project_path = self.current_project_path.clone();
+        }
+    }
+
+    pub fn sync_active_tab_from_storage(&mut self) {
+        if let Some(tab) = self.tabs.get(self.active_tab_index) {
+            self.shapes = tab.shapes.clone();
+            self.cached_svgs = tab.cached_svgs.clone();
+            self.mat_width_in = tab.mat_width_in;
+            self.mat_height_in = tab.mat_height_in;
+            self.show_reg_marks = tab.show_reg_marks;
+            self.reg_mark_inset_in = tab.reg_mark_inset_in;
+            self.reg_mark_thickness_in = tab.reg_mark_thickness_in;
+            self.reg_mark_size_in = tab.reg_mark_size_in;
+            self.paper_texture = tab.paper_texture.clone();
+            self.paper_image = tab.paper_image.clone();
+            self.paper_bytes = tab.paper_bytes.clone();
+            self.zoom = tab.zoom;
+            self.pan = tab.pan;
+            self.undo_stack = tab.undo_stack.clone();
+            self.redo_stack = tab.redo_stack.clone();
+            self.selected_index = tab.selected_index;
+            self.selected_indices = tab.selected_indices.clone();
+            self.expanded_groups = tab.expanded_groups.clone();
+            self.group_names = tab.group_names.clone();
+            self.next_group_id = tab.next_group_id;
+            self.current_project_path = tab.project_path.clone();
+            self.drag_start = None;
+            self.marquee_start = None;
+            self.freehand_points.clear();
+            self.is_dragging_shape = false;
+            self.active_resize_corner = None;
+            self.resize_initial_rect = None;
+            self.resize_initial_shapes.clear();
+        }
+    }
+
+    pub fn switch_to_tab(&mut self, new_idx: usize) {
+        if new_idx == self.active_tab_index || new_idx >= self.tabs.len() {
             return;
         }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        if ext == "studio" || ext == "studio3" {
-            if let Ok(doc) = crate::studio_format::parse_studio_file(path) {
-                self.mat_width_in = doc.mat_width_in;
-                self.mat_height_in = doc.mat_height_in;
-                self.group_names = doc.group_names;
-                self.next_group_id = self.group_names.keys().max().copied().unwrap_or(0) + 1;
-                self.shapes = doc.shapes;
-                self.selected_indices.clear();
-                self.selected_index = None;
-                let msg = format!("Imported {} shapes from Silhouette Studio file", self.shapes.len());
-                self.status_message = Some((msg, std::time::Instant::now()));
+        self.sync_active_tab_to_storage();
+        self.active_tab_index = new_idx;
+        self.sync_active_tab_from_storage();
+        self.set_status(format!("Switched to tab '{}'", self.tabs[self.active_tab_index].title));
+    }
+
+    pub fn new_tab(&mut self) {
+        self.sync_active_tab_to_storage();
+        let title = format!("Design {}", self.next_tab_number);
+        self.next_tab_number += 1;
+        let tab = DocumentTab::new_default(title.clone());
+        self.tabs.push(tab);
+        self.active_tab_index = self.tabs.len() - 1;
+        self.sync_active_tab_from_storage();
+        self.fit_to_view();
+        self.set_status(format!("Opened new tab '{}'", title));
+    }
+
+    pub fn request_close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.sync_active_tab_to_storage();
+        if self.tabs[idx].is_dirty {
+            self.close_confirm_tab_index = Some(idx);
+        } else {
+            self.close_tab_force(idx);
+        }
+    }
+
+    pub fn close_tab_force(&mut self, idx: usize) {
+        if self.tabs.len() <= 1 {
+            let new_tab = DocumentTab::new_default("Design 1".to_string());
+            self.tabs = vec![new_tab];
+            self.active_tab_index = 0;
+            self.next_tab_number = 2;
+            self.sync_active_tab_from_storage();
+            self.fit_to_view();
+            self.set_status("Reset to empty design");
+            return;
+        }
+
+        self.sync_active_tab_to_storage();
+        self.tabs.remove(idx);
+
+        if self.active_tab_index >= self.tabs.len() {
+            self.active_tab_index = self.tabs.len().saturating_sub(1);
+        } else if self.active_tab_index > idx {
+            self.active_tab_index -= 1;
+        }
+
+        self.sync_active_tab_from_storage();
+        self.set_status(format!("Closed tab (now on '{}')", self.tabs[self.active_tab_index].title));
+    }
+
+    pub fn active_tab_stem(&self) -> String {
+        self.tabs.get(self.active_tab_index)
+            .map(|t| t.default_filename_stem())
+            .unwrap_or_else(|| "design".to_string())
+    }
+
+    pub fn active_tab_dir(&self) -> Option<std::path::PathBuf> {
+        self.tabs.get(self.active_tab_index)
+            .and_then(|t| t.default_export_directory())
+    }
+
+    pub fn save_tab_interactive(&mut self, tab_idx: usize) -> bool {
+        if tab_idx != self.active_tab_index {
+            self.switch_to_tab(tab_idx);
+        }
+        if let Some(path) = self.current_project_path.clone() {
+            match self.save_craft_file(&path) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.set_status(format!("Error saving project: {}", e));
+                    false
+                }
             }
-        } else if ext == "craft" {
-            let _ = self.open_craft_file(path);
-        } else if ext == "json" {
-            let _ = self.open_project_file(path);
+        } else {
+            let stem = self.active_tab_stem();
+            let dir = self.active_tab_dir();
+            let mut dialog = rfd::FileDialog::new()
+                .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                .set_file_name(format!("{}.craft", stem));
+            if let Some(d) = dir {
+                dialog = dialog.set_directory(d);
+            }
+            if let Some(p) = dialog.save_file() {
+                match self.save_craft_file(&p) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        self.set_status(format!("Error saving project: {}", e));
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        }
+    }
+
+    pub fn open_file_into_tab(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        if !path.exists() {
+            return Err(format!("File does not exist: {:?}", path).into());
+        }
+
+        self.sync_active_tab_to_storage();
+
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("design").to_string();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+        let can_replace = self.tabs.get(self.active_tab_index)
+            .map(|t| t.is_blank_and_unmodified())
+            .unwrap_or(false);
+
+        let target_idx = if can_replace {
+            self.active_tab_index
+        } else {
+            let new_tab = DocumentTab::new_default(stem.clone());
+            self.tabs.push(new_tab);
+            self.tabs.len() - 1
+        };
+
+        self.active_tab_index = target_idx;
+        self.tabs[target_idx].title = stem.clone();
+        self.tabs[target_idx].is_dirty = false;
+        self.tabs[target_idx].undo_stack.clear();
+        self.tabs[target_idx].redo_stack.clear();
+        self.tabs[target_idx].cached_svgs.clear();
+        self.tabs[target_idx].selected_indices.clear();
+        self.tabs[target_idx].selected_index = None;
+        self.tabs[target_idx].shapes.clear();
+
+        if ext == "craft" {
+            let project = project_file::load_craft_project(path)?;
+            self.tabs[target_idx].mat_width_in = project.mat_width_in;
+            self.tabs[target_idx].mat_height_in = project.mat_height_in;
+            self.tabs[target_idx].group_names = project.group_names;
+            self.tabs[target_idx].next_group_id = project.next_group_id;
+            self.tabs[target_idx].show_reg_marks = project.show_reg_marks;
+            self.tabs[target_idx].reg_mark_inset_in = project.reg_mark_inset_in;
+            self.tabs[target_idx].shapes = project.shapes.into_iter().map(CanvasShape::from_craft_shape).collect();
+            self.tabs[target_idx].project_path = Some(path.to_path_buf());
+            if let Some(src) = project.source_path {
+                self.tabs[target_idx].source_path = Some(std::path::PathBuf::from(src));
+            } else {
+                self.tabs[target_idx].source_path = None;
+            }
+            if let Some(t) = project.title {
+                self.tabs[target_idx].title = t;
+            }
+            if let Some(ref b64) = project.paper_image_b64 {
+                if let Ok(bytes) = project_file::base64_decode_bytes(b64) {
+                    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                        let rgba = dyn_img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        self.tabs[target_idx].paper_image = Some(egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &rgba.into_raw(),
+                        ));
+                        self.tabs[target_idx].paper_texture = None;
+                        self.tabs[target_idx].paper_bytes = Some(bytes);
+                    }
+                }
+            }
+        } else if ext == "studio" || ext == "studio3" {
+            let doc = crate::studio_format::parse_studio_file(path)?;
+            self.tabs[target_idx].mat_width_in = doc.mat_width_in;
+            self.tabs[target_idx].mat_height_in = doc.mat_height_in;
+            self.tabs[target_idx].group_names = doc.group_names;
+            self.tabs[target_idx].next_group_id = self.tabs[target_idx].group_names.keys().max().copied().unwrap_or(0) + 1;
+            self.tabs[target_idx].shapes = doc.shapes;
+            self.tabs[target_idx].source_path = Some(path.to_path_buf());
+            self.tabs[target_idx].project_path = None;
         } else if ext == "svg" {
-            let _ = self.import_svg_file(path);
+            let content = std::fs::read(path)?;
+            self.shapes.clear();
+            self.group_names.clear();
+            self.cached_svgs.clear();
+            self.clear_selection();
+            let _ = self.import_svg_bytes(&content)?;
+            self.undo_stack.clear();
+            self.tabs[target_idx].shapes = self.shapes.clone();
+            self.tabs[target_idx].group_names = self.group_names.clone();
+            self.tabs[target_idx].next_group_id = self.next_group_id;
+            self.tabs[target_idx].source_path = Some(path.to_path_buf());
+            self.tabs[target_idx].project_path = None;
+        } else if ext == "json" {
+            self.shapes.clear();
+            let _ = self.open_project_file(path)?;
+            self.undo_stack.clear();
+            self.tabs[target_idx].shapes = self.shapes.clone();
+            self.tabs[target_idx].mat_width_in = self.mat_width_in;
+            self.tabs[target_idx].mat_height_in = self.mat_height_in;
+            self.tabs[target_idx].group_names = self.group_names.clone();
+            self.tabs[target_idx].next_group_id = self.next_group_id;
+            self.tabs[target_idx].project_path = Some(path.to_path_buf());
+        } else {
+            return Err(format!("Unsupported file extension: {}", ext).into());
+        }
+
+        self.tabs[target_idx].is_dirty = false;
+        self.sync_active_tab_from_storage();
+        self.fit_to_view();
+        self.set_status(format!("Loaded '{}' ({} shapes)", self.tabs[target_idx].title, self.shapes.len()));
+        Ok(())
+    }
+
+    pub fn load_file(&mut self, path: &Path) {
+        if let Err(e) = self.open_file_into_tab(path) {
+            self.set_status(format!("Error loading file: {}", e));
         }
     }
 
     pub fn push_undo(&mut self) {
+        self.mark_dirty();
         let snapshot = CanvasSnapshot {
             shapes: self.shapes.clone(),
             group_names: self.group_names.clone(),
@@ -988,6 +1384,7 @@ impl StudioApp {
 
     pub fn undo(&mut self) {
         if let Some(snapshot) = self.undo_stack.pop() {
+            self.mark_dirty();
             let current = CanvasSnapshot {
                 shapes: self.shapes.clone(),
                 group_names: self.group_names.clone(),
@@ -1012,6 +1409,7 @@ impl StudioApp {
 
     pub fn redo(&mut self) {
         if let Some(snapshot) = self.redo_stack.pop() {
+            self.mark_dirty();
             let current = CanvasSnapshot {
                 shapes: self.shapes.clone(),
                 group_names: self.group_names.clone(),
@@ -1601,6 +1999,11 @@ impl StudioApp {
                 })
             });
 
+        let title = self.tabs.get(self.active_tab_index).map(|t| t.title.clone());
+        let source_path = self.tabs.get(self.active_tab_index)
+            .and_then(|t| t.source_path.as_ref())
+            .map(|p| p.to_string_lossy().to_string());
+
         let project = project_file::CraftProject {
             version: 2,
             app_name: "Craft Anything".to_string(),
@@ -1612,10 +2015,18 @@ impl StudioApp {
             paper_image_b64: paper_b64,
             show_reg_marks: self.show_reg_marks,
             reg_mark_inset_in: self.reg_mark_inset_in,
+            title,
+            source_path,
         };
 
         project_file::save_craft_project(path, &project)?;
         self.current_project_path = Some(path.to_path_buf());
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
+            tab.project_path = Some(path.to_path_buf());
+            tab.is_dirty = false;
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("project");
+            tab.title = stem.to_string();
+        }
         let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or(".craft");
         self.set_status(format!("Project saved to {}", fname));
         Ok(())
@@ -1623,38 +2034,7 @@ impl StudioApp {
 
     // 1c. Open Native .craft Project
     pub fn open_craft_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let project = project_file::load_craft_project(path)?;
-        self.push_undo();
-        self.mat_width_in = project.mat_width_in;
-        self.mat_height_in = project.mat_height_in;
-        self.group_names = project.group_names;
-        self.next_group_id = project.next_group_id;
-        self.show_reg_marks = project.show_reg_marks;
-        self.reg_mark_inset_in = project.reg_mark_inset_in;
-
-        self.shapes = project.shapes.into_iter().map(CanvasShape::from_craft_shape).collect();
-
-        if let Some(ref b64) = project.paper_image_b64 {
-            if let Ok(bytes) = project_file::base64_decode_bytes(b64) {
-                if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-                    let rgba = dyn_img.to_rgba8();
-                    let (w, h) = rgba.dimensions();
-                    self.paper_image = Some(egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        &rgba.into_raw(),
-                    ));
-                    self.paper_texture = None;
-                    self.paper_bytes = Some(bytes);
-                }
-            }
-        }
-
-        self.cached_svgs.clear();
-        self.clear_selection();
-        self.current_project_path = Some(path.to_path_buf());
-        let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or(".craft");
-        self.set_status(format!("Loaded project from {} ({} shapes)", fname, self.shapes.len()));
-        Ok(())
+        self.open_file_into_tab(path)
     }
 
     // Vector Crafting: Parallel offset contour for sticker / cardstock border
@@ -3507,35 +3887,56 @@ impl eframe::App for StudioApp {
             if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z)))) {
                 self.redo();
             }
+            // New Design Tab: Ctrl+T
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::T)) {
+                self.new_tab();
+            }
+            // Close Tab: Ctrl+W
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::W)) {
+                self.request_close_tab(self.active_tab_index);
+            }
             // Save Project (.craft): Ctrl+S
             if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
                 if let Some(path) = self.current_project_path.clone() {
                     let _ = self.save_craft_file(&path);
-                } else if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Craft Anything Project (*.craft)", &["craft"])
-                    .set_file_name("project.craft")
-                    .save_file()
-                {
-                    let _ = self.save_craft_file(&path);
+                } else {
+                    let stem = self.active_tab_stem();
+                    let dir = self.active_tab_dir();
+                    let mut dialog = rfd::FileDialog::new()
+                        .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                        .set_file_name(format!("{}.craft", stem));
+                    if let Some(d) = dir {
+                        dialog = dialog.set_directory(d);
+                    }
+                    if let Some(path) = dialog.save_file() {
+                        let _ = self.save_craft_file(&path);
+                    }
                 }
             }
             // Save Project As (.craft): Ctrl+Shift+S
             if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.shift && i.key_pressed(egui::Key::S)) {
-                if let Some(path) = rfd::FileDialog::new()
+                let stem = self.active_tab_stem();
+                let dir = self.active_tab_dir();
+                let mut dialog = rfd::FileDialog::new()
                     .add_filter("Craft Anything Project (*.craft)", &["craft"])
-                    .set_file_name("project.craft")
-                    .save_file()
-                {
+                    .set_file_name(format!("{}.craft", stem));
+                if let Some(d) = dir {
+                    dialog = dialog.set_directory(d);
+                }
+                if let Some(path) = dialog.save_file() {
                     let _ = self.save_craft_file(&path);
                 }
             }
             // Open Project: Ctrl+O
             if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::O)) {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Design Projects (*.craft, *.studio, *.studio3, *.svg, *.json)", &["craft", "studio", "studio3", "svg", "json"])
-                    .pick_file()
-                {
-                    self.load_file(&path);
+                let dir = self.active_tab_dir();
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("Design Projects (*.craft, *.studio, *.studio3, *.svg, *.json)", &["craft", "studio", "studio3", "svg", "json"]);
+                if let Some(d) = dir {
+                    dialog = dialog.set_directory(d);
+                }
+                if let Some(path) = dialog.pick_file() {
+                    let _ = self.open_file_into_tab(&path);
                 }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
@@ -3595,25 +3996,24 @@ impl eframe::App for StudioApp {
         egui::TopBottomPanel::top("top_menu").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New Design").clicked() {
-                        if !self.shapes.is_empty() {
-                            self.push_undo();
-                            self.shapes.clear();
-                            self.cached_svgs.clear();
-                            self.clear_selection();
-                            self.pan = egui::Vec2::ZERO;
-                            self.zoom = 1.0;
-                            self.current_project_path = None;
-                        }
+                    if ui.button("New Design Tab (Ctrl+T)").clicked() {
+                        self.new_tab();
+                        ui.close_menu();
+                    }
+                    if ui.button("Close Tab (Ctrl+W)").clicked() {
+                        self.request_close_tab(self.active_tab_index);
                         ui.close_menu();
                     }
                     ui.separator();
                     if ui.button("Open Project (.craft)... (Ctrl+O)").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Craft Anything Project (*.craft)", &["craft"])
-                            .pick_file()
-                        {
-                            match self.open_craft_file(&path) {
+                        let dir = self.active_tab_dir();
+                        let mut dialog = rfd::FileDialog::new()
+                            .add_filter("Craft Anything Project (*.craft)", &["craft"]);
+                        if let Some(d) = dir {
+                            dialog = dialog.set_directory(d);
+                        }
+                        if let Some(path) = dialog.pick_file() {
+                            match self.open_file_into_tab(&path) {
                                 Ok(()) => (),
                                 Err(e) => self.set_status(format!("Error loading .craft project: {}", e)),
                             }
@@ -3626,24 +4026,34 @@ impl eframe::App for StudioApp {
                                 Ok(()) => (),
                                 Err(e) => self.set_status(format!("Error saving project: {}", e)),
                             }
-                        } else if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Craft Anything Project (*.craft)", &["craft"])
-                            .set_file_name("project.craft")
-                            .save_file()
-                        {
-                            match self.save_craft_file(&path) {
-                                Ok(()) => (),
-                                Err(e) => self.set_status(format!("Error saving project: {}", e)),
+                        } else {
+                            let stem = self.active_tab_stem();
+                            let dir = self.active_tab_dir();
+                            let mut dialog = rfd::FileDialog::new()
+                                .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                                .set_file_name(format!("{}.craft", stem));
+                            if let Some(d) = dir {
+                                dialog = dialog.set_directory(d);
+                            }
+                            if let Some(path) = dialog.save_file() {
+                                match self.save_craft_file(&path) {
+                                    Ok(()) => (),
+                                    Err(e) => self.set_status(format!("Error saving project: {}", e)),
+                                }
                             }
                         }
                         ui.close_menu();
                     }
                     if ui.button("Save Project As... (Ctrl+Shift+S)").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+                        let stem = self.active_tab_stem();
+                        let dir = self.active_tab_dir();
+                        let mut dialog = rfd::FileDialog::new()
                             .add_filter("Craft Anything Project (*.craft)", &["craft"])
-                            .set_file_name("project.craft")
-                            .save_file()
-                        {
+                            .set_file_name(format!("{}.craft", stem));
+                        if let Some(d) = dir {
+                            dialog = dialog.set_directory(d);
+                        }
+                        if let Some(path) = dialog.save_file() {
                             match self.save_craft_file(&path) {
                                 Ok(()) => (),
                                 Err(e) => self.set_status(format!("Error saving project: {}", e)),
@@ -3653,12 +4063,15 @@ impl eframe::App for StudioApp {
                     }
                     ui.separator();
                     if ui.button("Open / Import .studio / .studio3...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Silhouette Studio Files (*.studio, *.studio3)", &["studio", "studio3"])
-                            .pick_file()
-                        {
-                            match self.import_studio_file(&path) {
-                                Ok(n) => self.set_status(format!("Imported {} shapes from Silhouette Studio file", n)),
+                        let dir = self.active_tab_dir();
+                        let mut dialog = rfd::FileDialog::new()
+                            .add_filter("Silhouette Studio Files (*.studio, *.studio3)", &["studio", "studio3"]);
+                        if let Some(d) = dir {
+                            dialog = dialog.set_directory(d);
+                        }
+                        if let Some(path) = dialog.pick_file() {
+                            match self.open_file_into_tab(&path) {
+                                Ok(()) => (),
                                 Err(e) => self.set_status(format!("Error importing Studio file: {}", e)),
                             }
                         }
@@ -3686,23 +4099,30 @@ impl eframe::App for StudioApp {
                     }
                     ui.separator();
                     if ui.button("Import SVG...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Scalable Vector Graphics (*.svg)", &["svg"])
-                            .pick_file()
-                        {
-                            match self.import_svg_file(&path) {
-                                Ok(n) => self.set_status(format!("Imported {} shapes from SVG", n)),
+                        let dir = self.active_tab_dir();
+                        let mut dialog = rfd::FileDialog::new()
+                            .add_filter("Scalable Vector Graphics (*.svg)", &["svg"]);
+                        if let Some(d) = dir {
+                            dialog = dialog.set_directory(d);
+                        }
+                        if let Some(path) = dialog.pick_file() {
+                            match self.open_file_into_tab(&path) {
+                                Ok(()) => (),
                                 Err(e) => self.set_status(format!("Error importing SVG: {}", e)),
                             }
                         }
                         ui.close_menu();
                     }
                     if ui.button("Export SVG...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+                        let stem = self.active_tab_stem();
+                        let dir = self.active_tab_dir();
+                        let mut dialog = rfd::FileDialog::new()
                             .add_filter("Scalable Vector Graphics (*.svg)", &["svg"])
-                            .set_file_name("design.svg")
-                            .save_file()
-                        {
+                            .set_file_name(format!("{}.svg", stem));
+                        if let Some(d) = dir {
+                            dialog = dialog.set_directory(d);
+                        }
+                        if let Some(path) = dialog.save_file() {
                             match self.export_svg_file(&path) {
                                 Ok(()) => self.set_status("SVG exported successfully"),
                                 Err(e) => self.set_status(format!("Error exporting SVG: {}", e)),
@@ -3711,11 +4131,15 @@ impl eframe::App for StudioApp {
                         ui.close_menu();
                     }
                     if ui.button("Export PNG (High-DPI)...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+                        let stem = self.active_tab_stem();
+                        let dir = self.active_tab_dir();
+                        let mut dialog = rfd::FileDialog::new()
                             .add_filter("PNG Image (*.png)", &["png"])
-                            .set_file_name("mat_design.png")
-                            .save_file()
-                        {
+                            .set_file_name(format!("{}.png", stem));
+                        if let Some(d) = dir {
+                            dialog = dialog.set_directory(d);
+                        }
+                        if let Some(path) = dialog.save_file() {
                             match self.export_png_file(&path, 150.0) {
                                 Ok(()) => self.set_status("High-DPI PNG exported successfully"),
                                 Err(e) => self.set_status(format!("Error exporting PNG: {}", e)),
@@ -3901,6 +4325,48 @@ impl eframe::App for StudioApp {
                         ui.separator();
                         ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(0, 180, 240)));
                     }
+                }
+            });
+        });
+
+        // Document tab bar
+        egui::TopBottomPanel::top("document_tabs").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let mut tab_to_switch = None;
+                let mut tab_to_close = None;
+
+                for (idx, tab) in self.tabs.iter().enumerate() {
+                    let is_active = idx == self.active_tab_index;
+                    let dirty_prefix = if tab.is_dirty { "• " } else { "" };
+                    let title = format!("{}{}", dirty_prefix, tab.title);
+
+                    let resp = ui.selectable_label(
+                        is_active,
+                        if is_active {
+                            egui::RichText::new(&title).strong()
+                        } else {
+                            egui::RichText::new(&title)
+                        },
+                    );
+                    if resp.clicked() && !is_active {
+                        tab_to_switch = Some(idx);
+                    }
+
+                    if ui.small_button("×").on_hover_text("Close Tab (Ctrl+W)").clicked() {
+                        tab_to_close = Some(idx);
+                    }
+                    ui.separator();
+                }
+
+                if ui.button("+").on_hover_text("New Design Tab (Ctrl+T)").clicked() {
+                    self.new_tab();
+                }
+
+                if let Some(idx) = tab_to_switch {
+                    self.switch_to_tab(idx);
+                }
+                if let Some(idx) = tab_to_close {
+                    self.request_close_tab(idx);
                 }
             });
         });
@@ -5229,6 +5695,53 @@ impl eframe::App for StudioApp {
                 }
             }
         });
+
+        // Unsaved changes confirmation modal
+        if let Some(tab_idx) = self.close_confirm_tab_index {
+            if tab_idx < self.tabs.len() {
+                let tab_title = self.tabs[tab_idx].title.clone();
+                let mut close_action = None;
+                egui::Window::new("Unsaved Changes")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(format!("Save changes to '{}' before closing?", tab_title));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                close_action = Some("save");
+                            }
+                            if ui.button("Don't Save").clicked() {
+                                close_action = Some("discard");
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close_action = Some("cancel");
+                            }
+                        });
+                    });
+
+                match close_action {
+                    Some("save") => {
+                        let saved = self.save_tab_interactive(tab_idx);
+                        if saved {
+                            self.close_tab_force(tab_idx);
+                            self.close_confirm_tab_index = None;
+                        }
+                    }
+                    Some("discard") => {
+                        self.close_tab_force(tab_idx);
+                        self.close_confirm_tab_index = None;
+                    }
+                    Some("cancel") => {
+                        self.close_confirm_tab_index = None;
+                    }
+                    _ => {}
+                }
+            } else {
+                self.close_confirm_tab_index = None;
+            }
+        }
     }
 }
 
@@ -6944,5 +7457,117 @@ mod tests {
         assert_eq!(app_loaded.group_names.get(&42).map(|s| s.as_str()), Some("Mickey Accessories"));
 
         let _ = std::fs::remove_file(&craft_path);
+    }
+
+    #[test]
+    fn test_tab_creation_and_defaults() {
+        let mut app = StudioApp::new(None);
+        assert_eq!(app.tabs.len(), 1, "App should start with 1 default tab");
+        assert_eq!(app.tabs[0].title, "Design 1");
+        assert_eq!(app.active_tab_index, 0);
+        assert_eq!(app.mat_width_in, 12.0);
+        assert_eq!(app.mat_height_in, 12.0);
+        assert_eq!(app.tabs[0].is_dirty, false);
+        assert!(app.tabs[0].is_blank_and_unmodified());
+
+        // Open a new tab
+        app.new_tab();
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[1].title, "Design 2");
+        assert_eq!(app.active_tab_index, 1);
+        assert_eq!(app.mat_width_in, 12.0);
+        assert_eq!(app.mat_height_in, 12.0);
+        assert_eq!(app.tabs[1].is_dirty, false);
+
+        // Switch back to tab 0
+        app.switch_to_tab(0);
+        assert_eq!(app.active_tab_index, 0);
+        assert_eq!(app.tabs[app.active_tab_index].title, "Design 1");
+    }
+
+    #[test]
+    fn test_open_multiple_files_into_separate_tabs_with_stems() {
+        let mut app = StudioApp::new(None);
+        let p1 = if Path::new("test_samples/Peeker Bears.studio").exists() {
+            std::path::PathBuf::from("test_samples/Peeker Bears.studio")
+        } else {
+            std::path::PathBuf::from("../test_samples/Peeker Bears.studio")
+        };
+        let p2 = if Path::new("test_samples/BD CATS.studio").exists() {
+            std::path::PathBuf::from("test_samples/BD CATS.studio")
+        } else {
+            std::path::PathBuf::from("../test_samples/BD CATS.studio")
+        };
+
+        // 1. Initial file replaces blank tab 0
+        app.load_file(&p1);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].title, "Peeker Bears");
+        assert_eq!(app.active_tab_index, 0);
+        assert_eq!(app.shapes.len(), 24);
+        assert_eq!(app.tabs[0].is_dirty, false);
+        assert_eq!(app.tabs[0].source_path.as_deref(), Some(p1.as_path()));
+
+        // 2. Second file opens into new tab 1
+        app.load_file(&p2);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[1].title, "BD CATS");
+        assert_eq!(app.active_tab_index, 1);
+        let cats_shapes = app.shapes.len();
+        assert!(cats_shapes > 0);
+        assert_eq!(app.tabs[1].is_dirty, false);
+        assert_eq!(app.tabs[1].source_path.as_deref(), Some(p2.as_path()));
+
+        // 3. Tab switching retains independent shape states
+        app.switch_to_tab(0);
+        assert_eq!(app.active_tab_index, 0);
+        assert_eq!(app.shapes.len(), 24);
+
+        app.switch_to_tab(1);
+        assert_eq!(app.active_tab_index, 1);
+        assert_eq!(app.shapes.len(), cats_shapes);
+    }
+
+    #[test]
+    fn test_tab_dirty_flag_tracking_and_confirmation() {
+        let mut app = StudioApp::new(None);
+        assert_eq!(app.tabs[0].is_dirty, false);
+
+        // Modifying document marks tab dirty
+        app.push_undo();
+        assert_eq!(app.tabs[0].is_dirty, true);
+
+        // Requesting close on dirty tab opens confirmation modal
+        app.request_close_tab(0);
+        assert_eq!(app.close_confirm_tab_index, Some(0));
+
+        // Forcing close resets single tab back to clean default
+        app.close_tab_force(0);
+        app.close_confirm_tab_index = None;
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].title, "Design 1");
+        assert_eq!(app.tabs[0].is_dirty, false);
+    }
+
+    #[test]
+    fn test_default_export_filename_generation() {
+        let mut app = StudioApp::new(None);
+        assert_eq!(app.active_tab_stem(), "Design 1");
+        assert_eq!(app.tabs[0].default_export_filename("svg"), "Design 1.svg");
+        assert_eq!(app.tabs[0].default_export_filename("png"), "Design 1.png");
+        assert_eq!(app.tabs[0].default_export_filename("craft"), "Design 1.craft");
+
+        let p1 = if Path::new("test_samples/Peeker Bears.studio").exists() {
+            std::path::PathBuf::from("test_samples/Peeker Bears.studio")
+        } else {
+            std::path::PathBuf::from("../test_samples/Peeker Bears.studio")
+        };
+        app.load_file(&p1);
+
+        assert_eq!(app.active_tab_stem(), "Peeker Bears");
+        assert_eq!(app.tabs[0].default_export_filename("svg"), "Peeker Bears.svg");
+        assert_eq!(app.tabs[0].default_export_filename("png"), "Peeker Bears.png");
+        assert_eq!(app.tabs[0].default_export_filename("craft"), "Peeker Bears.craft");
+        assert!(app.active_tab_dir().is_some());
     }
 }
