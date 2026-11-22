@@ -32,6 +32,7 @@ pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x
 pub const HEADER_OFFSET_V5: usize = 0x0400; // 1,024 bytes
 pub const BEZIER_VERTEX_MARKER: [u8; 5] = [0x01, 0x21, 0x00, 0x00, 0x00];
 pub const BEZIER_VERTEX_MARKER_1H: [u8; 5] = [0x01, 0x19, 0x00, 0x00, 0x00];
+pub const BEZIER_VERTEX_MARKER_0H: [u8; 5] = [0x01, 0x11, 0x00, 0x00, 0x00];
 
 pub const TAG_PATH_BLOCK: [u8; 4] = [0x53, 0x50, 0x54, 0x48]; // "SPTH"
 pub const TAG_TRANSFORM: [u8; 4] = [0x53, 0x58, 0x46, 0x4D];  // "SXFM"
@@ -716,19 +717,22 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         }
     }
 
-    // Second attempt: General stream scanning for 01 21 00 00 00 (2 handles) and 01 19 00 00 00 (1 handle) records
+    // Second attempt: General stream scanning for 01 21 (2 handles), 01 19 (1 handle), and 01 11 (0 handles / corner) records
     let mut vertices_with_pos = Vec::new();
     let mut i = 0;
     while i + 5 <= stream.len() {
         if let Some(marker_slice) = stream.get(i..i + 5) {
             let is_2h = marker_slice == BEZIER_VERTEX_MARKER;
             let is_1h = marker_slice == BEZIER_VERTEX_MARKER_1H;
-            if is_2h || is_1h {
+            let is_0h = marker_slice == BEZIER_VERTEX_MARKER_0H;
+            if is_2h || is_1h || is_0h {
                 if let Some(payload) = stream.get(i + 5..) {
                     let parsed = if is_2h {
                         parse_bezier_vertex(payload)
-                    } else {
+                    } else if is_1h {
                         parse_bezier_vertex_1h(payload)
+                    } else {
+                        parse_bezier_vertex_0h(payload)
                     };
                     if let Some((v, len)) = parsed {
                         vertices_with_pos.push((i, 5 + len, v));
@@ -781,6 +785,49 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         return shapes;
     }
 
+    // Pre-scan all style color records in the stream (01 [len] 00 01 [r, g, b, a])
+    #[derive(Debug, Clone, Copy)]
+    struct StyleRecord {
+        pos: usize,
+        color: egui::Color32,
+    }
+
+    let mut style_records: Vec<StyleRecord> = Vec::new();
+    let mut s_idx = 0;
+    while s_idx + 23 <= stream.len() {
+        if stream[s_idx] == 0x01 && stream[s_idx + 5] == 0x00 && stream[s_idx + 6] == 0x01 {
+            if let Some(len) = read_u32_le(stream, s_idx + 1) {
+                if (16..=2000).contains(&len) {
+                    if let (Some(r), Some(g), Some(b), Some(a)) = (
+                        read_f32_le(stream, s_idx + 7),
+                        read_f32_le(stream, s_idx + 11),
+                        read_f32_le(stream, s_idx + 15),
+                        read_f32_le(stream, s_idx + 19),
+                    ) {
+                        if (0.0..=1.0).contains(&r)
+                            && (0.0..=1.0).contains(&g)
+                            && (0.0..=1.0).contains(&b)
+                            && (a - 1.0).abs() < 1e-3
+                        {
+                            style_records.push(StyleRecord {
+                                pos: s_idx,
+                                color: egui::Color32::from_rgba_unmultiplied(
+                                    (r * 255.0).round() as u8,
+                                    (g * 255.0).round() as u8,
+                                    (b * 255.0).round() as u8,
+                                    255,
+                                ),
+                            });
+                            s_idx = s_idx.saturating_add(5 + (len as usize).min(200));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        s_idx = s_idx.saturating_add(1);
+    }
+
     // Determine matrix and fill for each cluster
     let mut cluster_data: Vec<(AffineTransform2D, egui::Color32)> = Vec::new();
     let mut last_valid_xfm = AffineTransform2D::default();
@@ -790,64 +837,70 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         let cluster = &path_clusters[idx];
         let next_start = path_clusters.get(idx + 1).map(|p| p.start_pos).unwrap_or(stream.len());
 
-        // 1. Matrix: search in gap immediately following this cluster
+        let cur_style = style_records.iter().rev().find(|sr| sr.pos <= cluster.start_pos);
+        let next_style_pos = style_records
+            .iter()
+            .find(|sr| sr.pos > cluster.start_pos)
+            .map(|sr| sr.pos)
+            .unwrap_or(stream.len());
+
+        let group_start = cur_style.map(|s| s.pos).unwrap_or(0);
+        let group_end = next_style_pos.min(stream.len());
+
+        // 1. Matrix resolution:
+        // A. Check gap immediately following this cluster
         let gap_start = cluster.end_pos;
-        let gap_end = next_start.min(gap_start.saturating_add(120)).min(stream.len());
-        let mut xfm = None;
+        let gap_end = next_start.min(gap_start.saturating_add(150)).min(stream.len());
+        let mut local_xfm = None;
         if gap_start < gap_end {
             if let Some(gap_slice) = stream.get(gap_start..gap_end) {
-                xfm = find_transform_in_slice(gap_slice);
+                local_xfm = find_transform_in_slice(gap_slice);
             }
         }
 
-        // If not found in immediate gap, look ahead to next cluster's trailing gap (compound path contour)
-        if xfm.is_none() && idx + 1 < path_clusters.len() {
-            let next_end = path_clusters[idx + 1].end_pos;
-            let next_after_start = path_clusters.get(idx + 2).map(|p| p.start_pos).unwrap_or(stream.len());
-            let next_gap_end = next_after_start.min(next_end.saturating_add(120)).min(stream.len());
-            if next_end < next_gap_end {
-                if let Some(next_gap_slice) = stream.get(next_end..next_gap_end) {
-                    xfm = find_transform_in_slice(next_gap_slice);
-                }
+        // B. Search for group-level transform:
+        // First look forward within the group interval [cluster.end_pos..group_end]
+        let mut group_xfm = None;
+        if gap_start < group_end {
+            if let Some(fwd_slice) = stream.get(gap_start..group_end) {
+                group_xfm = find_transform_in_slice(fwd_slice);
+            }
+        }
+        // If not found forward, look backward within the group [group_start..cluster.start_pos]
+        if group_xfm.is_none() && group_start < cluster.start_pos {
+            if let Some(bwd_slice) = stream.get(group_start..cluster.start_pos) {
+                group_xfm = find_transform_in_slice(bwd_slice);
             }
         }
 
-        // If still not found, check before start_pos
-        if xfm.is_none() {
-            let prefix_start = cluster.start_pos.saturating_sub(120);
-            if let Some(prefix_slice) = stream.get(prefix_start..cluster.start_pos) {
-                xfm = find_transform_in_slice(prefix_slice);
-            }
-        }
-
-        let final_xfm = match xfm {
-            Some(t) => {
-                last_valid_xfm = t;
-                t
-            }
-            None => last_valid_xfm,
-        };
-
-        // 2. Fill color: search in prefix before start_pos
-        let prefix_start = cluster.start_pos.saturating_sub(350);
-        let mut fill_color = None;
-        if let Some(prefix_slice) = stream.get(prefix_start..cluster.start_pos) {
-            fill_color = find_fill_color_in_slice(prefix_slice);
-        }
-
-        let final_fill = match fill_color {
-            Some(c) => {
-                last_valid_fill = c;
-                c
-            }
-            None => {
-                if last_valid_fill.a() > 0 {
-                    last_valid_fill
+        // C. Combine transforms: parent * child
+        let final_xfm = match (group_xfm, local_xfm) {
+            (Some(parent), Some(child)) => {
+                if parent != child {
+                    parent.combine(&child)
                 } else {
-                    egui::Color32::TRANSPARENT
+                    parent
+                }
+            }
+            (Some(parent), None) => parent,
+            (None, Some(child)) => child,
+            (None, None) => last_valid_xfm,
+        };
+        last_valid_xfm = final_xfm;
+
+        // 2. Fill color resolution:
+        let final_fill = match cur_style {
+            Some(s) => s.color,
+            None => {
+                let prefix_start = cluster.start_pos.saturating_sub(600);
+                if let Some(prefix_slice) = stream.get(prefix_start..cluster.start_pos) {
+                    find_fill_color_in_slice(prefix_slice).unwrap_or(last_valid_fill)
+                } else {
+                    last_valid_fill
                 }
             }
         };
+        last_valid_fill = final_fill;
 
         cluster_data.push((final_xfm, final_fill));
     }
@@ -1171,6 +1224,44 @@ fn parse_bezier_vertex_1h(payload: &[u8]) -> Option<(StudioBezierVertex, usize)>
     None
 }
 
+/// Parses a 0-handle corner/straight line vertex record (`01 11 00 00 00` marker + payload).
+/// In Silhouette Studio files, a corner point has no separate handles; incoming and outgoing
+/// handles match the anchor point.
+fn parse_bezier_vertex_0h(payload: &[u8]) -> Option<(StudioBezierVertex, usize)> {
+    if payload.len() < 8 {
+        return None;
+    }
+    let ax = read_f32_le(payload, 0)?;
+    let ay = read_f32_le(payload, 4)?;
+    if !is_plausible_coord(ax) || !is_plausible_coord(ay) {
+        return None;
+    }
+
+    // Determine payload length by checking for next vertex marker
+    let mut len = 13; // standard 18-byte record (5 marker + 13 payload)
+    for candidate in [13, 17, 21, 25, 29] {
+        if candidate + 5 <= payload.len() {
+            let next_tag = &payload[candidate..candidate + 5];
+            if next_tag == BEZIER_VERTEX_MARKER
+                || next_tag == BEZIER_VERTEX_MARKER_1H
+                || next_tag == BEZIER_VERTEX_MARKER_0H
+            {
+                len = candidate;
+                break;
+            }
+        }
+    }
+
+    Some((
+        StudioBezierVertex {
+            anchor: egui::pos2(ax, ay),
+            handle_in: egui::pos2(ax, ay),
+            handle_out: egui::pos2(ax, ay),
+        },
+        len,
+    ))
+}
+
 #[inline]
 fn is_plausible_coord(val: f32) -> bool {
     val.is_finite() && val.abs() < 50_000.0
@@ -1305,40 +1396,63 @@ fn find_transform_in_slice(slice: &[u8]) -> Option<AffineTransform2D> {
 }
 
 fn find_fill_color_in_slice(slice: &[u8]) -> Option<egui::Color32> {
-    if slice.len() < 16 {
+    if slice.len() < 18 {
         return None;
     }
 
-    // Look for 01 ea 00 00 00 marker (Silhouette Studio fill record)
-    let marker_ea: [u8; 5] = [0x01, 0xea, 0x00, 0x00, 0x00];
-    let mut search_from = slice.len();
-    while search_from >= 5 {
-        let sub = slice.get(..search_from)?;
-        if let Some(pos) = sub.windows(5).rposition(|w| w == marker_ea) {
-            for candidate_off in [pos + 7, pos + 5, pos + 8] {
-                if let (Some(r), Some(g), Some(b), Some(a)) = (
-                    read_f32_le(slice, candidate_off),
-                    read_f32_le(slice, candidate_off + 4),
-                    read_f32_le(slice, candidate_off + 8),
-                    read_f32_le(slice, candidate_off + 12),
-                ) {
-                    if (0.0..=1.0).contains(&r)
-                        && (0.0..=1.0).contains(&g)
-                        && (0.0..=1.0).contains(&b)
-                        && (a - 1.0).abs() < 1e-3
-                    {
-                        return Some(egui::Color32::from_rgba_unmultiplied(
-                            (r * 255.0).round() as u8,
-                            (g * 255.0).round() as u8,
-                            (b * 255.0).round() as u8,
-                            255,
-                        ));
+    // 1. Scan backwards from end of slice for official style record:
+    // 01 [len: 4 bytes] 00 01 [r: f32] [g: f32] [b: f32] [a: f32]
+    // where 0.0 <= r,g,b <= 1.0 and (a - 1.0).abs() < 1e-3
+    for i in (0..slice.len().saturating_sub(22)).rev() {
+        if slice[i] == 0x01 && slice[i + 5] == 0x00 && slice[i + 6] == 0x01 {
+            if let Some(len) = read_u32_le(slice, i + 1) {
+                if (16..=2000).contains(&len) {
+                    if let (Some(r), Some(g), Some(b), Some(a)) = (
+                        read_f32_le(slice, i + 7),
+                        read_f32_le(slice, i + 11),
+                        read_f32_le(slice, i + 15),
+                        read_f32_le(slice, i + 19),
+                    ) {
+                        if (0.0..=1.0).contains(&r)
+                            && (0.0..=1.0).contains(&g)
+                            && (0.0..=1.0).contains(&b)
+                            && (a - 1.0).abs() < 1e-3
+                        {
+                            return Some(egui::Color32::from_rgba_unmultiplied(
+                                (r * 255.0).round() as u8,
+                                (g * 255.0).round() as u8,
+                                (b * 255.0).round() as u8,
+                                255,
+                            ));
+                        }
                     }
                 }
             }
-            search_from = pos;
-        } else {
-            break;
+        }
+    }
+
+    // 2. Fallback: scan backwards for 00 01 [r, g, b, a] directly
+    for i in (0..slice.len().saturating_sub(17)).rev() {
+        if slice[i] == 0x00 && slice[i + 1] == 0x01 {
+            if let (Some(r), Some(g), Some(b), Some(a)) = (
+                read_f32_le(slice, i + 2),
+                read_f32_le(slice, i + 6),
+                read_f32_le(slice, i + 10),
+                read_f32_le(slice, i + 14),
+            ) {
+                if (0.0..=1.0).contains(&r)
+                    && (0.0..=1.0).contains(&g)
+                    && (0.0..=1.0).contains(&b)
+                    && (a - 1.0).abs() < 1e-3
+                {
+                    return Some(egui::Color32::from_rgba_unmultiplied(
+                        (r * 255.0).round() as u8,
+                        (g * 255.0).round() as u8,
+                        (b * 255.0).round() as u8,
+                        255,
+                    ));
+                }
+            }
         }
     }
 
@@ -1480,8 +1594,8 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>) -> Vec<CanvasShape> {
             continue;
         }
 
-        // Look for an inner hole candidate j
-        let mut hole_idx = None;
+        // Look for inner hole candidates
+        let mut hole_indices = Vec::new();
         for j in 0..shapes.len() {
             if i == j || consumed[j] {
                 continue;
@@ -1497,24 +1611,34 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>) -> Vec<CanvasShape> {
             let s2_max_x = s2.x + s2.width;
             let s2_max_y = s2.y + s2.height;
 
-            if s1.x <= s2.x + 0.05 && s1.y <= s2.y + 0.05 && s1_max_x >= s2_max_x - 0.05 && s1_max_y >= s2_max_y - 0.05 {
-                hole_idx = Some(j);
-                break;
+            if s1.x <= s2.x + 0.05
+                && s1.y <= s2.y + 0.05
+                && s1_max_x >= s2_max_x - 0.05
+                && s1_max_y >= s2_max_y - 0.05
+            {
+                if s2.width < s1.width * 0.99 || s2.height < s1.height * 0.99 {
+                    hole_indices.push(j);
+                }
             }
         }
 
-        if let Some(j) = hole_idx {
+        if !hole_indices.is_empty() {
             consumed[i] = true;
-            consumed[j] = true;
+            for &j in &hole_indices {
+                consumed[j] = true;
+            }
             let outer = s1;
-            let inner = &shapes[j];
 
-            // Build compound SVG path d string: M {outer} Z M {inner} Z
+            // Build compound SVG path d string: M {outer} Z M {inner1} Z M {inner2} Z ...
             let outer_str = outer.points.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" L ");
-            let inner_str = inner.points.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" L ");
-            let compound_d = format!("M {} Z M {} Z", outer_str, inner_str);
+            let mut compound_d = format!("M {} Z", outer_str);
+            for &j in &hole_indices {
+                let inner = &shapes[j];
+                let inner_str = inner.points.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" L ");
+                compound_d.push_str(&format!(" M {} Z", inner_str));
+            }
 
-            // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so the hole punches through
+            // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so the holes punch through
             let dpi = 150.0_f32;
             let pix_w = ((outer.width * dpi).ceil() as u32).max(16);
             let pix_h = ((outer.height * dpi).ceil() as u32).max(16);
@@ -1533,12 +1657,15 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>) -> Vec<CanvasShape> {
                     }
                     pb.close();
                 }
-                if let Some(p0) = inner.points.first() {
-                    pb.move_to((p0.x - outer.x) * sx + pad, (p0.y - outer.y) * sy + pad);
-                    for p in inner.points.iter().skip(1) {
-                        pb.line_to((p.x - outer.x) * sx + pad, (p.y - outer.y) * sy + pad);
+                for &j in &hole_indices {
+                    let inner = &shapes[j];
+                    if let Some(p0) = inner.points.first() {
+                        pb.move_to((p0.x - outer.x) * sx + pad, (p0.y - outer.y) * sy + pad);
+                        for p in inner.points.iter().skip(1) {
+                            pb.line_to((p.x - outer.x) * sx + pad, (p.y - outer.y) * sy + pad);
+                        }
+                        pb.close();
                     }
-                    pb.close();
                 }
 
                 if let Some(path) = pb.finish() {
@@ -1958,6 +2085,88 @@ mod tests {
             assert!(svg2.contains("<image"));
             assert!(svg2.contains("href=\"data:image/png;base64,"));
             assert!(svg2.contains("<polygon") || svg2.contains("<polyline") || svg2.contains("<path"));
+        }
+    }
+
+    #[test]
+    fn test_new_sample_files_verification() {
+        let beverly_candidates = [
+            Path::new("../test_samples/beverly high school mass.studio"),
+            Path::new("test_samples/beverly high school mass.studio"),
+        ];
+        let cats_candidates = [
+            Path::new("../test_samples/BD CATS.studio"),
+            Path::new("test_samples/BD CATS.studio"),
+        ];
+        let whale_candidates = [
+            Path::new("../test_samples/PP WHALE TAIL.studio"),
+            Path::new("test_samples/PP WHALE TAIL.studio"),
+        ];
+
+        if let Some(p_bev) = beverly_candidates.iter().find(|p| p.exists()) {
+            let doc = parse_studio_file(p_bev).expect("Parse beverly high school mass.studio");
+            assert_eq!(doc.version, StudioFormatVersion::StudioV4);
+            assert!(doc.shapes.len() >= 20, "Expected >= 20 shapes in beverly, got {}", doc.shapes.len());
+            let filled = doc.shapes.iter().filter(|s| s.fill_color.a() > 0).count();
+            assert!(filled >= 20, "Expected >= 20 filled shapes in beverly, got {}", filled);
+
+            let colors: std::collections::BTreeSet<String> = doc.shapes.iter()
+                .filter(|s| s.fill_color.a() > 0)
+                .map(|s| format!("#{:02x}{:02x}{:02x}", s.fill_color.r(), s.fill_color.g(), s.fill_color.b()))
+                .collect();
+            assert!(colors.contains("#f56700") || colors.contains("#f46600"), "Expected Panther Orange in beverly: {:?}", colors);
+
+            for shape in &doc.shapes {
+                assert!(shape.width > 0.0);
+                assert!(shape.height > 0.0);
+                assert!(shape.x >= 0.0 && shape.x <= doc.mat_width_in);
+                assert!(shape.y >= 0.0 && shape.y <= doc.mat_height_in);
+            }
+
+            let svg = convert_studio_to_svg(&std::fs::read(p_bev).unwrap()).expect("Convert beverly to SVG");
+            assert!(svg.contains("<svg"));
+            assert!(svg.contains("<polygon") || svg.contains("<path") || svg.contains("<polyline"));
+        }
+
+        if let Some(p_cats) = cats_candidates.iter().find(|p| p.exists()) {
+            let doc = parse_studio_file(p_cats).expect("Parse BD CATS.studio");
+            assert_eq!(doc.version, StudioFormatVersion::StudioV4);
+            assert!(doc.shapes.len() >= 5, "Expected >= 5 cats in BD CATS, got {}", doc.shapes.len());
+            let filled = doc.shapes.iter().filter(|s| s.fill_color.a() > 0).count();
+            assert!(filled >= 5, "Expected >= 5 filled cats in BD CATS, got {}", filled);
+
+            let colors: std::collections::BTreeSet<String> = doc.shapes.iter()
+                .filter(|s| s.fill_color.a() > 0)
+                .map(|s| format!("#{:02x}{:02x}{:02x}", s.fill_color.r(), s.fill_color.g(), s.fill_color.b()))
+                .collect();
+            assert!(colors.contains("#79472c") || colors.contains("#78462b"), "Expected Cat Brown in BD CATS: {:?}", colors);
+
+            for shape in &doc.shapes {
+                assert!(shape.width > 0.0);
+                assert!(shape.height > 0.0);
+                assert!(shape.x >= 0.0 && shape.x <= doc.mat_width_in);
+                assert!(shape.y >= 0.0 && shape.y <= doc.mat_height_in);
+            }
+
+            let svg = convert_studio_to_svg(&std::fs::read(p_cats).unwrap()).expect("Convert BD CATS to SVG");
+            assert!(svg.contains("<svg"));
+            assert!(svg.contains("<polygon") || svg.contains("<path") || svg.contains("<polyline"));
+        }
+
+        if let Some(p_whale) = whale_candidates.iter().find(|p| p.exists()) {
+            let doc = parse_studio_file(p_whale).expect("Parse PP WHALE TAIL.studio");
+            assert_eq!(doc.version, StudioFormatVersion::StudioV4);
+            assert!(!doc.shapes.is_empty(), "Expected >= 1 shape in PP WHALE TAIL");
+            let filled = doc.shapes.iter().filter(|s| s.fill_color.a() > 0).count();
+            assert!(filled >= 1, "Expected filled shape in PP WHALE TAIL");
+
+            let s = &doc.shapes[0];
+            assert!(s.width > 0.5 && s.width <= doc.mat_width_in);
+            assert!(s.height > 0.5 && s.height <= doc.mat_height_in);
+
+            let svg = convert_studio_to_svg(&std::fs::read(p_whale).unwrap()).expect("Convert PP WHALE TAIL to SVG");
+            assert!(svg.contains("<svg"));
+            assert!(svg.contains("<polygon") || svg.contains("<path") || svg.contains("<polyline"));
         }
     }
 }

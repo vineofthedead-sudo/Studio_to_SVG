@@ -4,6 +4,28 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.4.3] - 2026-11-21
+
+### Added & Improved
+- **Legacy `.studio` (`silhouette04;`) Full Vector Geometry & Corner Vertex Support (`app/src/studio_format.rs`)**:
+  - Added support for 0-handle straight-line / corner vertex records (`BEZIER_VERTEX_MARKER_0H = [0x01, 0x11, 0x00, 0x00, 0x00]`).
+  - Added `parse_bezier_vertex_0h` extracting anchor `(ax, ay)` coordinates and setting incoming/outgoing control handles to match anchor positions with bounded candidate length detection (`[13, 17, 21, 25, 29]`).
+  - Completely eliminates broken contours and contour fragmentation in files containing straight segments (e.g. 148 straight line segments in `BD CATS.studio`, 31 in `beverly high school mass.studio`, and 1 in `PP WHALE TAIL.studio`).
+- **Complete Solid Fill & Material Color Extraction Across All Object Variants (`app/src/studio_format.rs`)**:
+  - Replaced hardcoded single-length marker search with generalized scanning for Studio material/style color records (`01 [len_u32] 00 01 [r, g, b, a]` and direct `00 01 [r, g, b, a]`).
+  - Pre-scans style records to associate each vector object and group with its exact cardstock color, reliably extracting authentic colors like Beverly Panthers Orange (`#f56700`), Red (`#ff0000`), Grey (`#c4c4c4`), BD Cats Brown (`#79472c`), and Whale Tail Black (`#000000`).
+- **Exact Hierarchical Group & Shape Transforms (`parent * child`) (`app/src/studio_format.rs`)**:
+  - Implemented group-aware 2D affine matrix resolution where group-level container transforms are discovered within object intervals and multiplied down to child paths (`parent.combine(&child)`).
+  - Preserves exact relative design alignment so multi-part logos and paper-piecing layers stay in their authentic relative positions on the mat instead of separating, scattering, or collapsing.
+  - Retained strict zero per-shape or per-group artificial clamping during import.
+- **Multi-Hole Compound Path Cutouts (`app/src/studio_format.rs`)**:
+  - Upgraded `merge_compound_paths` to collect all interior holes contained within an outer boundary shape sharing the same solid fill color (e.g., letters with multiple counters, emblem cutouts, concentric wheels), generating a unified SVG path with `FillRule::EvenOdd` and rendering with `tiny_skia`.
+- **Comprehensive Integration Tests (`app/src/studio_format.rs`)**:
+  - Added `test_new_sample_files_verification` covering `beverly high school mass.studio` (23 shapes, all filled, Panthers orange present, valid bounds), `BD CATS.studio` (5 filled cats, brown fill color present, valid non-overlapping bounds), and `PP WHALE TAIL.studio` (1 filled shape, black color, valid bounds).
+  - Maintained 100% pass rate across the full test suite (55 tests passing, 0 failures, 0 warnings).
+
+---
+
 ## [0.4.2] - 2026-11-21
 
 ### Added & Improved
