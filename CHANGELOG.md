@@ -4,6 +4,28 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.4.2] - 2026-11-21
+
+### Added & Improved
+- **Shift+Click Multi-Select (Canvas & Layers Panel) + Group Drill-Down (`app/src/main.rs`)**:
+  - Canvas multi-selection: holding `Shift` (or `Ctrl`/`Cmd`) while clicking adds or toggles shapes and groups in `selected_indices` without deselecting currently selected objects.
+  - Double-click drill-down (`select_shape_exact`): double-clicking a grouped shape on the canvas bypasses top-level group expansion to select only the exact child shape underneath the cursor, allowing individual piece recoloring and nudging without ungrouping.
+  - Layers panel row selection: clicking any layer/group row selects it; `Shift+Click` and `Ctrl+Click` on rows multi-selects multiple layers directly from the list.
+  - Arrow key nudging: keyboard arrow keys (`ArrowLeft`, `ArrowRight`, `ArrowUp`, `ArrowDown`) nudge all selected shapes (or drilled-down children) by `0.02"` (or `0.10"` with `Shift`), with full undo/redo history.
+- **One-Click Paper-Piecing "Stack / Center" & "Spread / Explode" (`app/src/vector_ops.rs`, `app/src/main.rs`)**:
+  - **"🎯 Stack / Center"**: Added in both the `Layers` panel and `Transform` panel to concentrically align bounding-box centers (`cx, cy`) of all selected shapes/groups onto their shared average center point, re-assembling exploded cardstock layers into a stacked paper-piecing character with one click.
+  - **"⊞ Spread / Explode"**: Added in both `Layers` and `Transform` panels to arrange selected layers into a clean, non-overlapping multi-row cutting grid across the mat (with 0.5" margin and 0.5" gaps) so pieces cut separately by color without colliding.
+  - Entity-aware movement: shapes sharing a top-level group move together as a single cohesive unit, while standalone or drilled-down shapes move independently.
+- **Inline Layer & Group Renaming (`app/src/main.rs`, `app/src/project_file.rs`)**:
+  - Double-clicking or clicking the small `✏` rename icon on any row in the `Layers` panel allows inline text editing of group and shape names (e.g., `"Yellow Shoes"`, `"Base Silhouette"`, `"Face & Eyes"`).
+  - Pressing `Enter` or clicking outside commits the rename with Undo support; pressing `Esc` cancels.
+  - Custom names are persisted in `.craft` projects via `CraftShape.name` and `CraftProject.group_names` with 100% roundtrip fidelity.
+- **Verification & Unit Tests**:
+  - Added unit tests for concentric alignment offsets (`test_stack_center_offsets`), explode grid layout (`test_explode_grid_offsets`), double-click group drill-down (`test_drill_down_and_shift_multi_select`), paper-piecing stack/center and explode with undo (`test_paper_piecing_stack_center_and_explode_with_undo`), and inline renaming persistence (`test_inline_renaming_and_craft_persistence`).
+  - Total test suite expanded to 54 passing tests (0 failures).
+
+---
+
 ## [0.4.1] - 2026-11-21
 
 ### Added & Improved

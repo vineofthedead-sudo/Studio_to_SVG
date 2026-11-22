@@ -984,6 +984,7 @@ fn parse_structured_paths(stream: &[u8]) -> Option<Vec<CanvasShape>> {
                         group_path: vec![layer_id],
                         is_visible: true,
                         is_locked: false,
+                        name: None,
                         pixmap: None,
                         texture: None,
                     };
@@ -1222,6 +1223,7 @@ fn create_canvas_shape_from_vertices(
         group_path: vec![layer_id],
         is_visible: true,
         is_locked: false,
+        name: None,
         pixmap: None,
         texture: None,
     };
@@ -1438,6 +1440,7 @@ fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> Option<Can
         group_path: Vec::new(),
         is_visible: true,
         is_locked: true,
+        name: Some("Print Background".to_string()),
         pixmap: Some(pixmap),
         texture: None,
     })

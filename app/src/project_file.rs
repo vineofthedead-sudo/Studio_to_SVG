@@ -74,6 +74,10 @@ pub struct CraftShape {
     #[serde(default)]
     pub is_locked: bool,
 
+    /// Optional custom name/label for the shape (e.g. "Yellow Shoes", "Base Silhouette").
+    #[serde(default)]
+    pub name: Option<String>,
+
     /// Base64-encoded PNG bytes for raster pixmap shapes, or `None`.
     #[serde(default)]
     pub pixmap_b64: Option<String>,
@@ -330,6 +334,7 @@ mod tests {
             group_path: vec![1],
             is_visible: true,
             is_locked: false,
+            name: Some("Base Silhouette".to_string()),
             pixmap_b64: None,
             pixmap_width: 0,
             pixmap_height: 0,
@@ -352,6 +357,7 @@ mod tests {
             group_path: vec![],
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap_b64: Some("dGVzdA==".to_string()),
             pixmap_width: 10,
             pixmap_height: 20,

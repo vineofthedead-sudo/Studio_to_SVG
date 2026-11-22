@@ -458,6 +458,94 @@ pub fn registration_marks(
 }
 
 // ---------------------------------------------------------------------------
+// 5. Paper-Piecing Assembly (Stack / Center & Spread / Explode)
+// ---------------------------------------------------------------------------
+
+/// Compute concentric alignment translation offsets (dx, dy) for multiple entity bounding boxes.
+///
+/// Moves the center `(cx, cy)` of each entity bounding box onto their shared average center point.
+/// Returns a `Vec<(f32, f32)>` of the same length as `entity_rects`.
+pub fn compute_stack_center_offsets(
+    entity_rects: &[(f32, f32, f32, f32)],
+) -> Vec<(f32, f32)> {
+    if entity_rects.is_empty() {
+        return Vec::new();
+    }
+    if entity_rects.len() == 1 {
+        return vec![(0.0, 0.0)];
+    }
+
+    let n = entity_rects.len() as f32;
+    let mut sum_cx = 0.0_f32;
+    let mut sum_cy = 0.0_f32;
+
+    for &(min_x, min_y, max_x, max_y) in entity_rects {
+        let cx = (min_x + max_x) * 0.5;
+        let cy = (min_y + max_y) * 0.5;
+        sum_cx += cx;
+        sum_cy += cy;
+    }
+
+    let avg_cx = sum_cx / n;
+    let avg_cy = sum_cy / n;
+
+    entity_rects
+        .iter()
+        .map(|&(min_x, min_y, max_x, max_y)| {
+            let cx = (min_x + max_x) * 0.5;
+            let cy = (min_y + max_y) * 0.5;
+            (avg_cx - cx, avg_cy - cy)
+        })
+        .collect()
+}
+
+/// Compute grid layout translation offsets (dx, dy) for exploding / spreading entities across the mat.
+///
+/// Arranges entity bounding boxes into a clean, non-overlapping multi-row grid starting at
+/// `(start_x, start_y)` and wrapping within `max_width`.
+/// Returns a `Vec<(f32, f32)>` of the same length as `entity_rects`.
+pub fn compute_explode_grid_offsets(
+    entity_rects: &[(f32, f32, f32, f32)],
+    start_x: f32,
+    start_y: f32,
+    max_width: f32,
+    gap: f32,
+) -> Vec<(f32, f32)> {
+    if entity_rects.is_empty() {
+        return Vec::new();
+    }
+
+    let mut cur_x = start_x;
+    let mut cur_y = start_y;
+    let mut row_max_h = 0.0_f32;
+    let mut offsets = Vec::with_capacity(entity_rects.len());
+
+    for &(min_x, min_y, max_x, max_y) in entity_rects {
+        let w = (max_x - min_x).max(0.05);
+        let h = (max_y - min_y).max(0.05);
+
+        // Wrap to next row if not first item in this row and exceeds available width
+        if cur_x > start_x && (cur_x + w) > max_width {
+            cur_x = start_x;
+            cur_y += row_max_h + gap;
+            row_max_h = 0.0;
+        }
+
+        let target_min_x = cur_x;
+        let target_min_y = cur_y;
+
+        let dx = target_min_x - min_x;
+        let dy = target_min_y - min_y;
+        offsets.push((dx, dy));
+
+        cur_x += w + gap;
+        row_max_h = row_max_h.max(h);
+    }
+
+    offsets
+}
+
+// ---------------------------------------------------------------------------
 // Unit Tests
 // ---------------------------------------------------------------------------
 
@@ -672,5 +760,56 @@ mod tests {
 
         let welded = boolean_weld_polygons(&[rect_a, rect_b]);
         assert_eq!(welded.len(), 2, "disjoint shapes should remain 2 separate shapes");
+    }
+
+    // 10. compute_stack_center_offsets: concentric alignment of multiple layers
+    #[test]
+    fn test_stack_center_offsets() {
+        let box_a = (0.0_f32, 0.0_f32, 2.0_f32, 2.0_f32); // center: (1.0, 1.0)
+        let box_b = (4.0_f32, 4.0_f32, 8.0_f32, 8.0_f32); // center: (6.0, 6.0)
+        let offsets = compute_stack_center_offsets(&[box_a, box_b]);
+
+        assert_eq!(offsets.len(), 2);
+        // Shared average center is ((1+6)/2, (1+6)/2) = (3.5, 3.5)
+        let (dx_a, dy_a) = offsets[0];
+        let (dx_b, dy_b) = offsets[1];
+        assert!(approx_eq(dx_a, 2.5, 1e-4));
+        assert!(approx_eq(dy_a, 2.5, 1e-4));
+        assert!(approx_eq(dx_b, -2.5, 1e-4));
+        assert!(approx_eq(dy_b, -2.5, 1e-4));
+
+        let new_center_a_x = (box_a.0 + dx_a + box_a.2 + dx_a) * 0.5;
+        let new_center_a_y = (box_a.1 + dy_a + box_a.3 + dy_a) * 0.5;
+        let new_center_b_x = (box_b.0 + dx_b + box_b.2 + dx_b) * 0.5;
+        let new_center_b_y = (box_b.1 + dy_b + box_b.3 + dy_b) * 0.5;
+        assert!(approx_eq(new_center_a_x, 3.5, 1e-4));
+        assert!(approx_eq(new_center_a_y, 3.5, 1e-4));
+        assert!(approx_eq(new_center_b_x, 3.5, 1e-4));
+        assert!(approx_eq(new_center_b_y, 3.5, 1e-4));
+    }
+
+    // 11. compute_explode_grid_offsets: non-overlapping multi-row grid layout
+    #[test]
+    fn test_explode_grid_offsets() {
+        // 3 boxes, each 2.0 x 2.0
+        let b1 = (0.0_f32, 0.0_f32, 2.0_f32, 2.0_f32);
+        let b2 = (0.0_f32, 0.0_f32, 2.0_f32, 2.0_f32);
+        let b3 = (0.0_f32, 0.0_f32, 2.0_f32, 2.0_f32);
+
+        // max_width = 5.0 allows 2 boxes per row (2.0 + 0.5 + 2.0 = 4.5 <= 5.0)
+        let offsets = compute_explode_grid_offsets(&[b1, b2, b3], 0.5, 0.5, 5.0, 0.5);
+        assert_eq!(offsets.len(), 3);
+
+        // Box 1 placed at (0.5, 0.5)
+        assert!(approx_eq(offsets[0].0, 0.5, 1e-4));
+        assert!(approx_eq(offsets[0].1, 0.5, 1e-4));
+
+        // Box 2 placed at (3.0, 0.5)
+        assert!(approx_eq(offsets[1].0, 3.0, 1e-4));
+        assert!(approx_eq(offsets[1].1, 0.5, 1e-4));
+
+        // Box 3 wrapped to row 2 at (0.5, 3.0)
+        assert!(approx_eq(offsets[2].0, 0.5, 1e-4));
+        assert!(approx_eq(offsets[2].1, 3.0, 1e-4));
     }
 }

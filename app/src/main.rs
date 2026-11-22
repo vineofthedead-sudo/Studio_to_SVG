@@ -72,6 +72,7 @@ pub struct CanvasShape {
     pub group_path: Vec<u64>,
     pub is_visible: bool,
     pub is_locked: bool,
+    pub name: Option<String>,
     pub pixmap: Option<tiny_skia::Pixmap>,
     pub texture: Option<egui::TextureHandle>,
 }
@@ -80,6 +81,7 @@ impl std::fmt::Debug for CanvasShape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CanvasShape")
             .field("kind", &self.kind)
+            .field("name", &self.name)
             .field("x", &self.x)
             .field("y", &self.y)
             .field("width", &self.width)
@@ -112,6 +114,7 @@ impl Default for CanvasShape {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         }
@@ -146,6 +149,8 @@ pub struct SerializableShape {
     pub is_visible: bool,
     #[serde(default)]
     pub is_locked: bool,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -192,6 +197,7 @@ impl CanvasShape {
             group_path: self.group_path.clone(),
             is_visible: self.is_visible,
             is_locked: self.is_locked,
+            name: self.name.clone(),
         }
     }
 
@@ -228,6 +234,7 @@ impl CanvasShape {
             },
             is_visible: s.is_visible,
             is_locked: s.is_locked,
+            name: s.name,
             pixmap: None,
             texture: None,
         };
@@ -273,6 +280,7 @@ impl CanvasShape {
             group_path: self.group_path.clone(),
             is_visible: self.is_visible,
             is_locked: self.is_locked,
+            name: self.name.clone(),
             pixmap_b64,
             pixmap_width,
             pixmap_height,
@@ -328,6 +336,7 @@ impl CanvasShape {
             },
             is_visible: s.is_visible,
             is_locked: s.is_locked,
+            name: s.name,
             pixmap,
             texture: None,
         };
@@ -395,6 +404,25 @@ impl CanvasShape {
             *p += delta;
         }
         self.is_modified = true;
+    }
+
+    pub fn bounding_box(&self) -> egui::Rect {
+        if !self.points.is_empty() {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for p in &self.points {
+                min_x = min_x.min(p.x);
+                min_y = min_y.min(p.y);
+                max_x = max_x.max(p.x);
+                max_y = max_y.max(p.y);
+            }
+            if min_x.is_finite() && max_x.is_finite() {
+                return egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
+            }
+        }
+        egui::Rect::from_min_size(egui::pos2(self.x, self.y), egui::vec2(self.width, self.height))
     }
 
     pub fn hit_test(&self, p: egui::Pos2, tolerance: f32) -> bool {
@@ -541,6 +569,12 @@ pub enum ResizeCorner {
     BottomRight,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenamingTarget {
+    Group(u64),
+    Shape(usize),
+}
+
 #[derive(Clone)]
 pub struct CanvasSnapshot {
     pub shapes: Vec<CanvasShape>,
@@ -595,6 +629,8 @@ pub struct StudioApp {
     pub offset_round_joins: bool,
     pub canvas_size: egui::Vec2,
     pub focus_text_input: bool,
+    pub renaming_target: Option<RenamingTarget>,
+    pub renaming_text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -654,6 +690,11 @@ pub enum LayerAction {
     ToggleShapeVis(usize),
     ToggleShapeLock(usize),
     SelectShape(usize, bool),
+    StartRenameGroup(u64, String),
+    StartRenameShape(usize, String),
+    CommitRenameGroup(u64, String),
+    CommitRenameShape(usize, String),
+    CancelRename,
 }
 
 pub fn render_layer_nodes(
@@ -664,6 +705,8 @@ pub fn render_layer_nodes(
     selected_index: Option<usize>,
     expanded_groups: &std::collections::BTreeSet<u64>,
     group_names: &std::collections::BTreeMap<u64, String>,
+    renaming_target: Option<RenamingTarget>,
+    renaming_text: &mut String,
     actions: &mut Vec<LayerAction>,
 ) {
     for node in nodes {
@@ -714,11 +757,33 @@ pub fn render_layer_nodes(
                     } else {
                         format!("Group {}", group.gid)
                     };
-                    let group_label = format!("{} ({} items)", name, group.member_indices.len());
-                    let resp = ui.selectable_label(is_sel, group_label);
-                    if resp.clicked() {
-                        let shift = ui.input(|inp| inp.modifiers.shift);
-                        actions.push(LayerAction::SelectGroup(group.member_indices.clone(), shift));
+
+                    let is_renaming_this = renaming_target == Some(RenamingTarget::Group(group.gid));
+                    if is_renaming_this {
+                        let text_edit = egui::TextEdit::singleline(renaming_text)
+                            .id_source(egui::Id::new("rename_group").with(group.gid));
+                        let resp = ui.add(text_edit);
+                        resp.request_focus();
+                        if resp.lost_focus() {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                actions.push(LayerAction::CancelRename);
+                            } else {
+                                actions.push(LayerAction::CommitRenameGroup(group.gid, renaming_text.clone()));
+                            }
+                        }
+                    } else {
+                        let group_label = format!("{} ({} items)", name, group.member_indices.len());
+                        let resp = ui.selectable_label(is_sel, group_label);
+                        if resp.double_clicked() {
+                            actions.push(LayerAction::StartRenameGroup(group.gid, name.clone()));
+                        } else if resp.clicked() {
+                            let shift = ui.input(|inp| inp.modifiers.shift || inp.modifiers.ctrl || inp.modifiers.command);
+                            actions.push(LayerAction::SelectGroup(group.member_indices.clone(), shift));
+                        }
+
+                        if ui.small_button("✏").on_hover_text("Rename group").clicked() {
+                            actions.push(LayerAction::StartRenameGroup(group.gid, name));
+                        }
                     }
                 });
 
@@ -731,6 +796,8 @@ pub fn render_layer_nodes(
                         selected_index,
                         expanded_groups,
                         group_names,
+                        renaming_target,
+                        renaming_text,
                         actions,
                     );
                 }
@@ -756,6 +823,8 @@ pub fn render_layer_nodes(
                     egui::Color32::BLACK
                 };
 
+                let default_name = shape.name.clone().unwrap_or_else(|| kind_label.to_string());
+
                 ui.horizontal(|ui| {
                     let indent = (*depth as f32) * 12.0 + 16.0;
                     ui.add_space(indent);
@@ -770,10 +839,32 @@ pub fn render_layer_nodes(
                     ui.painter().rect_filled(rect, 2.0, swatch_color);
                     ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::GRAY));
 
-                    let label_text = format!("#{} {}", i, kind_label);
-                    if ui.selectable_label(is_sel, label_text).clicked() {
-                        let shift = ui.input(|inp| inp.modifiers.shift);
-                        actions.push(LayerAction::SelectShape(i, shift));
+                    let is_renaming_this = renaming_target == Some(RenamingTarget::Shape(i));
+                    if is_renaming_this {
+                        let text_edit = egui::TextEdit::singleline(renaming_text)
+                            .id_source(egui::Id::new("rename_shape").with(i));
+                        let resp = ui.add(text_edit);
+                        resp.request_focus();
+                        if resp.lost_focus() {
+                            if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                                actions.push(LayerAction::CancelRename);
+                            } else {
+                                actions.push(LayerAction::CommitRenameShape(i, renaming_text.clone()));
+                            }
+                        }
+                    } else {
+                        let label_text = format!("#{} {}", i + 1, default_name);
+                        let resp = ui.selectable_label(is_sel, label_text);
+                        if resp.double_clicked() {
+                            actions.push(LayerAction::StartRenameShape(i, default_name.clone()));
+                        } else if resp.clicked() {
+                            let shift = ui.input(|inp| inp.modifiers.shift || inp.modifiers.ctrl || inp.modifiers.command);
+                            actions.push(LayerAction::SelectShape(i, shift));
+                        }
+
+                        if ui.small_button("✏").on_hover_text("Rename shape").clicked() {
+                            actions.push(LayerAction::StartRenameShape(i, default_name));
+                        }
                     }
                 });
             }
@@ -828,6 +919,8 @@ impl StudioApp {
             offset_round_joins: true,
             canvas_size: egui::vec2(800.0, 600.0),
             focus_text_input: false,
+            renaming_target: None,
+            renaming_text: String::new(),
         }
     }
 
@@ -1043,6 +1136,147 @@ impl StudioApp {
         }
         self.selected_index = self.selected_indices.iter().copied().next_back();
         self.sync_active_properties();
+    }
+
+    /// Select only the exact shape index without expanding to the shape's parent group (drill-down).
+    pub fn select_shape_exact(&mut self, idx: usize, multi: bool) {
+        if !multi {
+            self.selected_indices.clear();
+        }
+        self.selected_indices.insert(idx);
+        self.selected_index = Some(idx);
+        self.sync_active_properties();
+    }
+
+    /// Group selected shape indices by their top-level group ID or standalone shape.
+    pub fn get_selected_entities(&self) -> Vec<Vec<usize>> {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() {
+            return Vec::new();
+        }
+
+        let mut group_map: std::collections::BTreeMap<u64, Vec<usize>> = std::collections::BTreeMap::new();
+        let mut standalone: Vec<Vec<usize>> = Vec::new();
+
+        for &idx in &sel {
+            if let Some(shape) = self.shapes.get(idx) {
+                let top_gid = shape.group_path.first().copied().or(shape.group_id);
+                if let Some(gid) = top_gid {
+                    group_map.entry(gid).or_default().push(idx);
+                } else {
+                    standalone.push(vec![idx]);
+                }
+            }
+        }
+
+        let mut entities = standalone;
+        for (_, members) in group_map {
+            entities.push(members);
+        }
+        entities
+    }
+
+    /// Align centers of all selected entities (groups / shapes) onto their shared average center point.
+    pub fn stack_center_selected(&mut self) {
+        let entities = self.get_selected_entities();
+        if entities.len() < 2 {
+            self.set_status("Select at least 2 layers/groups to stack & center");
+            return;
+        }
+
+        let mut entity_rects = Vec::with_capacity(entities.len());
+        for entity in &entities {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+
+            for &idx in entity {
+                if let Some(s) = self.shapes.get(idx) {
+                    let bb = s.bounding_box();
+                    min_x = min_x.min(bb.min.x);
+                    min_y = min_y.min(bb.min.y);
+                    max_x = max_x.max(bb.max.x);
+                    max_y = max_y.max(bb.max.y);
+                }
+            }
+
+            if min_x.is_finite() && max_x.is_finite() {
+                entity_rects.push((min_x, min_y, max_x, max_y));
+            } else {
+                entity_rects.push((0.0, 0.0, 1.0, 1.0));
+            }
+        }
+
+        let offsets = vector_ops::compute_stack_center_offsets(&entity_rects);
+        self.push_undo();
+
+        for (entity, (dx, dy)) in entities.iter().zip(offsets.iter()) {
+            let delta = egui::vec2(*dx, *dy);
+            for &idx in entity {
+                if let Some(s) = self.shapes.get_mut(idx) {
+                    if !s.is_locked {
+                        s.translate(delta);
+                    }
+                }
+            }
+        }
+
+        self.set_status(format!("Stacked & centered {} layers", entities.len()));
+    }
+
+    /// Arrange selected entities into a clean, non-overlapping cutting grid across the mat.
+    pub fn explode_selected(&mut self) {
+        let entities = self.get_selected_entities();
+        if entities.len() < 2 {
+            self.set_status("Select at least 2 layers/groups to spread & explode");
+            return;
+        }
+
+        let mut entity_rects = Vec::with_capacity(entities.len());
+        for entity in &entities {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+
+            for &idx in entity {
+                if let Some(s) = self.shapes.get(idx) {
+                    let bb = s.bounding_box();
+                    min_x = min_x.min(bb.min.x);
+                    min_y = min_y.min(bb.min.y);
+                    max_x = max_x.max(bb.max.x);
+                    max_y = max_y.max(bb.max.y);
+                }
+            }
+
+            if min_x.is_finite() && max_x.is_finite() {
+                entity_rects.push((min_x, min_y, max_x, max_y));
+            } else {
+                entity_rects.push((0.0, 0.0, 1.0, 1.0));
+            }
+        }
+
+        let start_x = 0.5_f32;
+        let start_y = 0.5_f32;
+        let max_width = (self.mat_width_in - 0.5).max(4.0);
+        let gap = 0.5_f32;
+
+        let offsets = vector_ops::compute_explode_grid_offsets(&entity_rects, start_x, start_y, max_width, gap);
+        self.push_undo();
+
+        for (entity, (dx, dy)) in entities.iter().zip(offsets.iter()) {
+            let delta = egui::vec2(*dx, *dy);
+            for &idx in entity {
+                if let Some(s) = self.shapes.get_mut(idx) {
+                    if !s.is_locked {
+                        s.translate(delta);
+                    }
+                }
+            }
+        }
+
+        self.set_status(format!("Exploded {} layers into cutting grid", entities.len()));
     }
 
     pub fn clear_selection(&mut self) {
@@ -1484,6 +1718,7 @@ impl StudioApp {
                         group_path: Vec::new(),
                         is_visible: true,
                         is_locked: false,
+                        name: Some("Offset Contour".to_string()),
                         pixmap: None,
                         texture: None,
                     };
@@ -1581,6 +1816,7 @@ impl StudioApp {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: Some("Compound Path".to_string()),
             pixmap: None,
             texture: None,
         };
@@ -1665,6 +1901,7 @@ impl StudioApp {
                                 group_path: Vec::new(),
                                 is_visible: true,
                                 is_locked: false,
+                                name: Some(format!("Path Part {}", released_count + 1)),
                                 pixmap: None,
                                 texture: None,
                             };
@@ -1812,6 +2049,7 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
                     group_path: Vec::new(),
                     is_visible: true,
                     is_locked: false,
+                    name: Some("Welded Union".to_string()),
                     pixmap: None,
                     texture: None,
                 };
@@ -1845,6 +2083,7 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
                     group_path: Vec::new(),
                     is_visible: true,
                     is_locked: false,
+                    name: Some("Welded Union".to_string()),
                     pixmap: None,
                     texture: None,
                 };
@@ -2801,6 +3040,7 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
             group_path: current_stack.to_vec(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap,
             texture: None,
         })
@@ -3312,6 +3552,34 @@ impl eframe::App for StudioApp {
             if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Num0)) {
                 self.fit_to_view();
             }
+
+            // Arrow key nudging for selected shapes
+            let nudge_left = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+            let nudge_right = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+            let nudge_up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+            let nudge_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+            if nudge_left || nudge_right || nudge_up || nudge_down {
+                let is_shift = ctx.input(|i| i.modifiers.shift);
+                let step = if is_shift { 0.10_f32 } else { 0.02_f32 };
+                let mut dx = 0.0_f32;
+                let mut dy = 0.0_f32;
+                if nudge_left { dx -= step; }
+                if nudge_right { dx += step; }
+                if nudge_up { dy -= step; }
+                if nudge_down { dy += step; }
+
+                let sel = self.all_selected_indices();
+                if !sel.is_empty() {
+                    self.push_undo();
+                    for idx in sel {
+                        if let Some(shape) = self.shapes.get_mut(idx) {
+                            if !shape.is_locked {
+                                shape.translate(egui::vec2(dx, dy));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Top menu
@@ -3754,6 +4022,21 @@ impl eframe::App for StudioApp {
                             self.group_by_color();
                         }
                     });
+                    ui.horizontal(|ui| {
+                        let sel_entities = self.get_selected_entities().len();
+                        if ui.add_enabled(sel_entities >= 2, egui::Button::new("🎯 Stack / Center"))
+                            .on_hover_text("Align centers of selected layers/groups to re-assemble paper-piecing character")
+                            .clicked()
+                        {
+                            self.stack_center_selected();
+                        }
+                        if ui.add_enabled(sel_entities >= 2, egui::Button::new("⊞ Spread / Explode"))
+                            .on_hover_text("Arrange selected layers into a non-overlapping cutting grid across the mat")
+                            .clicked()
+                        {
+                            self.explode_selected();
+                        }
+                    });
                     ui.separator();
 
                     let mut actions: Vec<LayerAction> = Vec::new();
@@ -3772,6 +4055,8 @@ impl eframe::App for StudioApp {
                                 self.selected_index,
                                 &self.expanded_groups,
                                 &self.group_names,
+                                self.renaming_target,
+                                &mut self.renaming_text,
                                 &mut actions,
                             );
                         }
@@ -3834,10 +4119,46 @@ impl eframe::App for StudioApp {
                             }
                             LayerAction::SelectShape(i, shift) => {
                                 if shift {
-                                    self.toggle_select_shape(i);
+                                    if self.is_selected(i) {
+                                        self.selected_indices.remove(&i);
+                                    } else {
+                                        self.selected_indices.insert(i);
+                                    }
+                                    self.selected_index = self.selected_indices.iter().copied().next_back();
+                                    self.sync_active_properties();
                                 } else {
-                                    self.select_shape(i, false);
+                                    self.select_shape_exact(i, false);
                                 }
+                            }
+                            LayerAction::StartRenameGroup(gid, cur) => {
+                                self.renaming_target = Some(RenamingTarget::Group(gid));
+                                self.renaming_text = cur;
+                            }
+                            LayerAction::StartRenameShape(i, cur) => {
+                                self.renaming_target = Some(RenamingTarget::Shape(i));
+                                self.renaming_text = cur;
+                            }
+                            LayerAction::CommitRenameGroup(gid, new_name) => {
+                                self.push_undo();
+                                let trimmed = new_name.trim();
+                                if trimmed.is_empty() {
+                                    self.group_names.remove(&gid);
+                                } else {
+                                    self.group_names.insert(gid, trimmed.to_string());
+                                }
+                                self.renaming_target = None;
+                            }
+                            LayerAction::CommitRenameShape(i, new_name) => {
+                                self.push_undo();
+                                let trimmed = new_name.trim();
+                                if let Some(s) = self.shapes.get_mut(i) {
+                                    s.name = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+                                    s.is_modified = true;
+                                }
+                                self.renaming_target = None;
+                            }
+                            LayerAction::CancelRename => {
+                                self.renaming_target = None;
                             }
                         }
                     }
@@ -4003,6 +4324,22 @@ impl eframe::App for StudioApp {
                             self.distribute_selected_v();
                         }
                     });
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        let sel_entities = self.get_selected_entities().len();
+                        if ui.add_enabled(sel_entities >= 2, egui::Button::new("🎯 Stack / Center"))
+                            .on_hover_text("Align centers of selected layers/groups to re-assemble paper-piecing character")
+                            .clicked()
+                        {
+                            self.stack_center_selected();
+                        }
+                        if ui.add_enabled(sel_entities >= 2, egui::Button::new("⊞ Spread / Explode"))
+                            .on_hover_text("Arrange selected layers into a non-overlapping cutting grid across the mat")
+                            .clicked()
+                        {
+                            self.explode_selected();
+                        }
+                    });
 
                     ui.add_space(10.0);
                     ui.separator();
@@ -4159,7 +4496,7 @@ impl eframe::App for StudioApp {
                                 let hit = self.shapes.iter().enumerate().rev().find(|(_, s)| {
                                     s.is_visible && s.hit_test(mat_pos, hit_tol)
                                 }).map(|(i, _)| i);
-                                let is_shift = ctx.input(|i| i.modifiers.shift);
+                                let is_shift = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
                                 if let Some(idx) = hit {
                                     if is_shift {
                                         self.toggle_select_shape(idx);
@@ -4201,7 +4538,7 @@ impl eframe::App for StudioApp {
                             let curr_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
                             if let Some(pos) = curr_pos {
                                 let mouse_mat = screen_to_mat(pos);
-                                let is_shift = ctx.input(|i| i.modifiers.shift);
+                                let is_shift = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
                                 let init_w = init_rect.width().max(0.001);
                                 let init_h = init_rect.height().max(0.001);
 
@@ -4310,7 +4647,27 @@ impl eframe::App for StudioApp {
             }
 
             // Click handling
-            if response.clicked() {
+            let is_double_click = response.double_clicked();
+            let is_single_click = response.clicked();
+
+            if is_double_click {
+                let click_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+                if let Some(pos) = click_pos {
+                    let mat_pos = screen_to_mat(pos);
+                    if self.active_tool == Tool::Select {
+                        let hit = self.shapes.iter().enumerate().rev().find(|(_, s)| {
+                            s.is_visible && s.hit_test(mat_pos, hit_tol)
+                        }).map(|(i, _)| i);
+                        if let Some(idx) = hit {
+                            let is_shift = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
+                            self.select_shape_exact(idx, is_shift);
+                            let shape_name = self.shapes[idx].name.clone()
+                                .unwrap_or_else(|| format!("Shape #{}", idx + 1));
+                            self.set_status(format!("Drilled down into: {}", shape_name));
+                        }
+                    }
+                }
+            } else if is_single_click {
                 let clicked_handle = if let Some(sel_rect) = self.get_selection_bounds() {
                     let click_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
                     click_pos.and_then(|p| self.hit_test_resize_handle(p, sel_rect, &mat_to_screen))
@@ -4324,20 +4681,16 @@ impl eframe::App for StudioApp {
                         let mat_pos = screen_to_mat(pos);
                         match self.active_tool {
                             Tool::Select => {
+                                let is_shift = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
                                 let hit = self.shapes.iter().enumerate().rev().find(|(_, s)| {
-                                    s.hit_test(mat_pos, hit_tol)
+                                    s.is_visible && s.hit_test(mat_pos, hit_tol)
                                 }).map(|(i, _)| i);
-                                self.selected_index = hit;
                                 if let Some(idx) = hit {
-                                    let s = &self.shapes[idx];
-                                    self.fill_color = [
-                                        s.fill_color.r() as f32 / 255.0,
-                                        s.fill_color.g() as f32 / 255.0,
-                                        s.fill_color.b() as f32 / 255.0,
-                                    ];
-                                    if s.kind == ShapeKind::Text && !s.text.is_empty() {
-                                        self.text_sample = s.text.clone();
+                                    if !is_shift {
+                                        self.select_shape(idx, false);
                                     }
+                                } else if !is_shift {
+                                    self.clear_selection();
                                 }
                             }
                             Tool::Text => {
@@ -4364,6 +4717,7 @@ impl eframe::App for StudioApp {
                                     group_path: Vec::new(),
                                     is_visible: true,
                                     is_locked: false,
+                                    name: None,
                                     pixmap: None,
                                     texture: None,
                                 });
@@ -4447,6 +4801,7 @@ impl eframe::App for StudioApp {
                                     group_path: Vec::new(),
                                     is_visible: true,
                                     is_locked: false,
+                                    name: None,
                                     pixmap: None,
                                     texture: None,
                                 });
@@ -4479,6 +4834,7 @@ impl eframe::App for StudioApp {
                                     group_path: Vec::new(),
                                     is_visible: true,
                                     is_locked: false,
+                                    name: None,
                                     pixmap: None,
                                     texture: None,
                                 });
@@ -4512,6 +4868,7 @@ impl eframe::App for StudioApp {
                                     group_path: Vec::new(),
                                     is_visible: true,
                                     is_locked: false,
+                                    name: None,
                                     pixmap: None,
                                     texture: None,
                                 });
@@ -4553,6 +4910,7 @@ impl eframe::App for StudioApp {
                             group_path: Vec::new(),
                             is_visible: true,
                             is_locked: false,
+                            name: None,
                             pixmap: None,
                             texture: None,
                         };
@@ -5063,6 +5421,7 @@ pub fn create_text_cut_path(
         group_path: Vec::new(),
         is_visible: true,
         is_locked: false,
+        name: None,
         pixmap: None,
         texture: None,
     };
@@ -5113,6 +5472,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5135,6 +5495,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5178,6 +5539,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5200,6 +5562,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5222,6 +5585,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5244,6 +5608,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5266,6 +5631,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5329,6 +5695,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5365,6 +5732,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5387,6 +5755,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5409,6 +5778,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5431,6 +5801,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -5522,7 +5893,7 @@ mod tests {
             text: String::new(), fill_color: egui::Color32::RED, stroke_color: None, stroke_width: 0.0,
             is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
             group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
-            pixmap: None, texture: None,
+            name: None, pixmap: None, texture: None,
         });
         app.shapes.push(CanvasShape {
             kind: ShapeKind::Ellipse,
@@ -5530,7 +5901,7 @@ mod tests {
             text: String::new(), fill_color: egui::Color32::BLUE, stroke_color: None, stroke_width: 0.0,
             is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
             group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
-            pixmap: None, texture: None,
+            name: None, pixmap: None, texture: None,
         });
 
         app.select_shape(0, false);
@@ -5562,7 +5933,7 @@ mod tests {
                 text: format!("Shape {}", i), fill_color: egui::Color32::RED, stroke_color: None, stroke_width: 0.0,
                 is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
                 group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
-                pixmap: None, texture: None,
+                name: None, pixmap: None, texture: None,
             });
         }
         // Initial order: Shape 0, Shape 1, Shape 2
@@ -5639,7 +6010,7 @@ mod tests {
                 text: format!("Shape {}", i), fill_color: col, stroke_color: None, stroke_width: 0.0,
                 is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
                 group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
-                pixmap: None, texture: None,
+                name: None, pixmap: None, texture: None,
             });
         }
 
@@ -5752,7 +6123,7 @@ mod tests {
             text: String::new(), fill_color: egui::Color32::RED, stroke_color: None, stroke_width: 0.0,
             is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
             group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
-            pixmap: None, texture: None,
+            name: None, pixmap: None, texture: None,
         });
         assert_eq!(app.shapes.len(), 1);
 
@@ -5764,7 +6135,7 @@ mod tests {
             text: String::new(), fill_color: egui::Color32::BLUE, stroke_color: None, stroke_width: 0.0,
             is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
             group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
-            pixmap: None, texture: None,
+            name: None, pixmap: None, texture: None,
         });
         assert_eq!(app.shapes.len(), 2);
 
@@ -5798,7 +6169,7 @@ mod tests {
             text: String::new(), fill_color: egui::Color32::RED, stroke_color: None, stroke_width: 0.0,
             is_closed: true, is_svg_path: false, is_modified: false, triangles: vec![],
             group_id: None, group_path: Vec::new(), is_visible: true, is_locked: false,
-            pixmap: None, texture: None,
+            name: None, pixmap: None, texture: None,
         });
         app.select_shape(0, false);
 
@@ -5980,6 +6351,7 @@ mod tests {
             group_path: vec![10],
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -6006,6 +6378,7 @@ mod tests {
             group_path: vec![10],
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: Some(pm),
             texture: None,
         });
@@ -6054,6 +6427,7 @@ mod tests {
             group_path: vec![],
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -6096,6 +6470,7 @@ mod tests {
             group_path: vec![],
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -6118,6 +6493,7 @@ mod tests {
             group_path: vec![],
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -6161,6 +6537,7 @@ mod tests {
             group_path: vec![],
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -6183,6 +6560,7 @@ mod tests {
             group_path: vec![],
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -6230,6 +6608,7 @@ mod tests {
                 group_path: vec![],
                 is_visible: true,
                 is_locked: false,
+                name: None,
                 pixmap: None,
                 texture: None,
             });
@@ -6274,6 +6653,7 @@ mod tests {
             group_path: vec![],
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -6348,6 +6728,7 @@ mod tests {
             group_path: Vec::new(),
             is_visible: true,
             is_locked: false,
+            name: None,
             pixmap: None,
             texture: None,
         });
@@ -6362,5 +6743,197 @@ mod tests {
         assert!(app.focus_text_input, "text input should request focus");
         assert_eq!(app.selected_index, Some(0));
         assert_eq!(app.shapes[0].text, "Hello Craft");
+    }
+
+    #[test]
+    fn test_drill_down_and_shift_multi_select() {
+        let mut app = StudioApp::new(None);
+        for i in 0..3 {
+            app.shapes.push(CanvasShape {
+                kind: ShapeKind::Rectangle,
+                x: i as f32 * 2.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                points: vec![],
+                text: String::new(),
+                fill_color: egui::Color32::RED,
+                stroke_color: None,
+                stroke_width: 0.0,
+                is_closed: true,
+                is_svg_path: false,
+                is_modified: false,
+                triangles: vec![],
+                group_id: None,
+                group_path: Vec::new(),
+                is_visible: true,
+                is_locked: false,
+                name: None,
+                pixmap: None,
+                texture: None,
+            });
+        }
+
+        // Group shapes 0 and 1
+        app.select_shape(0, false);
+        app.select_shape(1, true);
+        app.group_selected();
+        assert!(app.shapes[0].group_path.first().is_some());
+        assert_eq!(app.shapes[0].group_path.first(), app.shapes[1].group_path.first());
+
+        // Regular select expands to whole group
+        app.clear_selection();
+        app.select_shape(0, false);
+        assert_eq!(app.all_selected_indices().len(), 2, "normal click selects all group members");
+
+        // Double-click drill down selects ONLY shape 0
+        app.select_shape_exact(0, false);
+        assert_eq!(app.all_selected_indices(), vec![0], "exact drill-down selects only child shape 0");
+
+        // Shift-select adds shape 2 to selection
+        app.toggle_select_shape(2);
+        let sel = app.all_selected_indices();
+        assert!(sel.contains(&0) && sel.contains(&2), "shift toggle added shape 2 without clearing shape 0");
+    }
+
+    #[test]
+    fn test_paper_piecing_stack_center_and_explode_with_undo() {
+        let mut app = StudioApp::new(None);
+        app.mat_width_in = 12.0;
+        app.mat_height_in = 12.0;
+
+        // Layer 1: Base Silhouette (large square centered at (2.0, 2.0))
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 0.0,
+            y: 0.0,
+            width: 4.0,
+            height: 4.0,
+            points: vec![],
+            text: String::new(),
+            fill_color: egui::Color32::BLACK,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: None,
+            group_path: Vec::new(),
+            is_visible: true,
+            is_locked: false,
+            name: Some("Base Silhouette".to_string()),
+            pixmap: None,
+            texture: None,
+        });
+
+        // Layer 2: Yellow Shoes (small rectangle at (8.0, 8.0))
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 8.0,
+            y: 8.0,
+            width: 2.0,
+            height: 2.0,
+            points: vec![],
+            text: String::new(),
+            fill_color: egui::Color32::YELLOW,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: None,
+            group_path: Vec::new(),
+            is_visible: true,
+            is_locked: false,
+            name: Some("Yellow Shoes".to_string()),
+            pixmap: None,
+            texture: None,
+        });
+
+        // Select both layers
+        app.select_shape_exact(0, false);
+        app.select_shape_exact(1, true);
+        assert_eq!(app.all_selected_indices().len(), 2);
+
+        // 1. Stack & Center: Centers should align onto average center ((2+9)/2, (2+9)/2) = (5.5, 5.5)
+        app.stack_center_selected();
+
+        let bb0 = app.shapes[0].bounding_box();
+        let bb1 = app.shapes[1].bounding_box();
+        let c0 = bb0.center();
+        let c1 = bb1.center();
+
+        assert!((c0.x - c1.x).abs() < 1e-4, "centers x should match: {} vs {}", c0.x, c1.x);
+        assert!((c0.y - c1.y).abs() < 1e-4, "centers y should match: {} vs {}", c0.y, c1.y);
+        assert!((c0.x - 5.5).abs() < 1e-4, "center x should be 5.5: {}", c0.x);
+
+        // Undo restores original positions
+        app.undo();
+        assert_eq!(app.shapes[0].x, 0.0);
+        assert_eq!(app.shapes[1].x, 8.0);
+
+        // 2. Explode: Arranges onto grid starting at (0.5, 0.5)
+        app.select_shape_exact(0, false);
+        app.select_shape_exact(1, true);
+        app.explode_selected();
+
+        let exp_bb0 = app.shapes[0].bounding_box();
+        let exp_bb1 = app.shapes[1].bounding_box();
+        assert_eq!(exp_bb0.min.x, 0.5);
+        assert_eq!(exp_bb0.min.y, 0.5);
+        // Shape 1 placed after shape 0 with 0.5 gap: 0.5 + 4.0 + 0.5 = 5.0
+        assert_eq!(exp_bb1.min.x, 5.0);
+        assert_eq!(exp_bb1.min.y, 0.5);
+
+        // Undo restores original positions
+        app.undo();
+        assert_eq!(app.shapes[0].x, 0.0);
+        assert_eq!(app.shapes[1].x, 8.0);
+    }
+
+    #[test]
+    fn test_inline_renaming_and_craft_persistence() {
+        let mut app = StudioApp::new(None);
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Freehand,
+            x: 1.0,
+            y: 1.0,
+            width: 2.0,
+            height: 2.0,
+            points: vec![egui::pos2(1.0, 1.0), egui::pos2(3.0, 1.0), egui::pos2(2.0, 3.0)],
+            text: String::new(),
+            fill_color: egui::Color32::RED,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: Some(42),
+            group_path: vec![42],
+            is_visible: true,
+            is_locked: false,
+            name: Some("Red Bow".to_string()),
+            pixmap: None,
+            texture: None,
+        });
+
+        app.group_names.insert(42, "Mickey Accessories".to_string());
+
+        let temp_dir = std::env::temp_dir();
+        let craft_path = temp_dir.join("test_rename_persist.craft");
+
+        app.save_craft_file(&craft_path).expect("failed to save .craft project");
+
+        let mut app_loaded = StudioApp::new(None);
+        app_loaded.open_craft_file(&craft_path).expect("failed to open .craft project");
+
+        assert_eq!(app_loaded.shapes.len(), 1);
+        assert_eq!(app_loaded.shapes[0].name.as_deref(), Some("Red Bow"));
+        assert_eq!(app_loaded.group_names.get(&42).map(|s| s.as_str()), Some("Mickey Accessories"));
+
+        let _ = std::fs::remove_file(&craft_path);
     }
 }
