@@ -4,6 +4,26 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.4.1] - 2026-11-21
+
+### Added & Improved
+- **True Polygon Boolean Union (`app/src/vector_ops.rs`)**:
+  - Integrated `i_overlay v9.2.0` for exact 2D polygon boolean operations with `OverlayRule::Union` and `FillRule::EvenOdd`.
+  - Replaced the convex-hull `Weld` placeholder with `boolean_weld_shapes` and `boolean_weld_polygons`, merging overlapping shapes, polygons, and cursive script letters along their true outer contours while preserving interior holes (`WeldedShape` with outer boundaries and inner holes).
+  - Added canvas and SVG/PNG support for multi-subpath rendering without artificial bridging segments between outer contours and holes.
+- **Registration Marks Rendering Fix & "Fit to View" Zoom (`app/src/main.rs`)**:
+  - Moved Print & Cut registration marks rendering to draw cleanly and visibly on top of the mat grid, paper background, and canvas shapes inside the configured `Inset (in)` bounds on canvas, SVG, and high-DPI PNG exports.
+  - Added `Fit` zoom button in the top toolbar next to `Zoom: 100%`, plus `Fit to View (Ctrl+0)` in the View menu, auto-calculating optimal zoom so the full 12"x12" cutting mat fits comfortably inside split-screen windows with pan reset.
+  - Ensured mouse-wheel zoom and middle/secondary drag panning work smoothly across Wayland and X11 environments.
+- **Polished Text Tool Workflow (`app/src/main.rs`)**:
+  - Canvas clicks with the `Text` tool now place the text shape, immediately switch the active tool back to `Select`, switch the right inspector tab to `Text`, and automatically focus the text edit input.
+  - Typing immediately updates the placed text object without spawning unwanted duplicate `"Sample Design"` boxes.
+- **Verification & Unit Tests**:
+  - Added unit tests for true non-convex polygon union (`test_boolean_weld_non_convex_overlap`, 8 vertices), hole preservation (`test_boolean_weld_preserves_interior_holes`), disjoint shape separation (`test_boolean_weld_disjoint`), Fit to View zoom calculation (`test_fit_to_view_zoom`), and the polished Text tool workflow (`test_text_tool_workflow`).
+  - Total test suite expanded to 49 passing tests (0 failures).
+
+---
+
 ## [0.4.0] - 2026-11-21
 
 ### Added

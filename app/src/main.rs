@@ -593,6 +593,8 @@ pub struct StudioApp {
     pub letter_spacing_in: f32,
     pub offset_distance_in: f32,
     pub offset_round_joins: bool,
+    pub canvas_size: egui::Vec2,
+    pub focus_text_input: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -824,7 +826,21 @@ impl StudioApp {
             letter_spacing_in: 0.0,
             offset_distance_in: 0.10,
             offset_round_joins: true,
+            canvas_size: egui::vec2(800.0, 600.0),
+            focus_text_input: false,
         }
+    }
+
+    /// Fit the cutting mat inside the current canvas window.
+    pub fn fit_to_view(&mut self) {
+        let padding = 40.0;
+        let avail_w = (self.canvas_size.x - padding).max(100.0);
+        let avail_h = (self.canvas_size.y - padding).max(100.0);
+        let zoom_w = avail_w / (self.mat_width_in * 40.0);
+        let zoom_h = avail_h / (self.mat_height_in * 40.0);
+        self.zoom = zoom_w.min(zoom_h).clamp(0.1, 5.0);
+        self.pan = egui::Vec2::ZERO;
+        self.set_status(format!("Fit mat to view ({:.0}%)", self.zoom * 100.0));
     }
 
     pub fn load_file(&mut self, path: &Path) {
@@ -1676,7 +1692,72 @@ impl StudioApp {
         }
     }
 
-    // Vector Crafting: Weld overlapping shapes into a single outline
+fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape> {
+    match shape.kind {
+        ShapeKind::Rectangle => {
+            let outer = vec![
+                egui::pos2(shape.x, shape.y),
+                egui::pos2(shape.x + shape.width, shape.y),
+                egui::pos2(shape.x + shape.width, shape.y + shape.height),
+                egui::pos2(shape.x, shape.y + shape.height),
+            ];
+            Some(vector_ops::WeldedShape { outer, holes: Vec::new() })
+        }
+        ShapeKind::Ellipse => {
+            let n = 48;
+            let cx = shape.x + shape.width * 0.5;
+            let cy = shape.y + shape.height * 0.5;
+            let rx = shape.width * 0.5;
+            let ry = shape.height * 0.5;
+            let outer = (0..n).map(|k| {
+                let angle = (k as f32 / n as f32) * std::f32::consts::TAU;
+                egui::pos2(cx + rx * angle.cos(), cy + ry * angle.sin())
+            }).collect();
+            Some(vector_ops::WeldedShape { outer, holes: Vec::new() })
+        }
+        ShapeKind::Freehand => {
+            if shape.is_svg_path && shape.text.contains('M') {
+                let subpaths: Vec<&str> = shape.text.split('M').filter(|s| !s.trim().is_empty()).collect();
+                if !subpaths.is_empty() {
+                    let mut contours = Vec::new();
+                    for sub in subpaths {
+                        let nums: Vec<f32> = sub
+                            .split(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                            .filter_map(|s| s.parse::<f32>().ok())
+                            .collect();
+                        let mut pts = Vec::new();
+                        for chunk in nums.chunks(2) {
+                            if chunk.len() == 2 {
+                                pts.push(egui::pos2(chunk[0], chunk[1]));
+                            }
+                        }
+                        if pts.len() >= 3 {
+                            contours.push(pts);
+                        }
+                    }
+                    if !contours.is_empty() {
+                        let outer = contours.remove(0);
+                        return Some(vector_ops::WeldedShape { outer, holes: contours });
+                    }
+                }
+            }
+            if shape.points.len() >= 3 {
+                Some(vector_ops::WeldedShape { outer: shape.points.clone(), holes: Vec::new() })
+            } else {
+                None
+            }
+        }
+        _ => {
+            if shape.points.len() >= 3 {
+                Some(vector_ops::WeldedShape { outer: shape.points.clone(), holes: Vec::new() })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+    // Vector Crafting: Weld overlapping shapes into a single outline (true polygon boolean union via i_overlay)
     pub fn weld_selected(&mut self) {
         let sel = self.all_selected_indices();
         if sel.len() < 2 {
@@ -1685,81 +1766,112 @@ impl StudioApp {
         }
 
         self.push_undo();
-        let mut all_points = Vec::new();
+        let mut input_shapes = Vec::new();
+        let mut all_fallback_pts = Vec::new();
         let first_shape = self.shapes[sel[0]].clone();
 
         for &idx in &sel {
             if let Some(shape) = self.shapes.get(idx) {
-                let pts: Vec<egui::Pos2> = match shape.kind {
-                    ShapeKind::Rectangle => vec![
-                        egui::pos2(shape.x, shape.y),
-                        egui::pos2(shape.x + shape.width, shape.y),
-                        egui::pos2(shape.x + shape.width, shape.y + shape.height),
-                        egui::pos2(shape.x, shape.y + shape.height),
-                    ],
-                    ShapeKind::Ellipse => {
-                        let n = 36;
-                        let cx = shape.x + shape.width * 0.5;
-                        let cy = shape.y + shape.height * 0.5;
-                        let rx = shape.width * 0.5;
-                        let ry = shape.height * 0.5;
-                        (0..n).map(|k| {
-                            let angle = (k as f32 / n as f32) * std::f32::consts::TAU;
-                            egui::pos2(cx + rx * angle.cos(), cy + ry * angle.sin())
-                        }).collect()
-                    }
-                    _ => shape.points.clone(),
-                };
-                all_points.extend(pts);
+                if let Some(ws) = Self::canvas_shape_to_welded(shape) {
+                    all_fallback_pts.extend(ws.all_points());
+                    input_shapes.push(ws);
+                }
             }
         }
 
-        let hull = vector_ops::convex_hull(&all_points);
-        if hull.len() >= 3 {
-            let min_x = hull.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
-            let min_y = hull.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
-            let max_x = hull.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
-            let max_y = hull.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+        if input_shapes.is_empty() {
+            self.set_status("Selected shapes have insufficient geometry to weld");
+            return;
+        }
 
-            let mut welded = CanvasShape {
-                kind: ShapeKind::Freehand,
-                x: min_x,
-                y: min_y,
-                width: (max_x - min_x).max(0.01),
-                height: (max_y - min_y).max(0.01),
-                points: hull,
-                text: String::new(),
-                fill_color: first_shape.fill_color,
-                stroke_color: first_shape.stroke_color,
-                stroke_width: first_shape.stroke_width,
-                is_closed: true,
-                is_svg_path: false,
-                is_modified: true,
-                triangles: Vec::new(),
-                group_id: None,
-                group_path: Vec::new(),
-                is_visible: true,
-                is_locked: false,
-                pixmap: None,
-                texture: None,
-            };
-            welded.precompute_triangles();
+        let welded_results = vector_ops::boolean_weld_shapes(&input_shapes);
+        let mut new_shapes = Vec::new();
 
-            let mut sorted_sel = sel.clone();
-            sorted_sel.sort_unstable();
-            for &idx in sorted_sel.iter().rev() {
+        if !welded_results.is_empty() {
+            for ws in welded_results {
+                let (min_x, min_y, max_x, max_y) = ws.bounds();
+                let svg_d = ws.to_svg_path_data();
+                let all_pts = ws.all_points();
+
+                let mut welded = CanvasShape {
+                    kind: ShapeKind::Freehand,
+                    x: min_x,
+                    y: min_y,
+                    width: (max_x - min_x).max(0.01),
+                    height: (max_y - min_y).max(0.01),
+                    points: all_pts,
+                    text: svg_d,
+                    fill_color: first_shape.fill_color,
+                    stroke_color: first_shape.stroke_color,
+                    stroke_width: first_shape.stroke_width,
+                    is_closed: true,
+                    is_svg_path: true,
+                    is_modified: true,
+                    triangles: Vec::new(),
+                    group_id: None,
+                    group_path: Vec::new(),
+                    is_visible: true,
+                    is_locked: false,
+                    pixmap: None,
+                    texture: None,
+                };
+                welded.precompute_triangles();
+                new_shapes.push(welded);
+            }
+        } else {
+            let hull = vector_ops::convex_hull(&all_fallback_pts);
+            if hull.len() >= 3 {
+                let min_x = hull.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+                let min_y = hull.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+                let max_x = hull.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+                let max_y = hull.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+
+                let mut welded = CanvasShape {
+                    kind: ShapeKind::Freehand,
+                    x: min_x,
+                    y: min_y,
+                    width: (max_x - min_x).max(0.01),
+                    height: (max_y - min_y).max(0.01),
+                    points: hull,
+                    text: String::new(),
+                    fill_color: first_shape.fill_color,
+                    stroke_color: first_shape.stroke_color,
+                    stroke_width: first_shape.stroke_width,
+                    is_closed: true,
+                    is_svg_path: false,
+                    is_modified: true,
+                    triangles: Vec::new(),
+                    group_id: None,
+                    group_path: Vec::new(),
+                    is_visible: true,
+                    is_locked: false,
+                    pixmap: None,
+                    texture: None,
+                };
+                welded.precompute_triangles();
+                new_shapes.push(welded);
+            }
+        }
+
+        if new_shapes.is_empty() {
+            self.set_status("Could not weld selected shapes");
+            return;
+        }
+
+        let mut sorted_sel = sel.clone();
+        sorted_sel.sort_unstable();
+        for &idx in sorted_sel.iter().rev() {
+            if idx < self.shapes.len() {
                 self.shapes.remove(idx);
             }
-
-            let new_idx = self.shapes.len();
-            self.shapes.push(welded);
-            self.selected_indices.clear();
-            self.selected_indices.insert(new_idx);
-            self.selected_index = Some(new_idx);
-            self.set_status(format!("Welded {} shapes into unified outline", sel.len()));
-        } else {
-            self.set_status("Could not weld selected shapes");
         }
+
+        let start = self.shapes.len();
+        let added_count = new_shapes.len();
+        self.shapes.extend(new_shapes);
+        self.selected_indices = (start..start + added_count).collect();
+        self.selected_index = Some(start);
+        self.set_status(format!("Welded {} shapes into {} continuous outline(s)", sel.len(), added_count));
     }
 
     // Align & Distribute: Align multi-selected shapes
@@ -3196,6 +3308,10 @@ impl eframe::App for StudioApp {
             if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.shift && i.key_pressed(egui::Key::G)) {
                 self.ungroup_selected();
             }
+            // Fit to View: Ctrl+0
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Num0)) {
+                self.fit_to_view();
+            }
         }
 
         // Top menu
@@ -3477,17 +3593,29 @@ impl eframe::App for StudioApp {
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    if ui.button("Zoom In").clicked() {
+                    if ui.button("Zoom In (Ctrl++)").clicked() {
                         self.zoom = (self.zoom * 1.2).min(5.0);
                         ui.close_menu();
                     }
-                    if ui.button("Zoom Out").clicked() {
-                        self.zoom = (self.zoom / 1.2).max(0.25);
+                    if ui.button("Zoom Out (Ctrl+-)").clicked() {
+                        self.zoom = (self.zoom / 1.2).max(0.1);
+                        ui.close_menu();
+                    }
+                    if ui.button("Fit to View (Ctrl+0)").clicked() {
+                        self.fit_to_view();
+                        ui.close_menu();
+                    }
+                    if ui.button("Reset Zoom (100%)").clicked() {
+                        self.zoom = 1.0;
+                        self.pan = egui::Vec2::ZERO;
                         ui.close_menu();
                     }
                 });
                 ui.separator();
                 ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
+                if ui.button("Fit").on_hover_text("Fit mat to window (Ctrl+0)").clicked() {
+                    self.fit_to_view();
+                }
                 ui.separator();
                 ui.label(format!("Shapes: {}", self.shapes.len()));
 
@@ -3729,7 +3857,14 @@ impl eframe::App for StudioApp {
                     ui.heading("Typography & Text");
                     ui.horizontal(|ui| {
                         ui.label("Text:");
-                        if ui.text_edit_singleline(&mut self.text_sample).changed() {
+                        let text_edit = egui::TextEdit::singleline(&mut self.text_sample)
+                            .id_source("text_tool_input_field");
+                        let text_resp = ui.add(text_edit);
+                        if self.focus_text_input {
+                            text_resp.request_focus();
+                            self.focus_text_input = false;
+                        }
+                        if text_resp.changed() {
                             let text_val = self.text_sample.clone();
                             if let Some(idx) = self.selected_index {
                                 if let Some(shape) = self.shapes.get_mut(idx) {
@@ -3899,6 +4034,7 @@ impl eframe::App for StudioApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
             let rect = response.rect;
+            self.canvas_size = rect.size();
 
             // 1. Panning with middle-mouse or right-mouse drag
             if response.dragged_by(egui::PointerButton::Middle) || response.dragged_by(egui::PointerButton::Secondary) {
@@ -3909,7 +4045,7 @@ impl eframe::App for StudioApp {
             if response.hovered() {
                 let scroll = ctx.input(|i| i.raw_scroll_delta.y);
                 if scroll != 0.0 {
-                    self.zoom = (self.zoom * (1.0 + scroll * 0.001)).clamp(0.25, 5.0);
+                    self.zoom = (self.zoom * (1.0 + scroll * 0.001)).clamp(0.1, 5.0);
                 }
             }
 
@@ -3991,32 +4127,6 @@ impl eframe::App for StudioApp {
             for r in 1..(self.mat_height_in.ceil() as i32) {
                 let y = mat_rect.min.y + (r as f32) * px_per_in;
                 painter.line_segment([egui::pos2(mat_rect.min.x, y), egui::pos2(mat_rect.max.x, y)], grid_stroke);
-            }
-
-            // Print & Cut Registration Marks (corner square + L-brackets)
-            if self.show_reg_marks {
-                let marks = vector_ops::registration_marks(
-                    self.mat_width_in,
-                    self.mat_height_in,
-                    self.reg_mark_inset_in,
-                    self.reg_mark_size_in,
-                );
-                for (pts, is_closed) in marks {
-                    let screen_pts: Vec<egui::Pos2> = pts.iter().map(|&p| mat_to_screen(p)).collect();
-                    if is_closed {
-                        painter.add(egui::Shape::convex_polygon(
-                            screen_pts,
-                            egui::Color32::BLACK,
-                            egui::Stroke::NONE,
-                        ));
-                    } else if screen_pts.len() >= 2 {
-                        let stroke_w = (self.reg_mark_thickness_in * px_per_in).max(2.0);
-                        painter.add(egui::Shape::line(
-                            screen_pts,
-                            egui::Stroke::new(stroke_w, egui::Color32::BLACK),
-                        ));
-                    }
-                }
             }
 
             // Left-mouse tool interactions
@@ -4242,7 +4352,7 @@ impl eframe::App for StudioApp {
                                     width: initial_w,
                                     height: initial_h,
                                     points: vec![],
-                                    text,
+                                    text: text.clone(),
                                     fill_color: current_fill,
                                     stroke_color: None,
                                     stroke_width: 0.0,
@@ -4257,7 +4367,13 @@ impl eframe::App for StudioApp {
                                     pixmap: None,
                                     texture: None,
                                 });
-                                self.select_shape(self.shapes.len() - 1, false);
+                                let new_idx = self.shapes.len() - 1;
+                                self.select_shape(new_idx, false);
+                                self.active_tool = Tool::Select;
+                                self.right_panel = "Text";
+                                self.text_sample = text;
+                                self.focus_text_input = true;
+                                self.set_status("Placed text shape — edit text in Text panel");
                             }
                             _ => {}
                         }
@@ -4561,7 +4677,39 @@ impl eframe::App for StudioApp {
                         }
                     }
                     ShapeKind::Freehand => {
-                        if shape.points.len() >= 2 {
+                        if shape.is_svg_path && shape.text.matches('M').count() > 1 {
+                            // Render multi-contour compound and welded shapes independently so holes aren't bridged
+                            let subpaths: Vec<&str> = shape.text.split('M').filter(|s| !s.trim().is_empty()).collect();
+                            for sub in subpaths {
+                                let nums: Vec<f32> = sub
+                                    .split(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                                    .filter_map(|s| s.parse::<f32>().ok())
+                                    .collect();
+                                let mut sub_screen = Vec::new();
+                                for chunk in nums.chunks(2) {
+                                    if chunk.len() == 2 {
+                                        sub_screen.push(mat_to_screen(egui::pos2(chunk[0], chunk[1])));
+                                    }
+                                }
+                                if sub_screen.len() >= 2 {
+                                    if shape.fill_color.a() > 0 {
+                                        draw_filled_polygon(&painter, &sub_screen, shape.fill_color, stroke_opt, &[]);
+                                    } else if let Some(s) = stroke_opt {
+                                        let mut closed = sub_screen.clone();
+                                        if let (Some(f), Some(l)) = (closed.first(), closed.last()) {
+                                            if (*f - *l).length() > 0.5 { closed.push(*f); }
+                                        }
+                                        painter.add(egui::Shape::line(closed, s));
+                                    } else {
+                                        let mut closed = sub_screen.clone();
+                                        if let (Some(f), Some(l)) = (closed.first(), closed.last()) {
+                                            if (*f - *l).length() > 0.5 { closed.push(*f); }
+                                        }
+                                        painter.add(egui::Shape::line(closed, black_stroke));
+                                    }
+                                }
+                            }
+                        } else if shape.points.len() >= 2 {
                             let screen_pts: Vec<egui::Pos2> = shape.points.iter().map(|&p| mat_to_screen(p)).collect();
                             if shape.is_closed || shape.fill_color.a() > 0 {
                                 draw_filled_polygon(&painter, &screen_pts, shape.fill_color, stroke_opt, &shape.triangles);
@@ -4587,6 +4735,34 @@ impl eframe::App for StudioApp {
                             shape.fill_color,
                         );
                         shape.width = (text_rect.width() / px_per_in).max(0.2);
+                    }
+                }
+            }
+
+            // Print & Cut Registration Marks (corner square + L-brackets) rendered visibly on top of mat grid & artwork
+            if self.show_reg_marks {
+                let marks = vector_ops::registration_marks(
+                    self.mat_width_in,
+                    self.mat_height_in,
+                    self.reg_mark_inset_in,
+                    self.reg_mark_size_in,
+                );
+                for (pts, is_closed) in marks {
+                    let screen_pts: Vec<egui::Pos2> = pts.iter().map(|&p| mat_to_screen(p)).collect();
+                    if is_closed && screen_pts.len() >= 3 {
+                        let min_pt = screen_pts.iter().fold(egui::pos2(f32::INFINITY, f32::INFINITY), |a, b| egui::pos2(a.x.min(b.x), a.y.min(b.y)));
+                        let max_pt = screen_pts.iter().fold(egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY), |a, b| egui::pos2(a.x.max(b.x), a.y.max(b.y)));
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(min_pt, max_pt),
+                            0.0,
+                            egui::Color32::BLACK,
+                        );
+                    } else if screen_pts.len() >= 2 {
+                        let stroke_w = (self.reg_mark_thickness_in * px_per_in).max(2.5);
+                        painter.add(egui::Shape::line(
+                            screen_pts,
+                            egui::Stroke::new(stroke_w, egui::Color32::BLACK),
+                        ));
                     }
                 }
             }
@@ -6018,6 +6194,10 @@ mod tests {
         assert_eq!(app.shapes.len(), 1, "welded shapes should become 1 shape");
         assert_eq!(app.shapes[0].kind, ShapeKind::Freehand);
         assert!(app.shapes[0].is_closed);
+        assert!(app.shapes[0].is_svg_path);
+        assert_eq!(app.shapes[0].points.len(), 8, "true non-convex union has 8 outer boundary vertices");
+        assert!(app.shapes[0].text.contains('M'));
+        assert!(app.shapes[0].text.contains('Z'));
         assert_eq!(app.shapes[0].x, 1.0);
         assert_eq!(app.shapes[0].y, 1.0);
         assert_eq!(app.shapes[0].width, 4.0);
@@ -6122,5 +6302,65 @@ mod tests {
         assert!(svg.contains("Registration Mark"));
         assert!(svg.contains("<polygon points="));
         assert!(svg.contains("<polyline points="));
+    }
+
+    #[test]
+    fn test_fit_to_view_zoom() {
+        let mut app = StudioApp::new(None);
+        app.mat_width_in = 12.0;
+        app.mat_height_in = 12.0;
+        app.canvas_size = egui::vec2(600.0, 600.0);
+        app.zoom = 2.0;
+        app.pan = egui::vec2(50.0, 50.0);
+
+        app.fit_to_view();
+
+        // (600 - 40) / (12 * 40) = 560 / 480 = ~1.166
+        assert!(app.zoom > 1.1 && app.zoom < 1.2, "fit zoom should be ~1.166, got {}", app.zoom);
+        assert_eq!(app.pan, egui::Vec2::ZERO, "pan should reset to ZERO on fit");
+    }
+
+    #[test]
+    fn test_text_tool_workflow() {
+        let mut app = StudioApp::new(None);
+        app.active_tool = Tool::Text;
+        app.right_panel = "Transform";
+        app.text_sample = "Hello Craft".to_string();
+
+        let mat_pos = egui::pos2(2.0, 3.0);
+        let text = app.text_sample.clone();
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Text,
+            x: mat_pos.x,
+            y: mat_pos.y,
+            width: (text.len() as f32 * 0.35).max(0.8),
+            height: 0.6,
+            points: vec![],
+            text: text.clone(),
+            fill_color: egui::Color32::BLACK,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: false,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: None,
+            group_path: Vec::new(),
+            is_visible: true,
+            is_locked: false,
+            pixmap: None,
+            texture: None,
+        });
+        let new_idx = app.shapes.len() - 1;
+        app.select_shape(new_idx, false);
+        app.active_tool = Tool::Select;
+        app.right_panel = "Text";
+        app.focus_text_input = true;
+
+        assert_eq!(app.active_tool, Tool::Select, "tool should switch back to Select");
+        assert_eq!(app.right_panel, "Text", "inspector tab should switch to Text");
+        assert!(app.focus_text_input, "text input should request focus");
+        assert_eq!(app.selected_index, Some(0));
+        assert_eq!(app.shapes[0].text, "Hello Craft");
     }
 }

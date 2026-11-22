@@ -2,6 +2,9 @@
 //! All functions are panic-free and use safe bounds checking.
 
 use egui::{Pos2, Vec2};
+use i_overlay::core::fill_rule::FillRule;
+use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::float::overlay::FloatOverlay;
 
 // ---------------------------------------------------------------------------
 // 1. Polygon Offset
@@ -174,6 +177,163 @@ pub fn convex_hull(pts: &[Pos2]) -> Vec<Pos2> {
     }
 
     stack
+}
+
+// ---------------------------------------------------------------------------
+// 2b. True Polygon Boolean Union (i_overlay)
+// ---------------------------------------------------------------------------
+
+/// A shape produced by 2D polygon boolean union operations.
+///
+/// Contains an outer boundary contour and zero or more inner hole contours.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WeldedShape {
+    pub outer: Vec<Pos2>,
+    pub holes: Vec<Vec<Pos2>>,
+}
+
+impl WeldedShape {
+    /// Convert to an SVG path data string (`d="..."`) with `fill-rule="evenodd"`.
+    pub fn to_svg_path_data(&self) -> String {
+        let mut d = String::new();
+        if let Some(first) = self.outer.first() {
+            d.push_str(&format!("M {:.4} {:.4} ", first.x, first.y));
+            for p in self.outer.iter().skip(1) {
+                d.push_str(&format!("L {:.4} {:.4} ", p.x, p.y));
+            }
+            d.push_str("Z ");
+        }
+        for hole in &self.holes {
+            if let Some(first) = hole.first() {
+                d.push_str(&format!("M {:.4} {:.4} ", first.x, first.y));
+                for p in hole.iter().skip(1) {
+                    d.push_str(&format!("L {:.4} {:.4} ", p.x, p.y));
+                }
+                d.push_str("Z ");
+            }
+        }
+        d.trim().to_string()
+    }
+
+    /// Return all points across outer boundary and holes.
+    pub fn all_points(&self) -> Vec<Pos2> {
+        let mut pts = self.outer.clone();
+        for h in &self.holes {
+            pts.extend_from_slice(h);
+        }
+        pts
+    }
+
+    /// Compute bounding box `(min_x, min_y, max_x, max_y)`.
+    pub fn bounds(&self) -> (f32, f32, f32, f32) {
+        let pts = self.all_points();
+        if pts.is_empty() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let min_x = pts.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let min_y = pts.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let max_x = pts.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+        let max_y = pts.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+        (min_x, min_y, max_x, max_y)
+    }
+}
+
+/// Union multiple polygons into true non-convex outlines with interior hole preservation.
+///
+/// Each input polygon is a closed sequence of `Pos2` points.
+/// Returns a list of `WeldedShape`s. If input shapes overlap, they are merged along their
+/// true outer contours, while preserving any interior holes (`FillRule::EvenOdd`).
+pub fn boolean_weld_polygons(polygons: &[Vec<Pos2>]) -> Vec<WeldedShape> {
+    let clean_polys: Vec<Vec<[f32; 2]>> = polygons
+        .iter()
+        .filter(|p| p.len() >= 3)
+        .map(|pts| pts.iter().map(|p| [p.x, p.y]).collect())
+        .collect();
+
+    if clean_polys.is_empty() {
+        return Vec::new();
+    }
+    if clean_polys.len() == 1 {
+        let outer: Vec<Pos2> = clean_polys[0].iter().map(|&[x, y]| Pos2::new(x, y)).collect();
+        return vec![WeldedShape { outer, holes: Vec::new() }];
+    }
+
+    // Accumulate union iteratively
+    let mut current_shapes: Vec<Vec<Vec<[f32; 2]>>> = vec![vec![clean_polys[0].clone()]];
+
+    for poly in &clean_polys[1..] {
+        let clip = vec![poly.clone()];
+        let result = FloatOverlay::with_subj_and_clip(&current_shapes, &clip)
+            .overlay(OverlayRule::Union, FillRule::EvenOdd);
+        if !result.is_empty() {
+            current_shapes = result;
+        }
+    }
+
+    current_shapes
+        .into_iter()
+        .filter_map(|shape| {
+            if shape.is_empty() {
+                return None;
+            }
+            let outer = shape[0].iter().map(|&[x, y]| Pos2::new(x, y)).collect();
+            let holes = shape[1..]
+                .iter()
+                .map(|h| h.iter().map(|&[x, y]| Pos2::new(x, y)).collect())
+                .collect();
+            Some(WeldedShape { outer, holes })
+        })
+        .collect()
+}
+
+/// Union multiple complex shapes (each containing an outer contour and optional hole contours).
+pub fn boolean_weld_shapes(shapes: &[WeldedShape]) -> Vec<WeldedShape> {
+    let clean_shapes: Vec<Vec<Vec<[f32; 2]>>> = shapes
+        .iter()
+        .filter(|s| s.outer.len() >= 3)
+        .map(|s| {
+            let mut contours = Vec::with_capacity(1 + s.holes.len());
+            contours.push(s.outer.iter().map(|p| [p.x, p.y]).collect());
+            for h in &s.holes {
+                if h.len() >= 3 {
+                    contours.push(h.iter().map(|p| [p.x, p.y]).collect());
+                }
+            }
+            contours
+        })
+        .collect();
+
+    if clean_shapes.is_empty() {
+        return Vec::new();
+    }
+    if clean_shapes.len() == 1 {
+        return shapes.to_vec();
+    }
+
+    let mut current_shapes: Vec<Vec<Vec<[f32; 2]>>> = vec![clean_shapes[0].clone()];
+
+    for next_shape in &clean_shapes[1..] {
+        let result = FloatOverlay::with_subj_and_clip(&current_shapes, next_shape)
+            .overlay(OverlayRule::Union, FillRule::EvenOdd);
+        if !result.is_empty() {
+            current_shapes = result;
+        }
+    }
+
+    current_shapes
+        .into_iter()
+        .filter_map(|shape| {
+            if shape.is_empty() {
+                return None;
+            }
+            let outer = shape[0].iter().map(|&[x, y]| Pos2::new(x, y)).collect();
+            let holes = shape[1..]
+                .iter()
+                .map(|h| h.iter().map(|&[x, y]| Pos2::new(x, y)).collect())
+                .collect();
+            Some(WeldedShape { outer, holes })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -417,5 +577,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    // 7. boolean_weld_polygons: overlapping rectangles form true non-convex 8-vertex union
+    #[test]
+    fn test_boolean_weld_non_convex_overlap() {
+        let rect_a = vec![
+            Pos2::new(0.0, 0.0),
+            Pos2::new(2.0, 0.0),
+            Pos2::new(2.0, 2.0),
+            Pos2::new(0.0, 2.0),
+        ];
+        let rect_b = vec![
+            Pos2::new(1.0, 1.0),
+            Pos2::new(3.0, 1.0),
+            Pos2::new(3.0, 3.0),
+            Pos2::new(1.0, 3.0),
+        ];
+
+        let welded = boolean_weld_polygons(&[rect_a, rect_b]);
+        assert_eq!(welded.len(), 1, "overlapping rectangles should merge into 1 shape");
+        let shape = &welded[0];
+        // Non-convex L/staircase contour has 8 vertices:
+        // (0,0)->(2,0)->(2,1)->(3,1)->(3,3)->(1,3)->(1,2)->(0,2)
+        assert_eq!(shape.outer.len(), 8, "true non-convex union should have 8 vertices, got {}", shape.outer.len());
+        assert!(shape.holes.is_empty(), "no holes in simple overlap");
+
+        let (min_x, min_y, max_x, max_y) = shape.bounds();
+        assert!(approx_eq(min_x, 0.0, 1e-4));
+        assert!(approx_eq(min_y, 0.0, 1e-4));
+        assert!(approx_eq(max_x, 3.0, 1e-4));
+        assert!(approx_eq(max_y, 3.0, 1e-4));
+    }
+
+    // 8. boolean_weld_shapes: interior hole preservation
+    #[test]
+    fn test_boolean_weld_preserves_interior_holes() {
+        // Doughnut shape: outer 0..6, hole 2..4
+        let outer = vec![
+            Pos2::new(0.0, 0.0),
+            Pos2::new(6.0, 0.0),
+            Pos2::new(6.0, 6.0),
+            Pos2::new(0.0, 6.0),
+        ];
+        let hole = vec![
+            Pos2::new(2.0, 2.0),
+            Pos2::new(4.0, 2.0),
+            Pos2::new(4.0, 4.0),
+            Pos2::new(2.0, 4.0),
+        ];
+        let doughnut = WeldedShape {
+            outer,
+            holes: vec![hole],
+        };
+
+        // Small bar extending off the left edge (overlap only outside, hole untouched)
+        let tab = WeldedShape {
+            outer: vec![
+                Pos2::new(-1.0, 2.5),
+                Pos2::new(1.0, 2.5),
+                Pos2::new(1.0, 3.5),
+                Pos2::new(-1.0, 3.5),
+            ],
+            holes: Vec::new(),
+        };
+
+        let welded = boolean_weld_shapes(&[doughnut, tab]);
+        assert_eq!(welded.len(), 1, "shapes should merge into 1 welded shape");
+        let shape = &welded[0];
+        assert_eq!(shape.holes.len(), 1, "interior hole should be preserved in true union");
+        assert_eq!(shape.holes[0].len(), 4, "hole should have 4 vertices");
+        let (min_x, min_y, max_x, max_y) = shape.bounds();
+        assert!(approx_eq(min_x, -1.0, 1e-4));
+        assert!(approx_eq(max_x, 6.0, 1e-4));
+        assert!(approx_eq(min_y, 0.0, 1e-4));
+        assert!(approx_eq(max_y, 6.0, 1e-4));
+    }
+
+    // 9. boolean_weld_polygons: disjoint shapes stay separate
+    #[test]
+    fn test_boolean_weld_disjoint() {
+        let rect_a = vec![
+            Pos2::new(0.0, 0.0),
+            Pos2::new(1.0, 0.0),
+            Pos2::new(1.0, 1.0),
+            Pos2::new(0.0, 1.0),
+        ];
+        let rect_b = vec![
+            Pos2::new(5.0, 5.0),
+            Pos2::new(6.0, 5.0),
+            Pos2::new(6.0, 6.0),
+            Pos2::new(5.0, 6.0),
+        ];
+
+        let welded = boolean_weld_polygons(&[rect_a, rect_b]);
+        assert_eq!(welded.len(), 2, "disjoint shapes should remain 2 separate shapes");
     }
 }
