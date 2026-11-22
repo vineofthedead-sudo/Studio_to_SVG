@@ -4,6 +4,36 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.4.0] - 2026-11-21
+
+### Added
+- **Native `.craft` Project Save & Load (`app/src/project_file.rs`)**:
+  - Implemented version 2 `.craft` format preserving full workspace state: mat dimensions, paper background, all vector/raster/text shapes, fill/stroke styles, group hierarchies, visibility, lock states, and Print & Cut registration marks.
+  - Dependency-free base64 PNG embedding for 100% fidelity persistence of embedded raster graphics.
+  - Shortcut support: `Ctrl+S` (Save Project), `Ctrl+Shift+S` (Save Project As), and `Ctrl+O` (Open Project).
+- **Vector Crafting & Path Operations (`app/src/vector_ops.rs`)**:
+  - **Offset Path (Sticker & Cardstock Mat Border)**: Generates parallel inward and outward offset contours using vertex normal bisectors and winding-aware geometry with interactive distance slider (-0.25" to +0.50").
+  - **Make / Release Compound Path**: Combines multiple selected paths into an `EvenOdd` compound path with inner cutouts, or decomposes compound paths back into individual subpaths.
+  - **Weld**: Unions overlapping shapes into a single continuous outline using Graham scan convex hull geometry.
+  - **Align & Distribute Panel**: One-click alignment buttons (`Align Left`, `Center H`, `Align Right`, `Align Top`, `Center V`, `Align Bottom`, `Center to Mat`) and equal spacing distribution (horizontal/vertical) in the Transform panel.
+- **Rich Typography & Text-on-Canvas (`app/src/main.rs`)**:
+  - Live system TrueType/OpenType font rendering via `ab_glyph` across system directories (`/usr/share/fonts`).
+  - Font family selection (Liberation Sans, Liberation Serif, Liberation Mono, Noto Sans, JetBrains Mono).
+  - Font size (pt), bold, italic, and letter spacing controls.
+  - **"✂ Convert Text to Cut Paths"**: Converts live text into editable vector cut paths (`CanvasShape::Freehand`) ready for vinyl and craft cutters.
+- **Print & Cut Registration Marks**:
+  - Standard Silhouette/Cricut corner marks (top-left filled square, top-right and bottom-left L-brackets) with adjustable inset, mark size, and thickness in Page Setup.
+  - Rendered live on the cutting mat and exported into both SVG and high-DPI PNG outputs.
+- **Linux Desktop Integration**:
+  - Application icon: `assets/craft-anything.svg` (vector) and `assets/craft-anything.png` (256x256 raster).
+  - Desktop launcher: `craft-anything.desktop` with categories and keywords.
+  - MIME type registration: `craft-anything-mime.xml` for `.craft`, `.studio`, `.studio3`, and `.svg`.
+  - Automated installer: `./install_desktop.sh` supporting both system-wide and user-level installation.
+- **Batch Converter Polish**:
+  - Preserves both vector paths and embedded raster layers in batch-converted SVGs with status counts and diagnostic reporting.
+
+---
+
 ## [Unreleased] - 2026-11-21
 
 ### Completed Tonight

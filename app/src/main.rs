@@ -1,4 +1,6 @@
 pub mod studio_format;
+pub mod vector_ops;
+pub mod project_file;
 
 use eframe::egui;
 use std::path::Path;
@@ -227,6 +229,106 @@ impl CanvasShape {
             is_visible: s.is_visible,
             is_locked: s.is_locked,
             pixmap: None,
+            texture: None,
+        };
+        shape.precompute_triangles();
+        shape
+    }
+
+    pub fn to_craft_shape(&self) -> project_file::CraftShape {
+        let (pixmap_b64, pixmap_width, pixmap_height) = if let Some(ref pm) = self.pixmap {
+            let b64 = pm.encode_png().ok().map(|bytes| project_file::base64_encode_bytes(&bytes));
+            (b64, pm.width(), pm.height())
+        } else {
+            (None, 0, 0)
+        };
+
+        let kind_str = match self.kind {
+            ShapeKind::Rectangle => "Rectangle",
+            ShapeKind::Ellipse => "Ellipse",
+            ShapeKind::Line => "Line",
+            ShapeKind::Freehand => "Freehand",
+            ShapeKind::Text => "Text",
+        };
+
+        project_file::CraftShape {
+            kind: kind_str.to_string(),
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            points: self.points.iter().map(|p| [p.x, p.y]).collect(),
+            text: self.text.clone(),
+            fill_color: [
+                self.fill_color.r(),
+                self.fill_color.g(),
+                self.fill_color.b(),
+                self.fill_color.a(),
+            ],
+            stroke_color: self.stroke_color.map(|c| [c.r(), c.g(), c.b(), c.a()]),
+            stroke_width: self.stroke_width,
+            is_closed: self.is_closed,
+            is_svg_path: self.is_svg_path,
+            group_id: self.group_id,
+            group_path: self.group_path.clone(),
+            is_visible: self.is_visible,
+            is_locked: self.is_locked,
+            pixmap_b64,
+            pixmap_width,
+            pixmap_height,
+        }
+    }
+
+    pub fn from_craft_shape(s: project_file::CraftShape) -> Self {
+        let kind = match s.kind.as_str() {
+            "Rectangle" => ShapeKind::Rectangle,
+            "Ellipse" => ShapeKind::Ellipse,
+            "Line" => ShapeKind::Line,
+            "Text" => ShapeKind::Text,
+            _ => ShapeKind::Freehand,
+        };
+
+        let pixmap = s.pixmap_b64.as_deref().and_then(|b64| {
+            if let Ok(bytes) = project_file::base64_decode_bytes(b64) {
+                tiny_skia::Pixmap::decode_png(&bytes).ok()
+            } else {
+                None
+            }
+        });
+
+        let mut shape = CanvasShape {
+            kind,
+            x: s.x,
+            y: s.y,
+            width: s.width,
+            height: s.height,
+            points: s.points.into_iter().map(|[x, y]| egui::pos2(x, y)).collect(),
+            text: s.text,
+            fill_color: egui::Color32::from_rgba_unmultiplied(
+                s.fill_color[0],
+                s.fill_color[1],
+                s.fill_color[2],
+                s.fill_color[3],
+            ),
+            stroke_color: s.stroke_color.map(|c| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
+                .or_else(|| match kind {
+                    ShapeKind::Text => None,
+                    _ => Some(egui::Color32::BLACK),
+                }),
+            stroke_width: if s.stroke_width > 0.0 { s.stroke_width } else { 0.05 },
+            is_closed: s.is_closed,
+            is_svg_path: s.is_svg_path,
+            is_modified: false,
+            triangles: Vec::new(),
+            group_id: s.group_id,
+            group_path: if s.group_path.is_empty() {
+                s.group_id.map(|g| vec![g]).unwrap_or_default()
+            } else {
+                s.group_path
+            },
+            is_visible: s.is_visible,
+            is_locked: s.is_locked,
+            pixmap,
             texture: None,
         };
         shape.precompute_triangles();
@@ -479,6 +581,18 @@ pub struct StudioApp {
     pub status_message: Option<(String, std::time::Instant)>,
     pub screenshot_path: Option<String>,
     pub frames_rendered: u32,
+    pub current_project_path: Option<std::path::PathBuf>,
+    pub show_reg_marks: bool,
+    pub reg_mark_inset_in: f32,
+    pub reg_mark_thickness_in: f32,
+    pub reg_mark_size_in: f32,
+    pub font_family: String,
+    pub font_size_pt: f32,
+    pub font_bold: bool,
+    pub font_italic: bool,
+    pub letter_spacing_in: f32,
+    pub offset_distance_in: f32,
+    pub offset_round_joins: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -698,6 +812,18 @@ impl StudioApp {
             status_message: None,
             screenshot_path,
             frames_rendered: 0,
+            current_project_path: None,
+            show_reg_marks: false,
+            reg_mark_inset_in: 0.25,
+            reg_mark_thickness_in: 0.02,
+            reg_mark_size_in: 0.20,
+            font_family: "Liberation Sans".to_string(),
+            font_size_pt: 36.0,
+            font_bold: false,
+            font_italic: false,
+            letter_spacing_in: 0.0,
+            offset_distance_in: 0.10,
+            offset_round_joins: true,
         }
     }
 
@@ -718,6 +844,10 @@ impl StudioApp {
                 let msg = format!("Imported {} shapes from Silhouette Studio file", self.shapes.len());
                 self.status_message = Some((msg, std::time::Instant::now()));
             }
+        } else if ext == "craft" {
+            let _ = self.open_craft_file(path);
+        } else if ext == "json" {
+            let _ = self.open_project_file(path);
         } else if ext == "svg" {
             let _ = self.import_svg_file(path);
         }
@@ -1187,6 +1317,583 @@ impl StudioApp {
         Ok(())
     }
 
+    // 1b. Save Native .craft Project (version 2 with raster base64 & reg marks)
+    pub fn save_craft_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let paper_b64 = self.paper_bytes.as_ref().map(|b| project_file::base64_encode_bytes(b))
+            .or_else(|| {
+                self.paper_image.as_ref().and_then(|img| {
+                    let mut raw_png = Vec::new();
+                    let success = {
+                        let mut encoder = png::Encoder::new(&mut raw_png, img.width() as u32, img.height() as u32);
+                        encoder.set_color(png::ColorType::Rgba);
+                        encoder.set_depth(png::BitDepth::Eight);
+                        if let Ok(mut writer) = encoder.write_header() {
+                            let raw: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
+                            writer.write_image_data(&raw).is_ok()
+                        } else {
+                            false
+                        }
+                    };
+                    if success {
+                        Some(project_file::base64_encode_bytes(&raw_png))
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        let project = project_file::CraftProject {
+            version: 2,
+            app_name: "Craft Anything".to_string(),
+            mat_width_in: self.mat_width_in,
+            mat_height_in: self.mat_height_in,
+            shapes: self.shapes.iter().map(|s| s.to_craft_shape()).collect(),
+            group_names: self.group_names.clone(),
+            next_group_id: self.next_group_id,
+            paper_image_b64: paper_b64,
+            show_reg_marks: self.show_reg_marks,
+            reg_mark_inset_in: self.reg_mark_inset_in,
+        };
+
+        project_file::save_craft_project(path, &project)?;
+        self.current_project_path = Some(path.to_path_buf());
+        let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or(".craft");
+        self.set_status(format!("Project saved to {}", fname));
+        Ok(())
+    }
+
+    // 1c. Open Native .craft Project
+    pub fn open_craft_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let project = project_file::load_craft_project(path)?;
+        self.push_undo();
+        self.mat_width_in = project.mat_width_in;
+        self.mat_height_in = project.mat_height_in;
+        self.group_names = project.group_names;
+        self.next_group_id = project.next_group_id;
+        self.show_reg_marks = project.show_reg_marks;
+        self.reg_mark_inset_in = project.reg_mark_inset_in;
+
+        self.shapes = project.shapes.into_iter().map(CanvasShape::from_craft_shape).collect();
+
+        if let Some(ref b64) = project.paper_image_b64 {
+            if let Ok(bytes) = project_file::base64_decode_bytes(b64) {
+                if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                    let rgba = dyn_img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    self.paper_image = Some(egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba.into_raw(),
+                    ));
+                    self.paper_texture = None;
+                    self.paper_bytes = Some(bytes);
+                }
+            }
+        }
+
+        self.cached_svgs.clear();
+        self.clear_selection();
+        self.current_project_path = Some(path.to_path_buf());
+        let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or(".craft");
+        self.set_status(format!("Loaded project from {} ({} shapes)", fname, self.shapes.len()));
+        Ok(())
+    }
+
+    // Vector Crafting: Parallel offset contour for sticker / cardstock border
+    pub fn offset_selected(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() {
+            self.set_status("Select a shape to offset");
+            return;
+        }
+
+        self.push_undo();
+        let dist = self.offset_distance_in;
+        let mut new_shapes = Vec::new();
+
+        for &idx in &sel {
+            if let Some(shape) = self.shapes.get(idx) {
+                let pts: Vec<egui::Pos2> = match shape.kind {
+                    ShapeKind::Freehand | ShapeKind::Line => {
+                        if shape.points.len() >= 3 {
+                            shape.points.clone()
+                        } else {
+                            continue;
+                        }
+                    }
+                    ShapeKind::Rectangle => {
+                        vec![
+                            egui::pos2(shape.x, shape.y),
+                            egui::pos2(shape.x + shape.width, shape.y),
+                            egui::pos2(shape.x + shape.width, shape.y + shape.height),
+                            egui::pos2(shape.x, shape.y + shape.height),
+                        ]
+                    }
+                    ShapeKind::Ellipse => {
+                        let n = 36;
+                        let cx = shape.x + shape.width * 0.5;
+                        let cy = shape.y + shape.height * 0.5;
+                        let rx = shape.width * 0.5;
+                        let ry = shape.height * 0.5;
+                        (0..n).map(|k| {
+                            let angle = (k as f32 / n as f32) * std::f32::consts::TAU;
+                            egui::pos2(cx + rx * angle.cos(), cy + ry * angle.sin())
+                        }).collect()
+                    }
+                    ShapeKind::Text => continue,
+                };
+
+                let offset_pts = vector_ops::offset_polygon(&pts, dist);
+                if offset_pts.len() >= 3 {
+                    let min_x = offset_pts.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+                    let min_y = offset_pts.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+                    let max_x = offset_pts.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+                    let max_y = offset_pts.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+
+                    let mut offset_shape = CanvasShape {
+                        kind: ShapeKind::Freehand,
+                        x: min_x,
+                        y: min_y,
+                        width: (max_x - min_x).max(0.01),
+                        height: (max_y - min_y).max(0.01),
+                        points: offset_pts,
+                        text: String::new(),
+                        fill_color: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220),
+                        stroke_color: Some(egui::Color32::from_rgb(255, 38, 38)),
+                        stroke_width: 0.02,
+                        is_closed: true,
+                        is_svg_path: false,
+                        is_modified: true,
+                        triangles: Vec::new(),
+                        group_id: None,
+                        group_path: Vec::new(),
+                        is_visible: true,
+                        is_locked: false,
+                        pixmap: None,
+                        texture: None,
+                    };
+                    offset_shape.precompute_triangles();
+                    new_shapes.push(offset_shape);
+                }
+            }
+        }
+
+        if !new_shapes.is_empty() {
+            let new_count = new_shapes.len();
+            let start_idx = self.shapes.len();
+            self.shapes.extend(new_shapes);
+            self.selected_indices = (start_idx..start_idx + new_count).collect();
+            self.selected_index = Some(start_idx);
+            self.set_status(format!("Created {} offset path(s) ({:+.2} in)", new_count, dist));
+        } else {
+            self.set_status("Could not offset selected shape(s)");
+        }
+    }
+
+    // Vector Crafting: Combine multiple shapes into single compound path with holes
+    pub fn make_compound_path(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.len() < 2 {
+            self.set_status("Select at least 2 shapes to make a compound path");
+            return;
+        }
+
+        self.push_undo();
+        let mut d = String::new();
+        let mut all_points = Vec::new();
+        let first_shape = self.shapes[sel[0]].clone();
+
+        for &idx in &sel {
+            let shape = &self.shapes[idx];
+            if shape.is_svg_path && !shape.text.is_empty() {
+                d.push_str(&shape.text);
+                d.push(' ');
+                all_points.extend_from_slice(&shape.points);
+            } else {
+                let pts: Vec<egui::Pos2> = match shape.kind {
+                    ShapeKind::Rectangle => vec![
+                        egui::pos2(shape.x, shape.y),
+                        egui::pos2(shape.x + shape.width, shape.y),
+                        egui::pos2(shape.x + shape.width, shape.y + shape.height),
+                        egui::pos2(shape.x, shape.y + shape.height),
+                    ],
+                    ShapeKind::Ellipse => {
+                        let n = 36;
+                        let cx = shape.x + shape.width * 0.5;
+                        let cy = shape.y + shape.height * 0.5;
+                        let rx = shape.width * 0.5;
+                        let ry = shape.height * 0.5;
+                        (0..n).map(|k| {
+                            let angle = (k as f32 / n as f32) * std::f32::consts::TAU;
+                            egui::pos2(cx + rx * angle.cos(), cy + ry * angle.sin())
+                        }).collect()
+                    }
+                    _ => shape.points.clone(),
+                };
+
+                if let Some(first) = pts.first() {
+                    d.push_str(&format!("M {:.4} {:.4} ", first.x, first.y));
+                    for p in pts.iter().skip(1) {
+                        d.push_str(&format!("L {:.4} {:.4} ", p.x, p.y));
+                    }
+                    d.push_str("Z ");
+                }
+                all_points.extend_from_slice(&pts);
+            }
+        }
+
+        let min_x = all_points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let min_y = all_points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let max_x = all_points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+        let max_y = all_points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+
+        let mut compound = CanvasShape {
+            kind: ShapeKind::Freehand,
+            x: if min_x.is_finite() { min_x } else { 0.0 },
+            y: if min_y.is_finite() { min_y } else { 0.0 },
+            width: if max_x.is_finite() && min_x.is_finite() { (max_x - min_x).max(0.01) } else { 1.0 },
+            height: if max_y.is_finite() && min_y.is_finite() { (max_y - min_y).max(0.01) } else { 1.0 },
+            points: all_points,
+            text: d.trim().to_string(),
+            fill_color: first_shape.fill_color,
+            stroke_color: first_shape.stroke_color,
+            stroke_width: first_shape.stroke_width,
+            is_closed: true,
+            is_svg_path: true,
+            is_modified: true,
+            triangles: Vec::new(),
+            group_id: None,
+            group_path: Vec::new(),
+            is_visible: true,
+            is_locked: false,
+            pixmap: None,
+            texture: None,
+        };
+        compound.precompute_triangles();
+
+        let mut sorted_sel = sel.clone();
+        sorted_sel.sort_unstable();
+        for &idx in sorted_sel.iter().rev() {
+            if idx < self.shapes.len() {
+                self.shapes.remove(idx);
+            }
+        }
+
+        let new_idx = self.shapes.len();
+        self.shapes.push(compound);
+        self.selected_indices.clear();
+        self.selected_indices.insert(new_idx);
+        self.selected_index = Some(new_idx);
+        self.set_status(format!("Created compound path from {} shapes", sel.len()));
+    }
+
+    // Vector Crafting: Split compound path back into individual subpaths
+    pub fn release_compound_path(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() {
+            self.set_status("Select a compound path to release");
+            return;
+        }
+
+        self.push_undo();
+        let mut released_count = 0;
+        let mut to_remove = Vec::new();
+        let mut new_shapes = Vec::new();
+
+        for &idx in &sel {
+            if let Some(shape) = self.shapes.get(idx) {
+                if shape.is_svg_path && shape.text.contains('M') {
+                    let subpaths: Vec<&str> = shape.text.split('M').filter(|s| !s.trim().is_empty()).collect();
+                    if subpaths.len() > 1 {
+                        to_remove.push(idx);
+                        for sub in subpaths {
+                            let d_sub = format!("M {}", sub.trim());
+                            let mut sub_pts = Vec::new();
+                            for token in sub.split_whitespace() {
+                                if let Some((x_str, y_str)) = token.split_once(',') {
+                                    if let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) {
+                                        sub_pts.push(egui::pos2(x, y));
+                                    }
+                                }
+                            }
+                            if sub_pts.len() < 3 {
+                                let nums: Vec<f32> = sub.split(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                                    .filter_map(|s| s.parse::<f32>().ok()).collect();
+                                for chunk in nums.chunks(2) {
+                                    if chunk.len() == 2 {
+                                        sub_pts.push(egui::pos2(chunk[0], chunk[1]));
+                                    }
+                                }
+                            }
+
+                            let min_x = sub_pts.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+                            let min_y = sub_pts.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+                            let max_x = sub_pts.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+                            let max_y = sub_pts.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+
+                            let mut released = CanvasShape {
+                                kind: ShapeKind::Freehand,
+                                x: if min_x.is_finite() { min_x } else { shape.x },
+                                y: if min_y.is_finite() { min_y } else { shape.y },
+                                width: if max_x.is_finite() && min_x.is_finite() { (max_x - min_x).max(0.01) } else { shape.width },
+                                height: if max_y.is_finite() && min_y.is_finite() { (max_y - min_y).max(0.01) } else { shape.height },
+                                points: sub_pts,
+                                text: d_sub,
+                                fill_color: shape.fill_color,
+                                stroke_color: shape.stroke_color,
+                                stroke_width: shape.stroke_width,
+                                is_closed: true,
+                                is_svg_path: true,
+                                is_modified: true,
+                                triangles: Vec::new(),
+                                group_id: None,
+                                group_path: Vec::new(),
+                                is_visible: true,
+                                is_locked: false,
+                                pixmap: None,
+                                texture: None,
+                            };
+                            released.precompute_triangles();
+                            new_shapes.push(released);
+                            released_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !to_remove.is_empty() {
+            to_remove.sort_unstable();
+            for &idx in to_remove.iter().rev() {
+                self.shapes.remove(idx);
+            }
+            let start = self.shapes.len();
+            self.shapes.extend(new_shapes);
+            self.selected_indices = (start..start + released_count).collect();
+            self.selected_index = Some(start);
+            self.set_status(format!("Released compound path into {} shapes", released_count));
+        } else {
+            self.set_status("Selected shape is not a multi-subpath compound path");
+        }
+    }
+
+    // Vector Crafting: Weld overlapping shapes into a single outline
+    pub fn weld_selected(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.len() < 2 {
+            self.set_status("Select at least 2 shapes to weld");
+            return;
+        }
+
+        self.push_undo();
+        let mut all_points = Vec::new();
+        let first_shape = self.shapes[sel[0]].clone();
+
+        for &idx in &sel {
+            if let Some(shape) = self.shapes.get(idx) {
+                let pts: Vec<egui::Pos2> = match shape.kind {
+                    ShapeKind::Rectangle => vec![
+                        egui::pos2(shape.x, shape.y),
+                        egui::pos2(shape.x + shape.width, shape.y),
+                        egui::pos2(shape.x + shape.width, shape.y + shape.height),
+                        egui::pos2(shape.x, shape.y + shape.height),
+                    ],
+                    ShapeKind::Ellipse => {
+                        let n = 36;
+                        let cx = shape.x + shape.width * 0.5;
+                        let cy = shape.y + shape.height * 0.5;
+                        let rx = shape.width * 0.5;
+                        let ry = shape.height * 0.5;
+                        (0..n).map(|k| {
+                            let angle = (k as f32 / n as f32) * std::f32::consts::TAU;
+                            egui::pos2(cx + rx * angle.cos(), cy + ry * angle.sin())
+                        }).collect()
+                    }
+                    _ => shape.points.clone(),
+                };
+                all_points.extend(pts);
+            }
+        }
+
+        let hull = vector_ops::convex_hull(&all_points);
+        if hull.len() >= 3 {
+            let min_x = hull.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+            let min_y = hull.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+            let max_x = hull.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+            let max_y = hull.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+
+            let mut welded = CanvasShape {
+                kind: ShapeKind::Freehand,
+                x: min_x,
+                y: min_y,
+                width: (max_x - min_x).max(0.01),
+                height: (max_y - min_y).max(0.01),
+                points: hull,
+                text: String::new(),
+                fill_color: first_shape.fill_color,
+                stroke_color: first_shape.stroke_color,
+                stroke_width: first_shape.stroke_width,
+                is_closed: true,
+                is_svg_path: false,
+                is_modified: true,
+                triangles: Vec::new(),
+                group_id: None,
+                group_path: Vec::new(),
+                is_visible: true,
+                is_locked: false,
+                pixmap: None,
+                texture: None,
+            };
+            welded.precompute_triangles();
+
+            let mut sorted_sel = sel.clone();
+            sorted_sel.sort_unstable();
+            for &idx in sorted_sel.iter().rev() {
+                self.shapes.remove(idx);
+            }
+
+            let new_idx = self.shapes.len();
+            self.shapes.push(welded);
+            self.selected_indices.clear();
+            self.selected_indices.insert(new_idx);
+            self.selected_index = Some(new_idx);
+            self.set_status(format!("Welded {} shapes into unified outline", sel.len()));
+        } else {
+            self.set_status("Could not weld selected shapes");
+        }
+    }
+
+    // Align & Distribute: Align multi-selected shapes
+    pub fn align_selected(&mut self, anchor: vector_ops::AlignAnchor) {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() {
+            self.set_status("Select shapes to align");
+            return;
+        }
+
+        let rects: Vec<(f32, f32, f32, f32)> = sel.iter().filter_map(|&i| {
+            self.shapes.get(i).map(|s| {
+                let r = s.bounding_rect();
+                (r.min.x, r.min.y, r.max.x, r.max.y)
+            })
+        }).collect();
+
+        if rects.len() != sel.len() {
+            return;
+        }
+
+        self.push_undo();
+        let offsets = vector_ops::compute_align_offsets(&rects, anchor, self.mat_width_in, self.mat_height_in);
+        for (&idx, (dx, dy)) in sel.iter().zip(offsets.iter()) {
+            if let Some(shape) = self.shapes.get_mut(idx) {
+                shape.translate(egui::vec2(*dx, *dy));
+            }
+        }
+        self.set_status("Aligned selected shapes");
+    }
+
+    // Align & Distribute: Distribute shapes horizontally
+    pub fn distribute_selected_h(&mut self) {
+        let mut sel = self.all_selected_indices();
+        if sel.len() < 3 {
+            self.set_status("Select at least 3 shapes to distribute");
+            return;
+        }
+        self.push_undo();
+        sel.sort_by(|&a, &b| {
+            self.shapes[a].x.partial_cmp(&self.shapes[b].x).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let total_shapes_w: f32 = sel.iter().map(|&i| self.shapes[i].width).sum();
+        let first_idx = sel[0];
+        let last_idx = *sel.last().unwrap();
+        let total_span = (self.shapes[last_idx].x + self.shapes[last_idx].width) - self.shapes[first_idx].x;
+        let gaps = (sel.len() - 1) as f32;
+        let spacing = (total_span - total_shapes_w) / gaps;
+
+        let mut current_x = self.shapes[first_idx].x + self.shapes[first_idx].width + spacing;
+        for &idx in &sel[1..sel.len() - 1] {
+            let shape = &mut self.shapes[idx];
+            shape.set_x(current_x);
+            current_x += shape.width + spacing;
+        }
+        self.set_status("Distributed shapes horizontally");
+    }
+
+    // Align & Distribute: Distribute shapes vertically
+    pub fn distribute_selected_v(&mut self) {
+        let mut sel = self.all_selected_indices();
+        if sel.len() < 3 {
+            self.set_status("Select at least 3 shapes to distribute");
+            return;
+        }
+        self.push_undo();
+        sel.sort_by(|&a, &b| {
+            self.shapes[a].y.partial_cmp(&self.shapes[b].y).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let total_shapes_h: f32 = sel.iter().map(|&i| self.shapes[i].height).sum();
+        let first_idx = sel[0];
+        let last_idx = *sel.last().unwrap();
+        let total_span = (self.shapes[last_idx].y + self.shapes[last_idx].height) - self.shapes[first_idx].y;
+        let gaps = (sel.len() - 1) as f32;
+        let spacing = (total_span - total_shapes_h) / gaps;
+
+        let mut current_y = self.shapes[first_idx].y + self.shapes[first_idx].height + spacing;
+        for &idx in &sel[1..sel.len() - 1] {
+            let shape = &mut self.shapes[idx];
+            shape.set_y(current_y);
+            current_y += shape.height + spacing;
+        }
+        self.set_status("Distributed shapes vertically");
+    }
+
+    // Typography: Convert live text into vector cut paths
+    pub fn convert_text_to_cut_paths(&mut self) {
+        let sel = self.all_selected_indices();
+        if sel.is_empty() {
+            self.set_status("Select a text shape to convert");
+            return;
+        }
+
+        self.push_undo();
+        let mut converted_count = 0;
+        let mut replacements = Vec::new();
+
+        for &idx in &sel {
+            if let Some(shape) = self.shapes.get(idx) {
+                if shape.kind == ShapeKind::Text && !shape.text.is_empty() {
+                    match create_text_cut_path(
+                        &shape.text,
+                        &self.font_family,
+                        self.font_size_pt,
+                        self.font_bold,
+                        self.font_italic,
+                        self.letter_spacing_in,
+                        shape.x,
+                        shape.y,
+                        shape.fill_color,
+                    ) {
+                        Ok(new_shape) => {
+                            replacements.push((idx, new_shape));
+                            converted_count += 1;
+                        }
+                        Err(e) => {
+                            self.set_status(format!("Text conversion error: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (idx, new_shape) in replacements {
+            self.shapes[idx] = new_shape;
+        }
+
+        if converted_count > 0 {
+            self.set_status(format!("Converted {} text object(s) to cut paths", converted_count));
+        }
+    }
+
     // 2. Export SVG string in mat-inch coordinates
     pub fn export_svg_string(&self) -> String {
         let mut out = String::new();
@@ -1286,6 +1993,25 @@ impl StudioApp {
                         "  <text x=\"{:.3}\" y=\"{:.3}\" font-family=\"sans-serif\" font-size=\"{:.3}\"{}>{}</text>\n",
                         shape.x, y_base, shape.height, fill_str, escaped
                     ));
+                }
+            }
+        }
+
+        if self.show_reg_marks {
+            let marks = vector_ops::registration_marks(
+                self.mat_width_in,
+                self.mat_height_in,
+                self.reg_mark_inset_in,
+                self.reg_mark_size_in,
+            );
+            for (pts, is_closed) in marks {
+                if is_closed {
+                    let pts_str = pts.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" ");
+                    out.push_str(&format!("  <!-- Registration Mark -->\n  <polygon points=\"{}\" fill=\"#000000\" stroke=\"none\" />\n", pts_str));
+                } else if pts.len() >= 2 {
+                    let pts_str = pts.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" ");
+                    let sw = self.reg_mark_thickness_in.max(0.02);
+                    out.push_str(&format!("  <!-- Registration Mark -->\n  <polyline points=\"{}\" fill=\"none\" stroke=\"#000000\" stroke-width=\"{:.3}\" stroke-linecap=\"square\" stroke-linejoin=\"miter\" />\n", pts_str, sw));
                 }
             }
         }
@@ -1547,6 +2273,36 @@ impl StudioApp {
                                     });
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.show_reg_marks {
+            let marks = vector_ops::registration_marks(
+                self.mat_width_in,
+                self.mat_height_in,
+                self.reg_mark_inset_in,
+                self.reg_mark_size_in,
+            );
+            for (pts, is_closed) in marks {
+                let mut pb = tiny_skia::PathBuilder::new();
+                if let Some(first) = pts.first() {
+                    pb.move_to(first.x * dpi, first.y * dpi);
+                    for p in pts.iter().skip(1) {
+                        pb.line_to(p.x * dpi, p.y * dpi);
+                    }
+                    if is_closed {
+                        pb.close();
+                    }
+                    if let Some(path) = pb.finish() {
+                        if is_closed {
+                            pixmap.fill_path(&path, &black_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                        } else {
+                            let sw = (self.reg_mark_thickness_in * dpi).max(2.0);
+                            let stroke = tiny_skia::Stroke { width: sw, ..Default::default() };
+                            pixmap.stroke_path(&path, &black_paint, &stroke, tiny_skia::Transform::identity(), None);
                         }
                     }
                 }
@@ -2390,6 +3146,37 @@ impl eframe::App for StudioApp {
             if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z)))) {
                 self.redo();
             }
+            // Save Project (.craft): Ctrl+S
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+                if let Some(path) = self.current_project_path.clone() {
+                    let _ = self.save_craft_file(&path);
+                } else if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                    .set_file_name("project.craft")
+                    .save_file()
+                {
+                    let _ = self.save_craft_file(&path);
+                }
+            }
+            // Save Project As (.craft): Ctrl+Shift+S
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                    .set_file_name("project.craft")
+                    .save_file()
+                {
+                    let _ = self.save_craft_file(&path);
+                }
+            }
+            // Open Project: Ctrl+O
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::O)) {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Design Projects (*.craft, *.studio, *.studio3, *.svg, *.json)", &["craft", "studio", "studio3", "svg", "json"])
+                    .pick_file()
+                {
+                    self.load_file(&path);
+                }
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
                 let mut to_remove = self.all_selected_indices();
                 if !to_remove.is_empty() {
@@ -2423,30 +3210,49 @@ impl eframe::App for StudioApp {
                             self.clear_selection();
                             self.pan = egui::Vec2::ZERO;
                             self.zoom = 1.0;
+                            self.current_project_path = None;
                         }
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Open Project (.json)...").clicked() {
+                    if ui.button("Open Project (.craft)... (Ctrl+O)").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Silhouette Project (*.json)", &["json"])
+                            .add_filter("Craft Anything Project (*.craft)", &["craft"])
                             .pick_file()
                         {
-                            match self.open_project_file(&path) {
-                                Ok(()) => self.set_status("Project loaded successfully"),
-                                Err(e) => self.set_status(format!("Error loading project: {}", e)),
+                            match self.open_craft_file(&path) {
+                                Ok(()) => (),
+                                Err(e) => self.set_status(format!("Error loading .craft project: {}", e)),
                             }
                         }
                         ui.close_menu();
                     }
-                    if ui.button("Save Project (.json)...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Silhouette Project (*.json)", &["json"])
-                            .set_file_name("project.json")
+                    if ui.button("Save Project (.craft) (Ctrl+S)").clicked() {
+                        if let Some(path) = self.current_project_path.clone() {
+                            match self.save_craft_file(&path) {
+                                Ok(()) => (),
+                                Err(e) => self.set_status(format!("Error saving project: {}", e)),
+                            }
+                        } else if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                            .set_file_name("project.craft")
                             .save_file()
                         {
-                            match self.save_project_file(&path) {
-                                Ok(()) => self.set_status("Project saved successfully"),
+                            match self.save_craft_file(&path) {
+                                Ok(()) => (),
+                                Err(e) => self.set_status(format!("Error saving project: {}", e)),
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Save Project As... (Ctrl+Shift+S)").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                            .set_file_name("project.craft")
+                            .save_file()
+                        {
+                            match self.save_craft_file(&path) {
+                                Ok(()) => (),
                                 Err(e) => self.set_status(format!("Error saving project: {}", e)),
                             }
                         }
@@ -2520,6 +3326,32 @@ impl eframe::App for StudioApp {
                             match self.export_png_file(&path, 150.0) {
                                 Ok(()) => self.set_status("High-DPI PNG exported successfully"),
                                 Err(e) => self.set_status(format!("Error exporting PNG: {}", e)),
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Legacy: Open Project (.json)...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Silhouette Project (*.json)", &["json"])
+                            .pick_file()
+                        {
+                            match self.open_project_file(&path) {
+                                Ok(()) => self.set_status("Project loaded successfully"),
+                                Err(e) => self.set_status(format!("Error loading project: {}", e)),
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Legacy: Save Project (.json)...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Silhouette Project (*.json)", &["json"])
+                            .set_file_name("project.json")
+                            .save_file()
+                        {
+                            match self.save_project_file(&path) {
+                                Ok(()) => self.set_status("Project saved successfully"),
+                                Err(e) => self.set_status(format!("Error saving project: {}", e)),
                             }
                         }
                         ui.close_menu();
@@ -2620,6 +3452,29 @@ impl eframe::App for StudioApp {
                         }
                         ui.close_menu();
                     }
+                    ui.separator();
+                    let sel_count = self.all_selected_indices().len();
+                    if ui.add_enabled(sel_count >= 1, egui::Button::new("✂ Offset Path (Sticker Border)...")).clicked() {
+                        self.offset_selected();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(sel_count >= 2, egui::Button::new("Make Compound Path")).clicked() {
+                        self.make_compound_path();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(sel_count >= 1, egui::Button::new("Release Compound Path")).clicked() {
+                        self.release_compound_path();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(sel_count >= 2, egui::Button::new("Weld Overlapping Shapes")).clicked() {
+                        self.weld_selected();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(sel_count >= 1, egui::Button::new("Convert Text to Cut Paths")).clicked() {
+                        self.convert_text_to_cut_paths();
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("View", |ui| {
                     if ui.button("Zoom In").clicked() {
@@ -2690,6 +3545,16 @@ impl eframe::App for StudioApp {
                     ui.heading("Page Setup");
                     ui.add(egui::Slider::new(&mut self.mat_width_in, 4.0..=24.0).text("Width (in)"));
                     ui.add(egui::Slider::new(&mut self.mat_height_in, 4.0..=24.0).text("Height (in)"));
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.heading("Print & Cut Marks");
+                    ui.checkbox(&mut self.show_reg_marks, "Registration Marks");
+                    if self.show_reg_marks {
+                        ui.add(egui::Slider::new(&mut self.reg_mark_inset_in, 0.1..=1.0).text("Inset (in)"));
+                        ui.add(egui::Slider::new(&mut self.reg_mark_size_in, 0.1..=0.5).text("Mark Size (in)"));
+                        ui.add(egui::Slider::new(&mut self.reg_mark_thickness_in, 0.01..=0.08).text("Thickness (in)"));
+                    }
 
                     ui.add_space(10.0);
                     ui.separator();
@@ -2861,22 +3726,52 @@ impl eframe::App for StudioApp {
                     }
                 }
                 "Text" => {
-                    ui.heading("Text Style");
-                    if ui.text_edit_singleline(&mut self.text_sample).changed() {
-                        let text_val = self.text_sample.clone();
-                        if let Some(idx) = self.selected_index {
-                            if let Some(shape) = self.shapes.get_mut(idx) {
-                                if shape.kind == ShapeKind::Text {
-                                    shape.text = text_val;
+                    ui.heading("Typography & Text");
+                    ui.horizontal(|ui| {
+                        ui.label("Text:");
+                        if ui.text_edit_singleline(&mut self.text_sample).changed() {
+                            let text_val = self.text_sample.clone();
+                            if let Some(idx) = self.selected_index {
+                                if let Some(shape) = self.shapes.get_mut(idx) {
+                                    if shape.kind == ShapeKind::Text {
+                                        shape.text = text_val;
+                                    }
                                 }
                             }
                         }
+                    });
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Font:");
+                        egui::ComboBox::from_id_source("font_family_combo")
+                            .selected_text(&self.font_family)
+                            .show_ui(ui, |ui| {
+                                for family in ["Liberation Sans", "Liberation Serif", "Liberation Mono", "Noto Sans", "JetBrains Mono"] {
+                                    ui.selectable_value(&mut self.font_family, family.to_string(), family);
+                                }
+                            });
+                    });
+
+                    ui.add(egui::Slider::new(&mut self.font_size_pt, 8.0..=120.0).text("Size (pt)"));
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.font_bold, "Bold");
+                        ui.checkbox(&mut self.font_italic, "Italic");
+                    });
+                    ui.add(egui::Slider::new(&mut self.letter_spacing_in, -0.05..=0.20).text("Letter Spacing (in)"));
+
+                    ui.add_space(10.0);
+                    let sel_is_text = self.selected_index.and_then(|i| self.shapes.get(i)).map(|s| s.kind == ShapeKind::Text).unwrap_or(false);
+                    if ui.add_enabled(sel_is_text, egui::Button::new("✂ Convert Text to Cut Paths")).on_hover_text("Converts text into editable vector paths ready for cutting").clicked() {
+                        self.convert_text_to_cut_paths();
                     }
                     ui.add_space(8.0);
-                    ui.label("Click on the mat with the Text tool to place.");
+                    ui.label("Click on the mat with the Text tool to place live text.");
                 }
                 _ => {
-                    ui.heading("Transform");
+                    ui.heading("Transform & Vector Ops");
+                    let sel_count = self.all_selected_indices().len();
+
                     if let Some(idx) = self.selected_index {
                         if idx < self.shapes.len() {
                             let mut delete_clicked = false;
@@ -2886,10 +3781,10 @@ impl eframe::App for StudioApp {
                                     ShapeKind::Rectangle => "Rectangle",
                                     ShapeKind::Ellipse => "Ellipse",
                                     ShapeKind::Line => "Line",
-                                    ShapeKind::Freehand => "Freehand",
+                                    ShapeKind::Freehand => if shape.is_svg_path { "Compound / SVG Path" } else { "Freehand" },
                                     ShapeKind::Text => "Text",
                                 };
-                                ui.label(format!("Selected: {}", kind_str));
+                                ui.label(format!("Selected: {} ({} selected)", kind_str, sel_count));
                                 ui.separator();
 
                                 let mut x = shape.x;
@@ -2922,7 +3817,7 @@ impl eframe::App for StudioApp {
                                     }
                                 });
 
-                                ui.add_space(10.0);
+                                ui.add_space(8.0);
                                 if ui.button("🗑 Delete Shape").clicked() {
                                     delete_clicked = true;
                                 }
@@ -2931,12 +3826,70 @@ impl eframe::App for StudioApp {
                                 self.shapes.remove(idx);
                                 self.selected_index = None;
                             }
-                        } else {
-                            self.selected_index = None;
-                            ui.label("Select an object on the mat to transform.");
                         }
                     } else {
                         ui.label("Select an object on the mat to transform.");
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.heading("Align & Distribute");
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(sel_count >= 2, egui::Button::new("⬅ Left")).clicked() {
+                            self.align_selected(vector_ops::AlignAnchor::Left);
+                        }
+                        if ui.add_enabled(sel_count >= 2, egui::Button::new("⬌ Center H")).clicked() {
+                            self.align_selected(vector_ops::AlignAnchor::CenterH);
+                        }
+                        if ui.add_enabled(sel_count >= 2, egui::Button::new("➡ Right")).clicked() {
+                            self.align_selected(vector_ops::AlignAnchor::Right);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(sel_count >= 2, egui::Button::new("⬆ Top")).clicked() {
+                            self.align_selected(vector_ops::AlignAnchor::Top);
+                        }
+                        if ui.add_enabled(sel_count >= 2, egui::Button::new("⬍ Center V")).clicked() {
+                            self.align_selected(vector_ops::AlignAnchor::CenterV);
+                        }
+                        if ui.add_enabled(sel_count >= 2, egui::Button::new("⬇ Bottom")).clicked() {
+                            self.align_selected(vector_ops::AlignAnchor::Bottom);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(sel_count >= 1, egui::Button::new("Center to Mat")).clicked() {
+                            self.align_selected(vector_ops::AlignAnchor::CenterToMatH);
+                            self.align_selected(vector_ops::AlignAnchor::CenterToMatV);
+                        }
+                        if ui.add_enabled(sel_count >= 3, egui::Button::new("Distribute H")).clicked() {
+                            self.distribute_selected_h();
+                        }
+                        if ui.add_enabled(sel_count >= 3, egui::Button::new("Distribute V")).clicked() {
+                            self.distribute_selected_v();
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.heading("Vector Crafting");
+                    ui.horizontal(|ui| {
+                        ui.label("Offset:");
+                        ui.add(egui::Slider::new(&mut self.offset_distance_in, -0.25..=0.50).suffix(" in"));
+                    });
+                    if ui.add_enabled(sel_count >= 1, egui::Button::new("✂ Offset Path (Sticker Border)")).on_hover_text("Generate outward or inward contour around shape").clicked() {
+                        self.offset_selected();
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(sel_count >= 2, egui::Button::new("Make Compound")).on_hover_text("Combine selected into compound path with holes").clicked() {
+                            self.make_compound_path();
+                        }
+                        if ui.add_enabled(sel_count >= 1, egui::Button::new("Release Compound")).on_hover_text("Split compound path into separate subpaths").clicked() {
+                            self.release_compound_path();
+                        }
+                    });
+                    if ui.add_enabled(sel_count >= 2, egui::Button::new("Weld Shapes")).on_hover_text("Union selected shapes into a single outline").clicked() {
+                        self.weld_selected();
                     }
                 }
             }
@@ -3038,6 +3991,32 @@ impl eframe::App for StudioApp {
             for r in 1..(self.mat_height_in.ceil() as i32) {
                 let y = mat_rect.min.y + (r as f32) * px_per_in;
                 painter.line_segment([egui::pos2(mat_rect.min.x, y), egui::pos2(mat_rect.max.x, y)], grid_stroke);
+            }
+
+            // Print & Cut Registration Marks (corner square + L-brackets)
+            if self.show_reg_marks {
+                let marks = vector_ops::registration_marks(
+                    self.mat_width_in,
+                    self.mat_height_in,
+                    self.reg_mark_inset_in,
+                    self.reg_mark_size_in,
+                );
+                for (pts, is_closed) in marks {
+                    let screen_pts: Vec<egui::Pos2> = pts.iter().map(|&p| mat_to_screen(p)).collect();
+                    if is_closed {
+                        painter.add(egui::Shape::convex_polygon(
+                            screen_pts,
+                            egui::Color32::BLACK,
+                            egui::Stroke::NONE,
+                        ));
+                    } else if screen_pts.len() >= 2 {
+                        let stroke_w = (self.reg_mark_thickness_in * px_per_in).max(2.0);
+                        painter.add(egui::Shape::line(
+                            screen_pts,
+                            egui::Stroke::new(stroke_w, egui::Color32::BLACK),
+                        ));
+                    }
+                }
             }
 
             // Left-mouse tool interactions
@@ -3708,6 +4687,211 @@ impl eframe::App for StudioApp {
             }
         });
     }
+}
+
+pub fn find_font_file(family: &str, bold: bool, italic: bool) -> Option<std::path::PathBuf> {
+    let family_lower = family.to_lowercase();
+    let is_serif = family_lower.contains("serif");
+    let is_mono = family_lower.contains("mono");
+
+    let specific_candidates = if is_serif {
+        if bold && italic {
+            vec![
+                "/usr/share/fonts/liberation/LiberationSerif-BoldItalic.ttf",
+                "/usr/share/fonts/noto/NotoSerif-BoldItalic.ttf",
+            ]
+        } else if bold {
+            vec![
+                "/usr/share/fonts/liberation/LiberationSerif-Bold.ttf",
+                "/usr/share/fonts/noto/NotoSerif-Bold.ttf",
+            ]
+        } else if italic {
+            vec![
+                "/usr/share/fonts/liberation/LiberationSerif-Italic.ttf",
+                "/usr/share/fonts/noto/NotoSerif-Italic.ttf",
+            ]
+        } else {
+            vec![
+                "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSerif-Regular.ttf",
+            ]
+        }
+    } else if is_mono {
+        if bold && italic {
+            vec![
+                "/usr/share/fonts/liberation/LiberationMono-BoldItalic.ttf",
+                "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFontMono-BoldItalic.ttf",
+            ]
+        } else if bold {
+            vec![
+                "/usr/share/fonts/liberation/LiberationMono-Bold.ttf",
+                "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFontMono-Bold.ttf",
+            ]
+        } else if italic {
+            vec![
+                "/usr/share/fonts/liberation/LiberationMono-Italic.ttf",
+                "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFontMono-Italic.ttf",
+            ]
+        } else {
+            vec![
+                "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+                "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFontMono-Regular.ttf",
+            ]
+        }
+    } else {
+        if bold && italic {
+            vec![
+                "/usr/share/fonts/liberation/LiberationSans-BoldItalic.ttf",
+                "/usr/share/fonts/noto/NotoSans-BoldItalic.ttf",
+            ]
+        } else if bold {
+            vec![
+                "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+            ]
+        } else if italic {
+            vec![
+                "/usr/share/fonts/liberation/LiberationSans-Italic.ttf",
+                "/usr/share/fonts/noto/NotoSans-Italic.ttf",
+            ]
+        } else {
+            vec![
+                "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            ]
+        }
+    };
+
+    for path_str in specific_candidates {
+        let p = std::path::PathBuf::from(path_str);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    let fallbacks = [
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFontMono-Bold.ttf",
+    ];
+    for path_str in &fallbacks {
+        let p = std::path::PathBuf::from(path_str);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn create_text_cut_path(
+    text: &str,
+    family: &str,
+    size_pt: f32,
+    bold: bool,
+    italic: bool,
+    letter_spacing_in: f32,
+    x: f32,
+    y: f32,
+    fill_color: egui::Color32,
+) -> Result<CanvasShape, String> {
+    use ab_glyph::{Font, FontRef, OutlineCurve};
+
+    let font_path = find_font_file(family, bold, italic)
+        .ok_or_else(|| "No system TTF font found on system".to_string())?;
+    let font_bytes = std::fs::read(&font_path)
+        .map_err(|e| format!("Failed to read font {}: {}", font_path.display(), e))?;
+    let font = FontRef::try_from_slice(&font_bytes)
+        .map_err(|e| format!("Invalid font file: {}", e))?;
+
+    let units_per_em = font.units_per_em().unwrap_or(1000.0) as f32;
+    let height_in = (size_pt / 72.0).max(0.1);
+    let s = height_in / units_per_em;
+    let baseline_y = y + height_in * 0.8;
+
+    let mut caret_x = x;
+    let mut all_points = Vec::new();
+    let mut svg_d = String::new();
+
+    for ch in text.chars() {
+        let glyph_id = font.glyph_id(ch);
+        let advance_in = font.h_advance_unscaled(glyph_id) * s;
+
+        if let Some(outline) = font.outline(glyph_id) {
+            for curve in outline.curves {
+                match curve {
+                    OutlineCurve::Line(p0, p1) => {
+                        let pt0 = egui::pos2(caret_x + p0.x * s, baseline_y - p0.y * s);
+                        let pt1 = egui::pos2(caret_x + p1.x * s, baseline_y - p1.y * s);
+                        all_points.push(pt0);
+                        all_points.push(pt1);
+                        svg_d.push_str(&format!("M {:.4} {:.4} L {:.4} {:.4} ", pt0.x, pt0.y, pt1.x, pt1.y));
+                    }
+                    OutlineCurve::Quad(p0, p1, p2) => {
+                        let pt0 = egui::pos2(caret_x + p0.x * s, baseline_y - p0.y * s);
+                        let pt1 = egui::pos2(caret_x + p1.x * s, baseline_y - p1.y * s);
+                        let pt2 = egui::pos2(caret_x + p2.x * s, baseline_y - p2.y * s);
+                        svg_d.push_str(&format!("M {:.4} {:.4} Q {:.4} {:.4}, {:.4} {:.4} ", pt0.x, pt0.y, pt1.x, pt1.y, pt2.x, pt2.y));
+                        for step in 0..=4 {
+                            let t = step as f32 / 4.0;
+                            let inv_t = 1.0 - t;
+                            let px = inv_t * inv_t * pt0.x + 2.0 * inv_t * t * pt1.x + t * t * pt2.x;
+                            let py = inv_t * inv_t * pt0.y + 2.0 * inv_t * t * pt1.y + t * t * pt2.y;
+                            all_points.push(egui::pos2(px, py));
+                        }
+                    }
+                    OutlineCurve::Cubic(p0, p1, p2, p3) => {
+                        let pt0 = egui::pos2(caret_x + p0.x * s, baseline_y - p0.y * s);
+                        let pt1 = egui::pos2(caret_x + p1.x * s, baseline_y - p1.y * s);
+                        let pt2 = egui::pos2(caret_x + p2.x * s, baseline_y - p2.y * s);
+                        let pt3 = egui::pos2(caret_x + p3.x * s, baseline_y - p3.y * s);
+                        svg_d.push_str(&format!("M {:.4} {:.4} C {:.4} {:.4}, {:.4} {:.4}, {:.4} {:.4} ", pt0.x, pt0.y, pt1.x, pt1.y, pt2.x, pt2.y, pt3.x, pt3.y));
+                        for step in 0..=6 {
+                            let t = step as f32 / 6.0;
+                            let inv_t = 1.0 - t;
+                            let px = inv_t.powi(3) * pt0.x + 3.0 * inv_t.powi(2) * t * pt1.x + 3.0 * inv_t * t.powi(2) * pt2.x + t.powi(3) * pt3.x;
+                            let py = inv_t.powi(3) * pt0.y + 3.0 * inv_t.powi(2) * t * pt1.y + 3.0 * inv_t * t.powi(2) * pt2.y + t.powi(3) * pt3.y;
+                            all_points.push(egui::pos2(px, py));
+                        }
+                    }
+                }
+            }
+        }
+        caret_x += advance_in + letter_spacing_in;
+    }
+
+    if all_points.is_empty() {
+        return Err("No vector outlines extracted from text".to_string());
+    }
+
+    let min_x = all_points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+    let min_y = all_points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+    let max_x = all_points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+    let max_y = all_points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+
+    let mut shape = CanvasShape {
+        kind: ShapeKind::Freehand,
+        x: if min_x.is_finite() { min_x } else { x },
+        y: if min_y.is_finite() { min_y } else { y },
+        width: if max_x.is_finite() && min_x.is_finite() { (max_x - min_x).max(0.1) } else { 1.0 },
+        height: if max_y.is_finite() && min_y.is_finite() { (max_y - min_y).max(0.1) } else { 0.5 },
+        points: all_points,
+        text: svg_d.trim().to_string(),
+        fill_color,
+        stroke_color: Some(egui::Color32::from_rgb(255, 38, 38)),
+        stroke_width: 0.02,
+        is_closed: true,
+        is_svg_path: true,
+        is_modified: true,
+        triangles: Vec::new(),
+        group_id: None,
+        group_path: Vec::new(),
+        is_visible: true,
+        is_locked: false,
+        pixmap: None,
+        texture: None,
+    };
+    shape.precompute_triangles();
+    Ok(shape)
 }
 
 fn save_png(path: &str, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {
@@ -4590,5 +5774,353 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_craft_project_app_roundtrip() {
+        let mut app = StudioApp::new(None);
+        app.mat_width_in = 8.5;
+        app.mat_height_in = 11.0;
+        app.show_reg_marks = true;
+        app.reg_mark_inset_in = 0.3;
+
+        // Shape 1: Rectangle
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+            points: vec![],
+            text: String::new(),
+            fill_color: egui::Color32::from_rgb(255, 100, 50),
+            stroke_color: Some(egui::Color32::BLACK),
+            stroke_width: 0.05,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: Some(10),
+            group_path: vec![10],
+            is_visible: true,
+            is_locked: false,
+            pixmap: None,
+            texture: None,
+        });
+
+        // Shape 2: Freehand / Polygon with cached pixmap
+        let mut pm = tiny_skia::Pixmap::new(32, 32).unwrap();
+        pm.fill(tiny_skia::Color::from_rgba8(200, 50, 50, 255));
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Freehand,
+            x: 5.0,
+            y: 5.0,
+            width: 2.0,
+            height: 2.0,
+            points: vec![egui::pos2(5.0, 5.0), egui::pos2(7.0, 5.0), egui::pos2(6.0, 7.0)],
+            text: String::new(),
+            fill_color: egui::Color32::BLUE,
+            stroke_color: Some(egui::Color32::RED),
+            stroke_width: 0.02,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: Some(10),
+            group_path: vec![10],
+            is_visible: true,
+            is_locked: false,
+            pixmap: Some(pm),
+            texture: None,
+        });
+
+        app.group_names.insert(10, "Sticker Layer".to_string());
+        app.next_group_id = 11;
+
+        let tmp_craft = std::env::temp_dir().join(format!("test_project_{}.craft", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        app.save_craft_file(&tmp_craft).expect("save craft file");
+
+        let mut app2 = StudioApp::new(None);
+        app2.open_craft_file(&tmp_craft).expect("open craft file");
+        let _ = std::fs::remove_file(&tmp_craft);
+
+        assert_eq!(app2.mat_width_in, 8.5);
+        assert_eq!(app2.mat_height_in, 11.0);
+        assert!(app2.show_reg_marks);
+        assert!((app2.reg_mark_inset_in - 0.3).abs() < 1e-4);
+        assert_eq!(app2.shapes.len(), 2);
+        assert_eq!(app2.shapes[0].kind, ShapeKind::Rectangle);
+        assert_eq!(app2.shapes[0].group_id, Some(10));
+        assert_eq!(app2.group_names.get(&10), Some(&"Sticker Layer".to_string()));
+        assert!(app2.shapes[1].pixmap.is_some());
+        assert_eq!(app2.shapes[1].pixmap.as_ref().unwrap().width(), 32);
+    }
+
+    #[test]
+    fn test_vector_ops_offset_selected() {
+        let mut app = StudioApp::new(None);
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 2.0,
+            y: 2.0,
+            width: 2.0,
+            height: 2.0,
+            points: vec![],
+            text: String::new(),
+            fill_color: egui::Color32::RED,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: None,
+            group_path: vec![],
+            is_visible: true,
+            is_locked: false,
+            pixmap: None,
+            texture: None,
+        });
+
+        app.select_shape(0, false);
+        app.offset_distance_in = 0.25;
+        app.offset_selected();
+
+        assert_eq!(app.shapes.len(), 2, "offset shape should be added to shapes");
+        let offset_shape = &app.shapes[1];
+        assert_eq!(offset_shape.kind, ShapeKind::Freehand);
+        assert!(offset_shape.is_closed);
+        assert!(offset_shape.points.len() >= 4);
+        // Bounds should expand outward by ~0.25 on each side
+        assert!(offset_shape.x < 2.0);
+        assert!(offset_shape.y < 2.0);
+        assert!(offset_shape.width > 2.0);
+        assert!(offset_shape.height > 2.0);
+    }
+
+    #[test]
+    fn test_vector_ops_compound_path() {
+        let mut app = StudioApp::new(None);
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 1.0,
+            y: 1.0,
+            width: 4.0,
+            height: 4.0,
+            points: vec![],
+            text: String::new(),
+            fill_color: egui::Color32::BLUE,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: None,
+            group_path: vec![],
+            is_visible: true,
+            is_locked: false,
+            pixmap: None,
+            texture: None,
+        });
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 2.0,
+            y: 2.0,
+            width: 2.0,
+            height: 2.0,
+            points: vec![],
+            text: String::new(),
+            fill_color: egui::Color32::WHITE,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: None,
+            group_path: vec![],
+            is_visible: true,
+            is_locked: false,
+            pixmap: None,
+            texture: None,
+        });
+
+        app.select_shape(0, false);
+        app.select_shape(1, true);
+        assert_eq!(app.all_selected_indices().len(), 2);
+
+        // Make compound path
+        app.make_compound_path();
+        assert_eq!(app.shapes.len(), 1, "shapes should be combined into 1 compound path");
+        assert!(app.shapes[0].is_svg_path);
+        assert!(app.shapes[0].text.contains('M'));
+        assert!(app.shapes[0].text.contains('Z'));
+
+        // Release compound path
+        app.select_shape(0, false);
+        app.release_compound_path();
+        assert_eq!(app.shapes.len(), 2, "compound path should be split back into 2 shapes");
+    }
+
+    #[test]
+    fn test_vector_ops_weld() {
+        let mut app = StudioApp::new(None);
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 1.0,
+            y: 1.0,
+            width: 3.0,
+            height: 2.0,
+            points: vec![],
+            text: String::new(),
+            fill_color: egui::Color32::GREEN,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: None,
+            group_path: vec![],
+            is_visible: true,
+            is_locked: false,
+            pixmap: None,
+            texture: None,
+        });
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Rectangle,
+            x: 2.0,
+            y: 2.0,
+            width: 3.0,
+            height: 2.0,
+            points: vec![],
+            text: String::new(),
+            fill_color: egui::Color32::GREEN,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: None,
+            group_path: vec![],
+            is_visible: true,
+            is_locked: false,
+            pixmap: None,
+            texture: None,
+        });
+
+        app.select_shape(0, false);
+        app.select_shape(1, true);
+        app.weld_selected();
+
+        assert_eq!(app.shapes.len(), 1, "welded shapes should become 1 shape");
+        assert_eq!(app.shapes[0].kind, ShapeKind::Freehand);
+        assert!(app.shapes[0].is_closed);
+        assert_eq!(app.shapes[0].x, 1.0);
+        assert_eq!(app.shapes[0].y, 1.0);
+        assert_eq!(app.shapes[0].width, 4.0);
+        assert_eq!(app.shapes[0].height, 3.0);
+    }
+
+    #[test]
+    fn test_vector_ops_align() {
+        let mut app = StudioApp::new(None);
+        app.mat_width_in = 12.0;
+        app.mat_height_in = 12.0;
+
+        for i in 0..3 {
+            app.shapes.push(CanvasShape {
+                kind: ShapeKind::Rectangle,
+                x: (i * 2) as f32 + 1.0,
+                y: (i * 2) as f32 + 1.0,
+                width: 1.0,
+                height: 1.0,
+                points: vec![],
+                text: String::new(),
+                fill_color: egui::Color32::RED,
+                stroke_color: None,
+                stroke_width: 0.0,
+                is_closed: true,
+                is_svg_path: false,
+                is_modified: false,
+                triangles: vec![],
+                group_id: None,
+                group_path: vec![],
+                is_visible: true,
+                is_locked: false,
+                pixmap: None,
+                texture: None,
+            });
+        }
+
+        app.select_shape(0, false);
+        app.select_shape(1, true);
+        app.select_shape(2, true);
+
+        // Align left
+        app.align_selected(vector_ops::AlignAnchor::Left);
+        for s in &app.shapes {
+            assert!((s.x - 1.0).abs() < 1e-4, "all shapes should have x=1.0 after Left align");
+        }
+
+        // Align top
+        app.align_selected(vector_ops::AlignAnchor::Top);
+        for s in &app.shapes {
+            assert!((s.y - 1.0).abs() < 1e-4, "all shapes should have y=1.0 after Top align");
+        }
+    }
+
+    #[test]
+    fn test_text_to_cut_paths() {
+        let mut app = StudioApp::new(None);
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Text,
+            x: 2.0,
+            y: 3.0,
+            width: 2.0,
+            height: 0.6,
+            points: vec![],
+            text: "CRAFT".to_string(),
+            fill_color: egui::Color32::BLACK,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: false,
+            is_svg_path: false,
+            is_modified: false,
+            triangles: vec![],
+            group_id: None,
+            group_path: vec![],
+            is_visible: true,
+            is_locked: false,
+            pixmap: None,
+            texture: None,
+        });
+
+        app.select_shape(0, false);
+        app.convert_text_to_cut_paths();
+
+        assert_eq!(app.shapes.len(), 1);
+        let converted = &app.shapes[0];
+        assert_eq!(converted.kind, ShapeKind::Freehand);
+        assert!(converted.is_svg_path);
+        assert!(converted.points.len() > 0);
+        assert!(converted.stroke_color.is_some());
+        assert_eq!(converted.stroke_color.unwrap(), egui::Color32::from_rgb(255, 38, 38));
+    }
+
+    #[test]
+    fn test_registration_marks_in_svg_export() {
+        let mut app = StudioApp::new(None);
+        app.mat_width_in = 8.5;
+        app.mat_height_in = 11.0;
+        app.show_reg_marks = true;
+        app.reg_mark_inset_in = 0.25;
+
+        let svg = app.export_svg_string();
+        assert!(svg.contains("Registration Mark"));
+        assert!(svg.contains("<polygon points="));
+        assert!(svg.contains("<polyline points="));
     }
 }

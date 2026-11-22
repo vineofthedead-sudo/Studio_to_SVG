@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fdfbf7"/>
+      <stop offset="100%" stop-color="#eddac2"/>
+    </linearGradient>
+    <linearGradient id="blade-metal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f1faee"/>
+      <stop offset="100%" stop-color="#a8dadc"/>
+    </linearGradient>
+    <linearGradient id="handle-red" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff4d4d"/>
+      <stop offset="100%" stop-color="#c9182b"/>
+    </linearGradient>
+    <linearGradient id="handle-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#457b9d"/>
+      <stop offset="100%" stop-color="#1d3557"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="2" dy="4" stdDeviation="4" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+
+  <!-- App Card Background -->
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="url(#bg)" stroke="#d4bda0" stroke-width="4" filter="url(#shadow)"/>
+
+  <!-- Cutting Mat Grid Lines (Subtle) -->
+  <path d="M 40 88 H 216 M 40 128 H 216 M 40 168 H 216 M 88 40 V 216 M 128 40 V 216 M 168 40 V 216" stroke="#e2cfb7" stroke-width="1.5" stroke-dasharray="4,4"/>
+
+  <!-- Paper Cut Contour / Sticker Border -->
+  <path d="M 60 70 Q 128 40 196 70 Q 220 128 196 186 Q 128 216 60 186 Q 36 128 60 70 Z" fill="#ffffff" stroke="#ff2626" stroke-width="2.5" stroke-dasharray="6,4" filter="url(#shadow)"/>
+
+  <!-- Left Blade -->
+  <path d="M 128 128 L 180 50 C 182 48 185 48 186 51 L 188 56 L 138 134 Z" fill="url(#blade-metal)" stroke="#457b9d" stroke-width="1.5"/>
+
+  <!-- Right Blade -->
+  <path d="M 128 128 L 76 50 C 74 48 71 48 70 51 L 68 56 L 118 134 Z" fill="url(#blade-metal)" stroke="#457b9d" stroke-width="1.5"/>
+
+  <!-- Scissors Pivot -->
+  <circle cx="128" cy="128" r="9" fill="#1d3557" stroke="#f1faee" stroke-width="2.5"/>
+
+  <!-- Left Red Handle -->
+  <path d="M 124 132 L 95 168 C 85 180 65 185 52 172 C 39 159 44 139 56 129 L 88 105" fill="none" stroke="url(#handle-red)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="68" cy="155" r="16" fill="url(#bg)" stroke="url(#handle-red)" stroke-width="8"/>
+
+  <!-- Right Blue Handle -->
+  <path d="M 132 132 L 161 168 C 171 180 191 185 204 172 C 217 159 212 139 200 129 L 168 105" fill="none" stroke="url(#handle-blue)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="188" cy="155" r="16" fill="url(#bg)" stroke="url(#handle-blue)" stroke-width="8"/>
+
+  <!-- Sparkle Accent -->
+  <path d="M 188 44 Q 188 54 198 54 Q 188 54 188 64 Q 188 54 178 54 Q 188 54 188 44 Z" fill="#ffb703"/>
+</svg>
