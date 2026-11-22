@@ -2985,4 +2985,58 @@ mod tests {
         assert!(svg.contains("fill=\"#ff0000\"")); // Red character color preserved
         assert!(!svg.contains("Print Background"), "Must not emit full-mat background layer");
     }
+
+    #[test]
+    fn test_integration_large_studio3_unicorn_and_disney_hearts() {
+        // 1. Verify loading JUDITH UNICORN AND DINOSAUR.studio3 (~20 MB)
+        let unicorn_candidates = [
+            Path::new("../test_samples/JUDITH UNICORN AND DINOSAUR.studio3"),
+            Path::new("test_samples/JUDITH UNICORN AND DINOSAUR.studio3"),
+        ];
+        if let Some(path) = unicorn_candidates.iter().find(|p| p.exists()) {
+            let data = std::fs::read(path).expect("Read JUDITH UNICORN");
+            let doc = parse_studio_data(&data).expect("Parse JUDITH UNICORN");
+            assert_eq!(doc.version, StudioFormatVersion::StudioV5);
+            assert!(doc.shapes.len() >= 600, "Expected >= 600 shapes in JUDITH UNICORN");
+
+            // Verify bounded pixmap dimensions and bounded memory usage
+            let mut total_pm_bytes: usize = 0;
+            for s in &doc.shapes {
+                if let Some(ref pm) = s.pixmap {
+                    if s.is_svg_path {
+                        assert!(pm.width() <= 1024 && pm.height() <= 1024, "Vector shape pixmap must be capped at 1024x1024");
+                    }
+                    total_pm_bytes += pm.data().len();
+                }
+            }
+            assert!(total_pm_bytes < 50_000_000, "Pixmap RAM must be under 50 MB, got {:.2} MB", total_pm_bytes as f64 / 1_048_576.0);
+        }
+
+        // 2. Verify loading DISNEY HEARTS.studio3
+        let disney_candidates = [
+            Path::new("../test_samples/DISNEY HEARTS.studio3"),
+            Path::new("test_samples/DISNEY HEARTS.studio3"),
+        ];
+        if let Some(path) = disney_candidates.iter().find(|p| p.exists()) {
+            let data = std::fs::read(path).expect("Read DISNEY HEARTS");
+            let doc = parse_studio_data(&data).expect("Parse DISNEY HEARTS");
+            assert_eq!(doc.version, StudioFormatVersion::StudioV5);
+            assert!(doc.shapes.len() >= 10, "Expected >= 10 shapes in DISNEY HEARTS");
+            assert!(doc.pattern_swatch.is_some(), "DISNEY HEARTS must have pattern swatch");
+
+            // Verify heart shapes have visible cut outlines (#ff2626) and realistic dimensions
+            let mut heart_found = false;
+            for s in &doc.shapes {
+                if s.is_svg_path {
+                    let is_white = (s.fill_color.r() > 240 && s.fill_color.g() > 240 && s.fill_color.b() > 240) || s.fill_color == egui::Color32::WHITE;
+                    if is_white {
+                        heart_found = true;
+                        assert_eq!(s.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)), "Heart cut outline must be red (#ff2626)");
+                        assert!(s.width > 0.3 && s.height > 0.3, "Heart contour must not be collapsed");
+                    }
+                }
+            }
+            assert!(heart_found, "Must find visible white heart path");
+        }
+    }
 }

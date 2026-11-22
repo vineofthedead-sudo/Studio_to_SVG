@@ -13,13 +13,15 @@ All notable changes, architectural implementations, and roadmap milestones for t
   - Reduced default tiny_skia raster resolution from 150 DPI to 96 DPI for vector path cache shapes, slashing memory usage by >50% (Judith Unicorn 20 MB file total pixmap RAM dropped from 36.85 MB to 18.21 MB).
   - Deduplicated `egui::TextureHandle` allocations in `StudioApp::update` using `Arc::as_ptr` pointer mapping across shapes that share identical pixmaps or pattern swatches, preventing GPU memory exhaustion.
 - **Fixed White / Clipped Shape Visibility and Pattern Selective Fills (`app/src/studio_format.rs`, `app/src/main.rs`)**:
+  - Fixed root cause of microscopic heart contour in `DISNEY HEARTS.studio3`: `parse_paths` previously used a document-wide `doc_max_coord > 24.0` threshold that divided all clusters by 25.4 if any cluster had millimeter coordinates. Shape #11 (authentic inches: 2.20" x 1.89") was incorrectly scaled down to 0.086" (and shrunk on the mat to 0.02"). Fixed by computing `cluster_max_coord` per-cluster, restoring Shape #11 to its full 2.20" x 1.89" cut geometry.
   - In `main.rs` canvas rendering, vector cut outlines (`stroke_to_draw` / `#ff2626`) are now drawn on top of textures instead of early-exiting with `continue;`, ensuring cutlines are always clearly visible over pattern-filled shapes and images.
   - Ensured white-filled (`#ffffff`) or unstroked shapes receive visible `#ff2626` cut outlines in both `studio_format.rs` and the egui canvas fallback renderer.
   - Restricted `pattern_swatch` application to white/light or uncolored vector shapes (`is_white_or_light || fill_color.a() == 0`), preventing authentic solid colors (e.g. Mickey/Minnie clothes, face, black contours) from being overwritten by pattern swatches.
 - **Integration Testing & Test Suite Verification**:
+  - Added `test_integration_large_studio3_unicorn_and_disney_hearts` verifying that `JUDITH UNICORN AND DINOSAUR.studio3` (20 MB) and `DISNEY HEARTS.studio3` load cleanly without panics, unbounded memory allocations, or invisible heart paths.
   - Added `test_judith_unicorn_large_file_parsing` verifying that 20 MB `JUDITH UNICORN AND DINOSAUR.studio3` parses smoothly with 646 shapes in ~7 seconds, all vector shapes are capped to <= 1024×1024, total pixmap RAM stays < 50 MB, and white shapes have `#ff2626` cutlines.
   - Added `test_disney_hearts_pattern_clipping_and_visible_cutlines` asserting pattern swatch extraction, visible red cut outlines on heart shapes, solid color preservation on character shapes, and correct SVG export without unclipped background layers.
-  - All 64 unit and integration tests passing (`cargo test`); release binary verified (`cargo build --release`).
+  - All 65 unit and integration tests passing (`cargo test`); release binary verified (`cargo build --release`).
 
 ---
 
