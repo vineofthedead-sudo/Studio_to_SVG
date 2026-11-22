@@ -188,6 +188,7 @@ pub struct ParsedStudioDocument {
     pub mat_height_in: f32,
     pub shapes: Vec<CanvasShape>,
     pub group_names: BTreeMap<u64, String>,
+    pub pattern_swatch: Option<tiny_skia::Pixmap>,
 }
 
 /// Detects the file version and the byte offsets defining the vector object stream [stream_start..stream_end].
@@ -305,8 +306,9 @@ pub fn parse_studio_data(data: &[u8]) -> Result<ParsedStudioDocument, StudioPars
     // 5. Detect and merge compound paths (e.g. concentric wheels with inner cutouts)
     let mut shapes = merge_compound_paths(shapes);
 
-    // 6. Extract embedded PNG raster image (e.g. Print & Cut artwork or preview) if present
-    if let Some(png_shape) = extract_embedded_png(data, mat_w_in, mat_h_in) {
+    // 6. Extract embedded PNG raster image (Print & Cut artwork vs repeating pattern swatch)
+    let (png_shape_opt, pattern_swatch) = extract_embedded_png(data, mat_w_in, mat_h_in);
+    if let Some(png_shape) = png_shape_opt {
         shapes.insert(0, png_shape);
     }
 
@@ -317,6 +319,7 @@ pub fn parse_studio_data(data: &[u8]) -> Result<ParsedStudioDocument, StudioPars
         mat_height_in: mat_h_in,
         shapes,
         group_names,
+        pattern_swatch,
     })
 }
 
@@ -448,6 +451,19 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
         w_in, h_in, w_in, h_in
     );
 
+    // If a pattern swatch is present, define it in <defs>
+    if let Some(ref swatch) = doc.pattern_swatch {
+        if let Ok(png_bytes) = swatch.encode_png() {
+            let b64 = base64_encode(&png_bytes);
+            svg.push_str("  <defs>\n");
+            svg.push_str(&format!(
+                "    <pattern id=\"swatch_pattern\" width=\"2.000\" height=\"2.000\" patternUnits=\"userSpaceOnUse\">\n      <image width=\"2.000\" height=\"2.000\" href=\"data:image/png;base64,{}\" />\n    </pattern>\n",
+                b64
+            ));
+            svg.push_str("  </defs>\n");
+        }
+    }
+
     // Group shapes by layer
     let mut layer_shapes: BTreeMap<Option<u64>, Vec<&CanvasShape>> = BTreeMap::new();
     for shape in &doc.shapes {
@@ -476,7 +492,9 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
                 }
             }
 
-            let fill_str = if shape.fill_color.a() == 0 {
+            let fill_str = if doc.pattern_swatch.is_some() && shape.fill_color.a() > 0 {
+                "fill=\"url(#swatch_pattern)\"".to_string()
+            } else if shape.fill_color.a() == 0 {
                 "fill=\"none\"".to_string()
             } else {
                 let hex = format!("#{:02x}{:02x}{:02x}", shape.fill_color.r(), shape.fill_color.g(), shape.fill_color.b());
@@ -940,6 +958,45 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         return shapes;
     }
 
+    // Pre-scan explicit Group records (primarily Studio V5 / silhouette05; files)
+    #[derive(Debug, Clone, Copy)]
+    struct StudioGroupRecord {
+        pos: usize,
+        transform: AffineTransform2D,
+    }
+
+    let mut group_records: Vec<StudioGroupRecord> = Vec::new();
+    let group_tag_prefixed = b"\x05\x00\x00\x00Group";
+    let mut g_idx = 0;
+    while g_idx + 5 <= stream.len() {
+        let is_prefixed = g_idx + 9 <= stream.len() && &stream[g_idx..g_idx + 9] == group_tag_prefixed;
+        let is_plain = &stream[g_idx..g_idx + 5] == b"Group";
+        if is_prefixed || is_plain {
+            let tag_offset = if is_prefixed { g_idx + 4 } else { g_idx };
+            // Scan backwards up to 200 bytes for the 3x3 matrix preceding this group closure
+            let bwd_start = tag_offset.saturating_sub(200);
+            if let Some(bwd_slice) = stream.get(bwd_start..tag_offset) {
+                if let Some(xfm) = find_transform_in_slice(bwd_slice) {
+                    group_records.push(StudioGroupRecord {
+                        pos: tag_offset,
+                        transform: xfm,
+                    });
+                }
+            }
+            g_idx = tag_offset + 5;
+            continue;
+        }
+        g_idx += 1;
+    }
+
+    // Macro/layer groups: Group records that immediately follow another Group record (within 350 bytes)
+    let mut macro_groups: Vec<StudioGroupRecord> = Vec::new();
+    for window in group_records.windows(2) {
+        if window[1].pos.saturating_sub(window[0].pos) < 350 {
+            macro_groups.push(window[1]);
+        }
+    }
+
     // Determine matrix and fill for each cluster
     let mut cluster_data: Vec<(AffineTransform2D, egui::Color32)> = Vec::new();
     let mut last_valid_xfm = AffineTransform2D::default();
@@ -971,32 +1028,51 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         }
 
         // B. Search for group-level transform:
-        // First look forward within the group interval [cluster.end_pos..group_end]
-        let mut group_xfm = None;
-        if gap_start < group_end {
-            if let Some(fwd_slice) = stream.get(gap_start..group_end) {
-                group_xfm = find_transform_in_slice(fwd_slice);
-            }
-        }
-        // If not found forward, look backward within the group [group_start..cluster.start_pos]
-        if group_xfm.is_none() && group_start < cluster.start_pos {
-            if let Some(bwd_slice) = stream.get(group_start..cluster.start_pos) {
-                group_xfm = find_transform_in_slice(bwd_slice);
-            }
-        }
+        let final_xfm = if !group_records.is_empty() {
+            // Studio V5 explicit hierarchical Group records:
+            let imm_group = group_records.iter().find(|g| g.pos >= cluster.end_pos).map(|g| g.transform);
+            let layer_group = macro_groups.iter().find(|g| g.pos >= cluster.end_pos).map(|g| g.transform);
 
-        // C. Combine transforms: parent * child
-        let final_xfm = match (group_xfm, local_xfm) {
-            (Some(parent), Some(child)) => {
-                if parent != child {
-                    parent.combine(&child)
-                } else {
-                    parent
+            let mut combined_group = AffineTransform2D::default();
+            if let Some(imm) = imm_group {
+                combined_group = imm;
+            }
+            if let Some(layer) = layer_group {
+                if Some(layer) != imm_group {
+                    combined_group = layer.combine(&combined_group);
                 }
             }
-            (Some(parent), None) => parent,
-            (None, Some(child)) => child,
-            (None, None) => last_valid_xfm,
+
+            match local_xfm {
+                Some(local) => combined_group.combine(&local),
+                None => combined_group,
+            }
+        } else {
+            // Studio V4: Group interval search
+            let mut group_xfm = None;
+            if gap_start < group_end {
+                if let Some(fwd_slice) = stream.get(gap_start..group_end) {
+                    group_xfm = find_transform_in_slice(fwd_slice);
+                }
+            }
+            if group_xfm.is_none() && group_start < cluster.start_pos {
+                if let Some(bwd_slice) = stream.get(group_start..cluster.start_pos) {
+                    group_xfm = find_transform_in_slice(bwd_slice);
+                }
+            }
+
+            match (group_xfm, local_xfm) {
+                (Some(parent), Some(child)) => {
+                    if parent != child {
+                        parent.combine(&child)
+                    } else {
+                        parent
+                    }
+                }
+                (Some(parent), None) => parent,
+                (None, Some(child)) => child,
+                (None, None) => last_valid_xfm,
+            }
         };
         last_valid_xfm = final_xfm;
 
@@ -1703,33 +1779,73 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Extracts embedded PNG raster image (e.g. Print & Cut artwork or preview) from Studio data.
-fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> Option<CanvasShape> {
+/// Extracts embedded PNG raster image (e.g. Print & Cut artwork or preview or pattern swatch) from Studio data.
+/// Differentiates between repeating pattern swatches (e.g. square power-of-two texture tiles like 512x512)
+/// and actual positioned Print & Cut raster images.
+fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<CanvasShape>, Option<tiny_skia::Pixmap>) {
     // 1. Search for PNG signature in data
-    let png_start = find_subsequence(data, &PNG_SIGNATURE)?;
-    let png_data_slice = data.get(png_start..)?;
+    let png_start = match find_subsequence(data, &PNG_SIGNATURE) {
+        Some(pos) => pos,
+        None => return (None, None),
+    };
+    let png_data_slice = match data.get(png_start..) {
+        Some(s) => s,
+        None => return (None, None),
+    };
 
     // 2. Locate IEND chunk to find the end of the PNG stream
     let iend_marker = b"IEND";
-    let iend_offset = find_subsequence(png_data_slice, iend_marker)?;
+    let iend_offset = match find_subsequence(png_data_slice, iend_marker) {
+        Some(off) => off,
+        None => return (None, None),
+    };
     let png_len = iend_offset.saturating_add(8); // include "IEND" (4) + CRC (4)
-    let png_bytes = png_data_slice.get(..png_len)?;
+    let png_bytes = match png_data_slice.get(..png_len) {
+        Some(b) => b,
+        None => return (None, None),
+    };
 
     // 3. Decode PNG to tiny_skia::Pixmap
-    let pixmap = decode_png_to_pixmap(png_bytes)?;
+    let pixmap = match decode_png_to_pixmap(png_bytes) {
+        Some(pm) => pm,
+        None => return (None, None),
+    };
 
-    // 4. Create CanvasShape covering the mat underneath the cut vectors
-    Some(CanvasShape {
+    let w = pixmap.width();
+    let h = pixmap.height();
+    let is_square = w == h;
+    let is_power_of_two = (w & (w - 1)) == 0;
+    let is_pattern_swatch = is_square && (is_power_of_two || w <= 1024);
+
+    if is_pattern_swatch {
+        // Pattern swatch: do NOT create an opaque 12"x12" full-mat rectangle covering the grid!
+        // Return as pattern_swatch for clipping/filling inside shapes and SVG <pattern> exports.
+        return (None, Some(pixmap));
+    }
+
+    // Actual positioned Print & Cut raster image:
+    // Place on mat with natural aspect ratio underneath cut vectors
+    let img_aspect = w as f32 / h.max(1) as f32;
+    let mat_aspect = mat_w_in / mat_h_in.max(0.1);
+    let (shape_w, shape_h) = if img_aspect > mat_aspect {
+        (mat_w_in, mat_w_in / img_aspect)
+    } else {
+        (mat_h_in * img_aspect, mat_h_in)
+    };
+    let shape_x = ((mat_w_in - shape_w) * 0.5).max(0.0);
+    let shape_y = ((mat_h_in - shape_h) * 0.5).max(0.0);
+
+    let shape = CanvasShape {
         kind: ShapeKind::Rectangle,
-        x: 0.0,
-        y: 0.0,
-        width: mat_w_in,
-        height: mat_h_in,
+        x: shape_x,
+        y: shape_y,
+        width: shape_w,
+        height: shape_h,
         points: vec![
-            egui::pos2(0.0, 0.0),
-            egui::pos2(mat_w_in, 0.0),
-            egui::pos2(mat_w_in, mat_h_in),
-            egui::pos2(0.0, mat_h_in),
+            egui::pos2(shape_x, shape_y),
+            egui::pos2(shape_x + shape_w, shape_y),
+            egui::pos2(shape_x + shape_w, shape_y + shape_h),
+            egui::pos2(shape_x, shape_y + shape_h),
         ],
         text: String::new(),
         fill_color: egui::Color32::WHITE,
@@ -1743,10 +1859,12 @@ fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> Option<Can
         group_path: Vec::new(),
         is_visible: true,
         is_locked: true,
-        name: Some("Print Background".to_string()),
-        pixmap: Some(pixmap),
+        name: Some("Print Artwork".to_string()),
+        pixmap: Some(pixmap.clone()),
         texture: None,
-    })
+    };
+
+    (Some(shape), Some(pixmap))
 }
 
 /// Robustly decodes PNG bytes to tiny_skia::Pixmap.
@@ -2202,6 +2320,8 @@ mod tests {
         let sample2_candidates = [
             Path::new("../test_samples/DISNEY HEARTS.studio3"),
             Path::new("test_samples/DISNEY HEARTS.studio3"),
+            Path::new("../test_samples/disney.studio3"),
+            Path::new("test_samples/disney.studio3"),
         ];
 
         let p1 = sample1_candidates.iter().find(|p| p.exists());
@@ -2255,10 +2375,17 @@ mod tests {
             let doc2 = parse_studio_file(path2).expect("Parse DISNEY HEARTS.studio3");
             assert_eq!(doc2.version, StudioFormatVersion::StudioV5);
             assert!(doc2.shapes.len() >= 100, "Expected >= 100 shapes in DISNEY HEARTS, got {}", doc2.shapes.len());
-            // Verify embedded PNG raster artwork was extracted onto bottom shape
-            assert!(doc2.shapes[0].pixmap.is_some(), "Expected embedded PNG raster artwork on doc2.shapes[0]");
-            assert_eq!(doc2.shapes[0].width, doc2.mat_width_in);
-            assert_eq!(doc2.shapes[0].height, doc2.mat_height_in);
+
+            // Verify pattern swatch extracted from Sec 2 without creating a giant obscuring rectangle
+            assert!(doc2.pattern_swatch.is_some(), "Expected pattern swatch extracted from Sec 2");
+            let swatch = doc2.pattern_swatch.as_ref().unwrap();
+            assert_eq!(swatch.width(), 512);
+            assert_eq!(swatch.height(), 512);
+
+            let mut min_x = f32::MAX;
+            let mut min_y = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut max_y = f32::MIN;
 
             for shape in &doc2.shapes {
                 assert!(shape.width > 0.0);
@@ -2267,10 +2394,22 @@ mod tests {
                 assert!(shape.y.is_finite());
                 assert!(shape.x >= 0.0 && shape.x <= doc2.mat_width_in);
                 assert!(shape.y >= 0.0 && shape.y <= doc2.mat_height_in);
+
+                min_x = min_x.min(shape.x);
+                min_y = min_y.min(shape.y);
+                max_x = max_x.max(shape.x + shape.width);
+                max_y = max_y.max(shape.y + shape.height);
             }
+
+            // Verify shapes span across the 12x12 mat in both dimensions and are not collapsed into a line
+            let span_x = max_x - min_x;
+            let span_y = max_y - min_y;
+            assert!(span_x > 4.0, "Expected shapes to span across width, got span_x = {:.2} in", span_x);
+            assert!(span_y > 4.0, "Expected shapes to span across height, got span_y = {:.2} in", span_y);
 
             let svg2 = convert_studio_to_svg(&std::fs::read(path2).unwrap()).expect("Convert DISNEY HEARTS to SVG");
             assert!(svg2.contains("<svg"));
+            assert!(svg2.contains("<pattern id=\"swatch_pattern\""));
             assert!(svg2.contains("<image"));
             assert!(svg2.contains("href=\"data:image/png;base64,"));
             assert!(svg2.contains("<polygon") || svg2.contains("<polyline") || svg2.contains("<path"));

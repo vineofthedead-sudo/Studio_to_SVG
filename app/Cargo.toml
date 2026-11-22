@@ -1,5 +1,5 @@
 [package]
-name = "ss_rebuild"
+name = "studio-to-svg"
 version = "0.1.0"
 edition = "2021"
 

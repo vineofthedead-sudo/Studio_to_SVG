@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
   <mime-type type="application/x-craft">
-    <comment>Craft Anything Project</comment>
-    <comment xml:lang="en">Craft Anything Project</comment>
+    <comment>Studio to SVG Project</comment>
+    <comment xml:lang="en">Studio to SVG Project</comment>
     <glob pattern="*.craft"/>
-    <icon name="craft-anything"/>
+    <icon name="studio-to-svg"/>
   </mime-type>
   <mime-type type="application/x-studio">
     <comment>Silhouette Studio Design</comment>
     <comment xml:lang="en">Silhouette Studio Design</comment>
     <glob pattern="*.studio"/>
     <glob pattern="*.studio3"/>
-    <icon name="craft-anything"/>
+    <icon name="studio-to-svg"/>
   </mime-type>
 </mime-info>

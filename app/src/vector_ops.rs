@@ -1,4 +1,4 @@
-//! Vector operations for Craft Anything papercraft design studio.
+//! Vector operations for Studio to SVG vector & papercraft design studio.
 //! All functions are panic-free and use safe bounds checking.
 
 use egui::{Pos2, Vec2};

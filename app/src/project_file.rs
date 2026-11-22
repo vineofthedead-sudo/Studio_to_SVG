@@ -1,6 +1,6 @@
 //! `.craft` project file format (plain JSON, version 2).
 //!
-//! Implements serialisation/deserialisation for the Craft Anything papercraft
+//! Implements serialisation/deserialisation for the Studio to SVG vector
 //! design studio, plus a dependency-free base64 codec used to embed raster
 //! pixmaps inside the JSON document.
 
@@ -99,7 +99,7 @@ pub struct CraftProject {
     /// File-format version — currently `2`.
     pub version: u32,
 
-    /// Application identifier — `"Craft Anything"`.
+    /// Application identifier — `"Studio to SVG"` (legacy: `"Craft Anything"`).
     pub app_name: String,
 
     /// Design-mat width in inches.

@@ -1,6 +1,32 @@
 # Changelog & Session Handoff
 
-All notable changes, architectural implementations, and roadmap milestones for the Silhouette Studio Linux rebuild (`ss_rebuild`).
+All notable changes, architectural implementations, and roadmap milestones for the Studio to SVG Linux application (`studio-to-svg`).
+
+---
+
+## [0.4.6] - 2026-11-22
+
+### Added & Improved
+- **Complete Rebrand to Studio to SVG (`studio-to-svg`)**:
+  - Full repo-wide rebranding across all layers: package name `studio-to-svg` in `Cargo.toml`, binary executable `studio-to-svg`, main window title `"Studio to SVG"`, CLI `--help` text, and README. Zero legacy references to `Craft Anything` or `ss_rebuild`.
+  - Renamed desktop assets and MIME configurations:
+    - `craft-anything.desktop` -> `studio-to-svg.desktop` (`Name=Studio to SVG`, `Exec=studio-to-svg %F`, `Icon=studio-to-svg`, `StartupWMClass=studio-to-svg`).
+    - `craft-anything-mime.xml` -> `studio-to-svg-mime.xml`.
+    - `assets/craft-anything.svg` / `.png` -> `assets/studio-to-svg.svg` / `.png`.
+  - Updated `install_desktop.sh` to install `studio-to-svg` binary, icons, desktop launcher, and default MIME associations, with automatic cleanup of legacy `craft-anything` files.
+  - Maintained backward compatibility for `.craft` project files, deserializing legacy projects seamlessly.
+- **Hierarchical Affine Transform Resolution for `.studio3` (`silhouette05;`) (`app/src/studio_format.rs`)**:
+  - Identified and decoded explicit Studio V5 `Group` records (`05 00 00 00 Group`) and macro group container records across the object stream.
+  - Implemented multi-level affine matrix multiplication (`layer_group * row_group * local_transform`), properly mapping row offsets (`ty`) and macro layer offsets (`tx`).
+  - Fixed the collapsed coordinate bug in multi-shape `.studio3` designs (such as `DISNEY HEARTS.studio3`), properly distributing 435+ vector shapes across the entire 12"×12" mat (spanning > 5" in width and height) rather than flattening onto a 0.5" horizontal line.
+- **Decoupled Pattern Swatches from Full-Mat Raster Overlays (`app/src/studio_format.rs`)**:
+  - Differentiated square power-of-two texture tiles (such as the 512×512 swatch in Sec 2 of `DISNEY HEARTS.studio3`) from positioned Print & Cut document raster images.
+  - Eliminated the giant opaque 12"×12" white background rectangle that previously obscured the grid mat and cut lines.
+  - Added `pattern_swatch: Option<tiny_skia::Pixmap>` to `ParsedStudioDocument`.
+  - Updated `convert_studio_to_svg` to export `<pattern id="swatch_pattern" ...>` with base64 embedded image data, rendering clean cut outlines (`stroke="#ff2626"`) directly visible on top.
+- **Automated Verification & Tests (`app/src/studio_format.rs`)**:
+  - Updated `test_real_sample_files_verification` asserting `doc2.pattern_swatch` extraction (512×512 pixmap) and verifying vector shape bounding span > 4.0 inches across both mat dimensions.
+  - All 60 unit and integration tests passing (`cargo test`), release binary cleanly compiled.
 
 ---
 

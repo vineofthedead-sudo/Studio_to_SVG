@@ -1,6 +1,6 @@
-# Silhouette Studio Linux Rebuild (`Craft Anything` / `ss_rebuild`)
+# Studio to SVG (`studio-to-svg`)
 
-A lightweight, native Linux replacement for Silhouette Studio built in Rust with `egui`, `tiny-skia`, `usvg`, and `resvg`. It provides an interactive cutting mat canvas for preparing, editing, previewing, and exporting vinyl cutting and scrapbooking designs.
+A lightweight, native Linux replacement for Silhouette Studio built in Rust with `egui`, `tiny-skia`, `usvg`, and `resvg`. It provides an interactive cutting mat canvas for preparing, editing, previewing, and exporting vinyl cutting and scrapbooking designs to SVG.
 
 ---
 
@@ -36,7 +36,7 @@ A lightweight, native Linux replacement for Silhouette Studio built in Rust with
   - Compound paths & hole punching: detects concentric same-color contours (e.g. wheels, cutouts) and punches holes cleanly using `FillRule::EvenOdd`.
   - Flattens Bézier curves via adaptive de Casteljau subdivision into smooth canvas polylines.
   - **Batch Converter**: One-click folder batch conversion preserving both vector paths and embedded raster layers, exporting clean `.svg` files for entire directories with status reporting.
-  - **CLI File Loading**: Direct command-line file loading and headless verification via `ss_rebuild <file> --screenshot <path>`.
+  - **CLI File Loading**: Direct command-line file loading and headless verification via `studio-to-svg <file> --screenshot <path>`.
 - **High-Performance SVG Import**:
   - Parses complex multi-layer commercial SVG cutting files with `usvg` 0.45.
   - Renders exact SVG styles, CSS classes, linear/radial gradients, and `FillRule::EvenOdd` cutouts into a cached `egui::TextureHandle` via `resvg` 0.45.
@@ -77,17 +77,17 @@ A lightweight, native Linux replacement for Silhouette Studio built in Rust with
 
 ## Desktop Integration (Linux)
 
-To install Craft Anything as a first-class Linux desktop application:
+To install Studio to SVG as a first-class Linux desktop application:
 
 ```bash
 ./install_desktop.sh
 ```
 
 This will:
-1. Build the optimized release binary (`ss_rebuild`).
-2. Install the executable as `/usr/local/bin/craft-anything`.
-3. Install high-resolution vector and raster icons (`assets/craft-anything.svg` and `craft-anything.png`).
-4. Install `craft-anything.desktop` into `/usr/share/applications/` (or `~/.local/share/applications/`).
+1. Build the optimized release binary (`studio-to-svg`).
+2. Install the executable as `/usr/local/bin/studio-to-svg`.
+3. Install high-resolution vector and raster icons (`assets/studio-to-svg.svg` and `studio-to-svg.png`).
+4. Install `studio-to-svg.desktop` into `/usr/share/applications/` (or `~/.local/share/applications/`).
 5. Register MIME type associations for `.craft`, `.studio`, `.studio3`, and `.svg` files.
 
 ---
@@ -131,5 +131,5 @@ cargo test --manifest-path app/Cargo.toml
 To capture a high-resolution screenshot without a display server (e.g. in CI or SSH):
 
 ```bash
-xvfb-run -a -s "-screen 0 1280x800x24" ./app/target/release/ss_rebuild "test_samples/Peeker Bears.studio" --screenshot /tmp/screenshot.png
+xvfb-run -a -s "-screen 0 1280x800x24" ./app/target/release/studio-to-svg "test_samples/Peeker Bears.studio" --screenshot /tmp/screenshot.png
 ```

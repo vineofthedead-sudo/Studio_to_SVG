@@ -11,7 +11,19 @@ fn main() -> eframe::Result<()> {
     let mut initial_files = Vec::new();
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--screenshot" && i + 1 < args.len() {
+        if args[i] == "--help" || args[i] == "-h" {
+            println!("Studio to SVG (studio-to-svg)");
+            println!("Native Silhouette Studio (.studio, .studio3) and SVG Vector Crafting Studio for Linux\n");
+            println!("Usage: studio-to-svg [OPTIONS] [FILES...]\n");
+            println!("Options:");
+            println!("  -h, --help               Display this help text and exit");
+            println!("  --screenshot <PATH>      Capture an offscreen raster preview (PNG) and exit");
+            println!("\nSupported File Formats:");
+            println!("  *.studio, *.studio3     Silhouette Studio v4 & v5 binary files");
+            println!("  *.svg                   Scalable Vector Graphics");
+            println!("  *.craft                 Studio to SVG native project format");
+            return Ok(());
+        } else if args[i] == "--screenshot" && i + 1 < args.len() {
             screenshot_path = Some(args[i + 1].clone());
             i += 2;
         } else if !args[i].starts_with("--") {
@@ -21,10 +33,10 @@ fn main() -> eframe::Result<()> {
             i += 1;
         }
     }
-    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]).with_title("Silhouette Studio");
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]).with_title("Studio to SVG");
     if screenshot_path.is_some() { viewport = viewport.with_active(false); }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("Silhouette Studio", options, Box::new(move |_cc| {
+    eframe::run_native("Studio to SVG", options, Box::new(move |_cc| {
         let mut app = StudioApp::new(screenshot_path);
         for file in initial_files {
             app.load_file(Path::new(&file));
@@ -1234,7 +1246,7 @@ impl StudioApp {
             let stem = self.active_tab_stem();
             let dir = self.active_tab_dir();
             let mut dialog = rfd::FileDialog::new()
-                .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                .add_filter("Studio to SVG Project (*.craft)", &["craft"])
                 .set_file_name(format!("{}.craft", stem));
             if let Some(d) = dir {
                 dialog = dialog.set_directory(d);
@@ -2006,7 +2018,7 @@ impl StudioApp {
 
         let project = project_file::CraftProject {
             version: 2,
-            app_name: "Craft Anything".to_string(),
+            app_name: "Studio to SVG".to_string(),
             mat_width_in: self.mat_width_in,
             mat_height_in: self.mat_height_in,
             shapes: self.shapes.iter().map(|s| s.to_craft_shape()).collect(),
@@ -3903,7 +3915,7 @@ impl eframe::App for StudioApp {
                     let stem = self.active_tab_stem();
                     let dir = self.active_tab_dir();
                     let mut dialog = rfd::FileDialog::new()
-                        .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                        .add_filter("Studio to SVG Project (*.craft)", &["craft"])
                         .set_file_name(format!("{}.craft", stem));
                     if let Some(d) = dir {
                         dialog = dialog.set_directory(d);
@@ -3918,7 +3930,7 @@ impl eframe::App for StudioApp {
                 let stem = self.active_tab_stem();
                 let dir = self.active_tab_dir();
                 let mut dialog = rfd::FileDialog::new()
-                    .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                    .add_filter("Studio to SVG Project (*.craft)", &["craft"])
                     .set_file_name(format!("{}.craft", stem));
                 if let Some(d) = dir {
                     dialog = dialog.set_directory(d);
@@ -4008,7 +4020,7 @@ impl eframe::App for StudioApp {
                     if ui.button("Open Project (.craft)... (Ctrl+O)").clicked() {
                         let dir = self.active_tab_dir();
                         let mut dialog = rfd::FileDialog::new()
-                            .add_filter("Craft Anything Project (*.craft)", &["craft"]);
+                            .add_filter("Studio to SVG Project (*.craft)", &["craft"]);
                         if let Some(d) = dir {
                             dialog = dialog.set_directory(d);
                         }
@@ -4030,7 +4042,7 @@ impl eframe::App for StudioApp {
                             let stem = self.active_tab_stem();
                             let dir = self.active_tab_dir();
                             let mut dialog = rfd::FileDialog::new()
-                                .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                                .add_filter("Studio to SVG Project (*.craft)", &["craft"])
                                 .set_file_name(format!("{}.craft", stem));
                             if let Some(d) = dir {
                                 dialog = dialog.set_directory(d);
@@ -4048,7 +4060,7 @@ impl eframe::App for StudioApp {
                         let stem = self.active_tab_stem();
                         let dir = self.active_tab_dir();
                         let mut dialog = rfd::FileDialog::new()
-                            .add_filter("Craft Anything Project (*.craft)", &["craft"])
+                            .add_filter("Studio to SVG Project (*.craft)", &["craft"])
                             .set_file_name(format!("{}.craft", stem));
                         if let Some(d) = dir {
                             dialog = dialog.set_directory(d);
