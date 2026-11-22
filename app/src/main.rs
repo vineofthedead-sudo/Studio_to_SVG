@@ -85,7 +85,7 @@ pub struct CanvasShape {
     pub is_visible: bool,
     pub is_locked: bool,
     pub name: Option<String>,
-    pub pixmap: Option<tiny_skia::Pixmap>,
+    pub pixmap: Option<std::sync::Arc<tiny_skia::Pixmap>>,
     pub texture: Option<egui::TextureHandle>,
 }
 
@@ -314,7 +314,7 @@ impl CanvasShape {
 
         let pixmap = s.pixmap_b64.as_deref().and_then(|b64| {
             if let Ok(bytes) = project_file::base64_decode_bytes(b64) {
-                tiny_skia::Pixmap::decode_png(&bytes).ok()
+                tiny_skia::Pixmap::decode_png(&bytes).ok().map(std::sync::Arc::new)
             } else {
                 None
             }
@@ -2884,7 +2884,7 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
                 let sx = (shape.width * dpi) / pm.width() as f32;
                 let sy = (shape.height * dpi) / pm.height() as f32;
                 let ts = tiny_skia::Transform::from_scale(sx, sy).post_translate(shape.x * dpi, shape.y * dpi);
-                pixmap.draw_pixmap(0, 0, pm.as_ref(), &tiny_skia::PixmapPaint::default(), ts, None);
+                pixmap.draw_pixmap(0, 0, (&**pm).as_ref(), &tiny_skia::PixmapPaint::default(), ts, None);
                 continue;
             }
             if let Some(gid) = shape.group_id {
@@ -3468,7 +3468,7 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
             is_visible: true,
             is_locked: false,
             name: None,
-            pixmap,
+            pixmap: pixmap.map(std::sync::Arc::new),
             texture: None,
         })
     }
@@ -3852,19 +3852,32 @@ fn draw_filled_polygon(
 }
 impl eframe::App for StudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Load textures for shapes if not loaded yet
+        // Load textures for shapes if not loaded yet (deduplicating handles across identical Arc<Pixmap> references)
+        let mut loaded_handles: std::collections::HashMap<*const tiny_skia::Pixmap, egui::TextureHandle> = std::collections::HashMap::new();
+        for shape in &self.shapes {
+            if let (Some(ref pm), Some(ref tex)) = (&shape.pixmap, &shape.texture) {
+                loaded_handles.insert(std::sync::Arc::as_ptr(pm), tex.clone());
+            }
+        }
         for (i, shape) in self.shapes.iter_mut().enumerate() {
             if shape.texture.is_none() {
                 if let Some(ref pm) = shape.pixmap {
-                    let img = egui::ColorImage::from_rgba_premultiplied(
-                        [pm.width() as usize, pm.height() as usize],
-                        pm.data(),
-                    );
-                    shape.texture = Some(ctx.load_texture(
-                        format!("shape_tex_{}", i),
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    let ptr = std::sync::Arc::as_ptr(pm);
+                    if let Some(existing_tex) = loaded_handles.get(&ptr) {
+                        shape.texture = Some(existing_tex.clone());
+                    } else {
+                        let img = egui::ColorImage::from_rgba_premultiplied(
+                            [pm.width() as usize, pm.height() as usize],
+                            pm.data(),
+                        );
+                        let tex = ctx.load_texture(
+                            format!("shape_tex_{}", i),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        loaded_handles.insert(ptr, tex.clone());
+                        shape.texture = Some(tex);
+                    }
                 }
             }
         }
@@ -5489,13 +5502,70 @@ impl eframe::App for StudioApp {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
+
+                    // Ensure vector cut-line contours are visible on top of pattern/image textures
+                    let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
+                    let stroke_to_draw = shape.stroke_color.and_then(|c| {
+                        if c.a() > 0 && !(c.r() > 240 && c.g() > 240 && c.b() > 240) {
+                            let sw = (shape.stroke_width * px_per_in).max(1.0);
+                            Some(egui::Stroke::new(sw, c))
+                        } else {
+                            None
+                        }
+                    }).or_else(|| {
+                        if is_white_or_light || shape.fill_color.a() == 0 || shape.stroke_color.is_some() {
+                            Some(egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 38, 38)))
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some(s) = stroke_to_draw {
+                        if shape.is_svg_path && shape.text.matches('M').count() > 1 {
+                            let subpaths: Vec<&str> = shape.text.split('M').filter(|s| !s.trim().is_empty()).collect();
+                            for sub in subpaths {
+                                let nums: Vec<f32> = sub
+                                    .split(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                                    .filter_map(|s| s.parse::<f32>().ok())
+                                    .collect();
+                                let mut sub_screen = Vec::new();
+                                for chunk in nums.chunks(2) {
+                                    if chunk.len() == 2 {
+                                        sub_screen.push(mat_to_screen(egui::pos2(chunk[0], chunk[1])));
+                                    }
+                                }
+                                if sub_screen.len() >= 2 {
+                                    let mut closed = sub_screen.clone();
+                                    if let (Some(f), Some(l)) = (closed.first(), closed.last()) {
+                                        if (*f - *l).length() > 0.5 { closed.push(*f); }
+                                    }
+                                    painter.add(egui::Shape::line(closed, s));
+                                }
+                            }
+                        } else if shape.points.len() >= 2 {
+                            let mut screen_pts: Vec<egui::Pos2> = shape.points.iter().map(|&p| mat_to_screen(p)).collect();
+                            if shape.is_closed {
+                                if let (Some(f), Some(l)) = (screen_pts.first(), screen_pts.last()) {
+                                    if (*f - *l).length() > 0.5 { screen_pts.push(*f); }
+                                }
+                            }
+                            painter.add(egui::Shape::line(screen_pts, s));
+                        }
+                    }
                     continue;
                 }
 
+                let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
                 let stroke_opt = shape.stroke_color.and_then(|c| {
-                    if c.a() > 0 {
+                    if c.a() > 0 && !(c.r() > 240 && c.g() > 240 && c.b() > 240) {
                         let sw = (shape.stroke_width * px_per_in).max(1.0);
                         Some(egui::Stroke::new(sw, c))
+                    } else {
+                        None
+                    }
+                }).or_else(|| {
+                    if is_white_or_light || shape.fill_color.a() == 0 {
+                        Some(egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 38, 38)))
                     } else {
                         None
                     }
@@ -6939,7 +7009,7 @@ mod tests {
             is_visible: true,
             is_locked: false,
             name: None,
-            pixmap: Some(pm),
+            pixmap: Some(std::sync::Arc::new(pm)),
             texture: None,
         });
 

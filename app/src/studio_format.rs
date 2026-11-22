@@ -188,7 +188,7 @@ pub struct ParsedStudioDocument {
     pub mat_height_in: f32,
     pub shapes: Vec<CanvasShape>,
     pub group_names: BTreeMap<u64, String>,
-    pub pattern_swatch: Option<tiny_skia::Pixmap>,
+    pub pattern_swatch: Option<std::sync::Arc<tiny_skia::Pixmap>>,
 }
 
 /// Detects the file version and the byte offsets defining the vector object stream [stream_start..stream_end].
@@ -301,13 +301,13 @@ pub fn parse_studio_data(data: &[u8]) -> Result<ParsedStudioDocument, StudioPars
     let (png_shape_opt, pattern_swatch) = extract_embedded_png(data, mat_w_in, mat_h_in);
 
     // 4. Parse cubic Bézier paths with pattern_swatch reference
-    let mut shapes = parse_paths(stream, &layer_name_by_id, pattern_swatch.as_ref());
+    let mut shapes = parse_paths(stream, &layer_name_by_id, pattern_swatch.as_deref());
 
     // 5. Normalize and center shapes onto the mat canvas
     normalize_shapes_onto_mat(&mut shapes, mat_w_in, mat_h_in);
 
     // 6. Detect and merge compound paths (e.g. concentric wheels with inner cutouts)
-    let mut shapes = merge_compound_paths(shapes, pattern_swatch.as_ref());
+    let mut shapes = merge_compound_paths(shapes, pattern_swatch.as_deref());
 
     // 7. Add positioned Print & Cut artwork (if any, placed under vector shapes)
     if let Some(png_shape) = png_shape_opt {
@@ -494,7 +494,8 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
                 }
             }
 
-            let fill_str = if doc.pattern_swatch.is_some() && shape.fill_color.a() > 0 {
+            let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
+            let fill_str = if doc.pattern_swatch.is_some() && (is_white_or_light || shape.fill_color.a() == 0) {
                 "fill=\"url(#swatch_pattern)\"".to_string()
             } else if shape.fill_color.a() == 0 {
                 "fill=\"none\"".to_string()
@@ -508,9 +509,9 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
                 }
             };
 
-            let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
+            let is_white_stroke = shape.stroke_color.map_or(true, |sc| sc.a() == 0 || (sc.r() > 240 && sc.g() > 240 && sc.b() > 240));
             let stroke_str = if let Some(sc) = shape.stroke_color {
-                if sc.a() > 0 {
+                if sc.a() > 0 && !is_white_stroke {
                     let hex = format!("#{:02x}{:02x}{:02x}", sc.r(), sc.g(), sc.b());
                     let opacity = sc.a() as f32 / 255.0;
                     if opacity < 0.999 {
@@ -518,12 +519,12 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
                     } else {
                         format!("stroke=\"{}\" stroke-width=\"{:.3}\"", hex, shape.stroke_width.max(0.02))
                     }
-                } else if doc.pattern_swatch.is_some() || is_white_or_light {
+                } else if doc.pattern_swatch.is_some() || is_white_or_light || shape.fill_color.a() == 0 {
                     format!("stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.02))
                 } else {
                     "stroke=\"none\"".to_string()
                 }
-            } else if doc.pattern_swatch.is_some() || is_white_or_light {
+            } else if doc.pattern_swatch.is_some() || is_white_or_light || shape.fill_color.a() == 0 {
                 format!("stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.02))
             } else {
                 "stroke=\"none\"".to_string()
@@ -1104,24 +1105,20 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: O
         cluster_data.push((final_xfm, final_fill));
     }
 
-    // Document-wide unit check: check maximum transformed coordinate
-    let mut doc_max_coord: f32 = 0.0;
-    for (cluster, (xfm, _)) in shape_clusters.iter().zip(cluster_data.iter()) {
-        for sub in &cluster.subpaths {
-            for v in &sub.vertices {
-                let p_tx = xfm.apply(v.anchor);
-                doc_max_coord = doc_max_coord.max(p_tx.x.abs().max(p_tx.y.abs()));
-            }
-        }
-    }
-
-    let scale_to_in = if doc_max_coord > 24.0 { 1.0 / 25.4 } else { 1.0 };
-
     let current_stroke = egui::Color32::from_rgb(255, 38, 38); // Silhouette cut line: Red (#ff2626)
     let current_stroke_width = 0.02_f32; // ~1.5 pt
     let current_layer_id = 1_u64;
 
     for (cluster, (xfm, fill)) in shape_clusters.into_iter().zip(cluster_data.into_iter()) {
+        let mut cluster_max_coord: f32 = 0.0;
+        for sub in &cluster.subpaths {
+            for v in &sub.vertices {
+                let p_tx = xfm.apply(v.anchor);
+                cluster_max_coord = cluster_max_coord.max(p_tx.x.abs().max(p_tx.y.abs()));
+            }
+        }
+        let scale_to_in = if cluster_max_coord > 24.0 { 1.0 / 25.4 } else { 1.0 };
+
         if let Some(shape) = create_canvas_shape_from_subpaths(
             &cluster.subpaths,
             current_layer_id,
@@ -1504,14 +1501,22 @@ fn create_canvas_shape_from_subpaths(
     }
 
     // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so multi-subpaths and holes render cleanly
-    let dpi = 150.0_f32;
-    let pix_w = ((w * dpi).ceil() as u32).max(16);
-    let pix_h = ((h * dpi).ceil() as u32).max(16);
+    let dpi = 96.0_f32;
+    let raw_w = ((w * dpi).ceil() as u32).max(16);
+    let raw_h = ((h * dpi).ceil() as u32).max(16);
+    let max_dim = 1024_u32;
+    let (pix_w, pix_h) = if raw_w > max_dim || raw_h > max_dim {
+        let scale = (max_dim as f32 / raw_w.max(raw_h) as f32).min(1.0);
+        (((raw_w as f32 * scale).round() as u32).max(16), ((raw_h as f32 * scale).round() as u32).max(16))
+    } else {
+        (raw_w, raw_h)
+    };
 
     let is_white_or_light = (fill_color.r() > 240 && fill_color.g() > 240 && fill_color.b() > 240) || fill_color == egui::Color32::WHITE;
-    let final_stroke_c = if stroke_color.a() > 0 {
+    let is_white_or_invisible_stroke = stroke_color.a() == 0 || (stroke_color.r() > 240 && stroke_color.g() > 240 && stroke_color.b() > 240);
+    let final_stroke_c = if !is_white_or_invisible_stroke {
         stroke_color
-    } else if pattern_swatch.is_some() || is_white_or_light {
+    } else if pattern_swatch.is_some() || is_white_or_light || fill_color.a() == 0 {
         egui::Color32::from_rgb(255, 38, 38)
     } else {
         egui::Color32::TRANSPARENT
@@ -1536,7 +1541,7 @@ fn create_canvas_shape_from_subpaths(
 
         if let Some(path) = pb.finish() {
             if let Some(swatch) = pattern_swatch {
-                if fill_color.a() > 0 {
+                if is_white_or_light || fill_color.a() == 0 {
                     // Tiled pattern fill clipped to the vector shape path
                     let tile_size_in = 2.0_f32;
                     let tile_w_px = (tile_size_in * sx).max(16.0);
@@ -1553,6 +1558,11 @@ fn create_canvas_shape_from_subpaths(
                     );
                     let mut fill_paint = tiny_skia::Paint::default();
                     fill_paint.shader = shader;
+                    fill_paint.anti_alias = true;
+                    pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                } else if fill_color.a() > 0 {
+                    let mut fill_paint = tiny_skia::Paint::default();
+                    fill_paint.set_color_rgba8(fill_color.r(), fill_color.g(), fill_color.b(), fill_color.a());
                     fill_paint.anti_alias = true;
                     pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
                 }
@@ -1575,7 +1585,7 @@ fn create_canvas_shape_from_subpaths(
                 };
                 pm.stroke_path(&path, &stroke_paint, &st, tiny_skia::Transform::identity(), None);
             }
-            pixmap = Some(pm);
+            pixmap = Some(std::sync::Arc::new(pm));
         }
     }
 
@@ -1828,7 +1838,7 @@ pub fn base64_encode(data: &[u8]) -> String {
 /// Extracts embedded PNG raster image (e.g. Print & Cut artwork or preview or pattern swatch) from Studio data.
 /// Differentiates between repeating pattern swatches (e.g. square power-of-two texture tiles like 512x512)
 /// and actual positioned Print & Cut raster images.
-fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<CanvasShape>, Option<tiny_skia::Pixmap>) {
+fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<CanvasShape>, Option<std::sync::Arc<tiny_skia::Pixmap>>) {
     let mut pattern_swatch = None;
     let mut print_artwork_shape = None;
 
@@ -1848,8 +1858,8 @@ fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<Ca
 
                             if is_square && is_power_of_two {
                                 // Power-of-two square tile is a repeating pattern swatch (e.g. 256x256, 512x512, 1024x1024)
-                                if pattern_swatch.is_none() || w >= pattern_swatch.as_ref().map_or(0, |s: &tiny_skia::Pixmap| s.width()) {
-                                    pattern_swatch = Some(pm);
+                                if pattern_swatch.is_none() || w >= pattern_swatch.as_ref().map_or(0, |s: &std::sync::Arc<tiny_skia::Pixmap>| s.width()) {
+                                    pattern_swatch = Some(std::sync::Arc::new(pm));
                                 }
                             } else if w >= 400 && h >= 400 && !is_square && print_artwork_shape.is_none() {
                                 // Positioned Print & Cut raster artwork
@@ -1888,7 +1898,7 @@ fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<Ca
                                     is_visible: true,
                                     is_locked: true,
                                     name: Some("Print Artwork".to_string()),
-                                    pixmap: Some(pm),
+                                    pixmap: Some(std::sync::Arc::new(pm)),
                                     texture: None,
                                 };
                                 print_artwork_shape = Some(shape);
@@ -1971,6 +1981,7 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
         }
 
         if !hole_indices.is_empty() {
+            println!("merge_compound_paths: merging outer #{} with hole indices {:?}", i, hole_indices);
             consumed[i] = true;
             for &j in &hole_indices {
                 consumed[j] = true;
@@ -1999,9 +2010,16 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
             }
 
             // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so the holes punch through
-            let dpi = 150.0_f32;
-            let pix_w = ((outer.width * dpi).ceil() as u32).max(16);
-            let pix_h = ((outer.height * dpi).ceil() as u32).max(16);
+            let dpi = 96.0_f32;
+            let raw_w = ((outer.width * dpi).ceil() as u32).max(16);
+            let raw_h = ((outer.height * dpi).ceil() as u32).max(16);
+            let max_dim = 1024_u32;
+            let (pix_w, pix_h) = if raw_w > max_dim || raw_h > max_dim {
+                let scale = (max_dim as f32 / raw_w.max(raw_h) as f32).min(1.0);
+                (((raw_w as f32 * scale).round() as u32).max(16), ((raw_h as f32 * scale).round() as u32).max(16))
+            } else {
+                (raw_w, raw_h)
+            };
 
             let mut pixmap = None;
             if let Some(mut pm) = tiny_skia::Pixmap::new(pix_w, pix_h) {
@@ -2030,8 +2048,9 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
                 }
 
                 if let Some(path) = pb.finish() {
+                    let is_white_or_light = (outer.fill_color.r() > 240 && outer.fill_color.g() > 240 && outer.fill_color.b() > 240) || outer.fill_color == egui::Color32::WHITE;
                     if let Some(swatch) = pattern_swatch {
-                        if outer.fill_color.a() > 0 {
+                        if is_white_or_light || outer.fill_color.a() == 0 {
                             let tile_size_in = 2.0_f32;
                             let tile_w_px = (tile_size_in * sx).max(16.0);
                             let tile_h_px = (tile_size_in * sy).max(16.0);
@@ -2049,6 +2068,11 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
                             fill_paint.shader = shader;
                             fill_paint.anti_alias = true;
                             pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                        } else if outer.fill_color.a() > 0 {
+                            let mut fill_paint = tiny_skia::Paint::default();
+                            fill_paint.set_color_rgba8(outer.fill_color.r(), outer.fill_color.g(), outer.fill_color.b(), outer.fill_color.a());
+                            fill_paint.anti_alias = true;
+                            pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
                         }
                     } else if outer.fill_color.a() > 0 {
                         let mut fill_paint = tiny_skia::Paint::default();
@@ -2056,11 +2080,11 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
                         fill_paint.anti_alias = true;
                         pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
                     }
-
                     let is_white_or_light = (outer.fill_color.r() > 240 && outer.fill_color.g() > 240 && outer.fill_color.b() > 240) || outer.fill_color == egui::Color32::WHITE;
-                    let stroke_c = if let Some(sc) = outer.stroke_color {
-                        if sc.a() > 0 { sc } else if pattern_swatch.is_some() || is_white_or_light { egui::Color32::from_rgb(255, 38, 38) } else { egui::Color32::TRANSPARENT }
-                    } else if pattern_swatch.is_some() || is_white_or_light {
+                    let is_white_or_invisible_stroke = outer.stroke_color.map_or(true, |sc| sc.a() == 0 || (sc.r() > 240 && sc.g() > 240 && sc.b() > 240));
+                    let stroke_c = if !is_white_or_invisible_stroke {
+                        outer.stroke_color.unwrap()
+                    } else if pattern_swatch.is_some() || is_white_or_light || outer.fill_color.a() == 0 {
                         egui::Color32::from_rgb(255, 38, 38)
                     } else {
                         egui::Color32::TRANSPARENT
@@ -2078,7 +2102,7 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
                         };
                         pm.stroke_path(&path, &stroke_paint, &st, tiny_skia::Transform::identity(), None);
                     }
-                    pixmap = Some(pm);
+                    pixmap = Some(std::sync::Arc::new(pm));
                 }
             }
 
@@ -2403,8 +2427,8 @@ mod tests {
             Path::new("test_samples/Peeker Bears.studio"),
         ];
         let sample2_candidates = [
-            Path::new("../test_samples/DISNEY HEARTS.studio3"),
-            Path::new("test_samples/DISNEY HEARTS.studio3"),
+            Path::new("../test_samples/1 DISNEY PEOPLE.studio3"),
+            Path::new("test_samples/1 DISNEY PEOPLE.studio3"),
             Path::new("../test_samples/disney.studio3"),
             Path::new("test_samples/disney.studio3"),
         ];
@@ -2744,7 +2768,11 @@ mod tests {
             assert!(svg.contains("<svg"));
             assert!(svg.contains("<pattern id=\"swatch_pattern\""));
             assert!(svg.contains("stroke=\"#ff2626\""));
-            assert!(svg.contains("fill=\"url(#swatch_pattern)\""));
+            if sample_name.to_lowercase().contains("heart") {
+                assert!(svg.contains("fill=\"url(#swatch_pattern)\""));
+            } else {
+                assert!(svg.contains("fill=\"#"));
+            }
         }
     }
 
@@ -2852,5 +2880,109 @@ mod tests {
         assert!(svg.contains("stroke=\"#ff2626\""));
         assert!(svg.contains("fill-rule=\"evenodd\""));
         assert!(!svg.contains("Z L"), "SVG output must not contain diagonal bridge line 'Z L'");
+    }
+
+    #[test]
+    fn test_judith_unicorn_large_file_parsing() {
+        let candidates = [
+            Path::new("../test_samples/JUDITH UNICORN AND DINOSAUR.studio3"),
+            Path::new("test_samples/JUDITH UNICORN AND DINOSAUR.studio3"),
+        ];
+        let path = match candidates.iter().find(|p| p.exists()) {
+            Some(p) => p,
+            None => return,
+        };
+        let data = std::fs::read(path).expect("Read JUDITH UNICORN");
+        assert!(data.len() > 10_000_000, "JUDITH UNICORN must be a ~20 MB file");
+        let start = std::time::Instant::now();
+        let doc = parse_studio_data(&data).expect("Parse JUDITH UNICORN");
+        let elapsed = start.elapsed();
+        println!("Parsed JUDITH UNICORN in {:?}: version={:?}, shapes={}, mat=({:.2},{:.2})",
+            elapsed, doc.version, doc.shapes.len(), doc.mat_width_in, doc.mat_height_in);
+
+        assert_eq!(doc.version, StudioFormatVersion::StudioV5);
+        assert!(doc.shapes.len() >= 600, "Must contain >= 600 vector shapes");
+
+        // Verify per-shape pixmap dimensions are capped to max 1024x1024 and RAM stays low
+        let mut total_pixmap_bytes: usize = 0;
+        let mut white_shape_count = 0;
+        for s in &doc.shapes {
+            if let Some(ref pm) = s.pixmap {
+                let b = pm.data().len();
+                total_pixmap_bytes += b;
+                if s.is_svg_path {
+                    assert!(pm.width() <= 1024 && pm.height() <= 1024,
+                        "Shape pixmap dimensions must be capped to 1024x1024, got {}x{}", pm.width(), pm.height());
+                }
+            }
+            if s.is_svg_path {
+                let is_white = (s.fill_color.r() > 240 && s.fill_color.g() > 240 && s.fill_color.b() > 240) || s.fill_color == egui::Color32::WHITE;
+                if is_white || s.fill_color.a() == 0 {
+                    white_shape_count += 1;
+                    assert_eq!(s.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)),
+                        "White or unstroked vector path must have visible #ff2626 cut outline");
+                }
+            }
+        }
+        assert!(white_shape_count >= 500, "Must contain >= 500 white vector cut shapes with visible red cutlines");
+        assert!(total_pixmap_bytes < 50_000_000,
+            "Total pixmap RAM must stay under 50 MB, got {:.2} MB", total_pixmap_bytes as f64 / 1_048_576.0);
+
+        // Verify SVG conversion produces visible red strokes without panic or unbounded memory
+        let svg = convert_studio_to_svg(&data).expect("Convert JUDITH UNICORN to SVG");
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("stroke=\"#ff2626\""));
+    }
+
+    #[test]
+    fn test_disney_hearts_pattern_clipping_and_visible_cutlines() {
+        let candidates = [
+            Path::new("../test_samples/DISNEY HEARTS.studio3"),
+            Path::new("test_samples/DISNEY HEARTS.studio3"),
+        ];
+        let path = match candidates.iter().find(|p| p.exists()) {
+            Some(p) => p,
+            None => return,
+        };
+        let data = std::fs::read(path).expect("Read DISNEY HEARTS");
+        let doc = parse_studio_data(&data).expect("Parse DISNEY HEARTS");
+        assert_eq!(doc.version, StudioFormatVersion::StudioV5);
+        assert!(doc.shapes.len() >= 10, "DISNEY HEARTS must contain >= 10 shapes");
+
+        // 1. Verify pattern swatch is extracted as 512x512 tile
+        assert!(doc.pattern_swatch.is_some(), "Pattern swatch must be extracted");
+        let swatch = doc.pattern_swatch.as_ref().unwrap();
+        assert_eq!(swatch.width(), 512);
+        assert_eq!(swatch.height(), 512);
+
+        // 2. Verify white / heart shapes have visible cut outlines (#ff2626)
+        let mut heart_pattern_shape_found = false;
+        let mut solid_color_shape_found = false;
+        for (i, shape) in doc.shapes.iter().enumerate() {
+            if shape.is_svg_path {
+                assert_eq!(
+                    shape.stroke_color,
+                    Some(egui::Color32::from_rgb(255, 38, 38)),
+                    "Shape #{} must have visible red (#ff2626) cut outline", i
+                );
+                let is_white = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
+                if is_white {
+                    heart_pattern_shape_found = true;
+                } else if shape.fill_color.a() > 0 && shape.fill_color != egui::Color32::BLACK {
+                    solid_color_shape_found = true;
+                }
+            }
+        }
+        assert!(heart_pattern_shape_found, "Must find white heart pattern shape with visible cut outline");
+        assert!(solid_color_shape_found, "Must find non-white colored shapes preserving their original solid color");
+
+        // 3. Verify SVG export contains pattern fill on heart shapes, solid colors on colored shapes, and #ff2626 cut strokes
+        let svg = convert_studio_to_svg(&data).expect("Convert DISNEY HEARTS to SVG");
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("<pattern id=\"swatch_pattern\""));
+        assert!(svg.contains("stroke=\"#ff2626\""));
+        assert!(svg.contains("fill=\"url(#swatch_pattern)\""));
+        assert!(svg.contains("fill=\"#ff0000\"")); // Red character color preserved
+        assert!(!svg.contains("Print Background"), "Must not emit full-mat background layer");
     }
 }
