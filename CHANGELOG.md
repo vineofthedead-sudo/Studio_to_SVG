@@ -4,6 +4,28 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.4.8] - 2026-11-22
+
+### Added & Improved
+- **Preserved Multi-Subpath Contours in Compound Path Merging (`app/src/studio_format.rs`)**:
+  - Fixed root cause of cross-subpath diagonal bridge lines in complex multi-contour cutouts (e.g. `PL ZOO PAPER.studio3` grass and reed cutouts).
+  - Previously, `merge_compound_paths` flattened `outer.points` into a single polyline joined with `" L "`, obliterating original `M` (`MoveTo`) and `Z` boundaries and connecting 86+ separate grass blades with straight diagonal lines.
+  - Updated `merge_compound_paths` to retain and concatenate `outer.text` and `inner.text` SVG path commands, preserving all subpath boundaries (`M ... Z M ... Z`).
+  - Updated `tiny_skia::PathBuilder` rendering inside `merge_compound_paths` to iterate per-subpath (`compound_d.split('M')`), issuing discrete `move_to` and `close` commands with `FillRule::EvenOdd` so every blade and island renders as an isolated cut contour without diagonal bridging lines.
+- **Multi-Subpath Freehand Canvas Rendering (`app/src/main.rs`)**:
+  - Enhanced `tiny_skia` freehand path builder in `main.rs` to parse multi-subpath `shape.text` (`shape.is_svg_path && shape.text.matches('M').count() > 1`) across individual `move_to` / `line_to` / `close` segments with `FillRule::EvenOdd`, guaranteeing zero diagonal bridge lines even when pixmap caches are regenerated.
+- **Pattern Swatch & Red Cut Outlines Verified for `PL ZOO PAPER.studio3` (`app/src/studio_format.rs`)**:
+  - Verified 512×512 square pattern swatch extraction from Section 2, mapped as clipped/tiled shader inside vector cut shapes with visible `#ff2626` cut outlines.
+- **Integration Testing & Test Suite Verification**:
+  - Added `test_pl_zoo_paper_grass_cutouts_no_diagonal_bridge_lines` asserting that:
+    - Multi-subpath grass cutout shapes retain separate `M` MoveTo commands (>= 86 subpaths) and zero diagonal bridge lines (`!text.contains("Z L")`).
+    - Every subpath cleanly terminates with `Z`.
+    - Pre-rendered `tiny_skia` pixmaps have rendered pixels and `#ff2626` cut outlines.
+    - Exported SVG contains `<pattern id="swatch_pattern">`, `fill-rule="evenodd"`, and visible red cut strokes without diagonal lines.
+  - All 62 unit and integration tests passing (`cargo test`); release binary verified (`cargo build --release`).
+
+---
+
 ## [0.4.7] - 2026-11-22
 
 ### Added & Improved

@@ -1977,13 +1977,25 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
             }
             let outer = s1;
 
-            // Build compound SVG path d string: M {outer} Z M {inner1} Z M {inner2} Z ...
-            let outer_str = outer.points.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" L ");
-            let mut compound_d = format!("M {} Z", outer_str);
+            // Build compound SVG path d string preserving all multi-subpath contours
+            let mut compound_d = if outer.is_svg_path && !outer.text.is_empty() {
+                outer.text.clone()
+            } else {
+                let outer_str = outer.points.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" L ");
+                format!("M {} Z", outer_str)
+            };
             for &j in &hole_indices {
                 let inner = &shapes[j];
-                let inner_str = inner.points.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" L ");
-                compound_d.push_str(&format!(" M {} Z", inner_str));
+                let inner_d = if inner.is_svg_path && !inner.text.is_empty() {
+                    inner.text.clone()
+                } else {
+                    let inner_str = inner.points.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" L ");
+                    format!("M {} Z", inner_str)
+                };
+                if !compound_d.is_empty() {
+                    compound_d.push(' ');
+                }
+                compound_d.push_str(&inner_d);
             }
 
             // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so the holes punch through
@@ -1998,19 +2010,20 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
                 let sy = (pix_h as f32 - pad * 2.0) / outer.height.max(0.001);
 
                 let mut pb = tiny_skia::PathBuilder::new();
-                if let Some(p0) = outer.points.first() {
-                    pb.move_to((p0.x - outer.x) * sx + pad, (p0.y - outer.y) * sy + pad);
-                    for p in outer.points.iter().skip(1) {
-                        pb.line_to((p.x - outer.x) * sx + pad, (p.y - outer.y) * sy + pad);
+                for sub in compound_d.split('M') {
+                    let sub = sub.trim();
+                    if sub.is_empty() {
+                        continue;
                     }
-                    pb.close();
-                }
-                for &j in &hole_indices {
-                    let inner = &shapes[j];
-                    if let Some(p0) = inner.points.first() {
-                        pb.move_to((p0.x - outer.x) * sx + pad, (p0.y - outer.y) * sy + pad);
-                        for p in inner.points.iter().skip(1) {
-                            pb.line_to((p.x - outer.x) * sx + pad, (p.y - outer.y) * sy + pad);
+                    let nums: Vec<f32> = sub
+                        .split(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                        .filter_map(|s| s.parse::<f32>().ok())
+                        .collect();
+                    let mut chunks = nums.chunks_exact(2);
+                    if let Some(first) = chunks.next() {
+                        pb.move_to((first[0] - outer.x) * sx + pad, (first[1] - outer.y) * sy + pad);
+                        for p in chunks {
+                            pb.line_to((p[0] - outer.x) * sx + pad, (p[1] - outer.y) * sy + pad);
                         }
                         pb.close();
                     }
@@ -2733,5 +2746,111 @@ mod tests {
             assert!(svg.contains("stroke=\"#ff2626\""));
             assert!(svg.contains("fill=\"url(#swatch_pattern)\""));
         }
+    }
+
+    #[test]
+    fn test_pl_zoo_paper_grass_cutouts_no_diagonal_bridge_lines() {
+        let candidates = [
+            Path::new("../test_samples/PL ZOO PAPER.studio3"),
+            Path::new("test_samples/PL ZOO PAPER.studio3"),
+        ];
+        let path = match candidates.iter().find(|p| p.exists()) {
+            Some(p) => p,
+            None => return,
+        };
+        let data = std::fs::read(path).expect("Read PL ZOO PAPER.studio3");
+        let doc = parse_studio_data(&data).expect("Parse PL ZOO PAPER.studio3");
+
+        assert_eq!(doc.version, StudioFormatVersion::StudioV5);
+        assert!(doc.shapes.len() >= 5, "Expected >= 5 shapes in PL ZOO PAPER, got {}", doc.shapes.len());
+
+        // 1. Verify pattern swatch is extracted as 512x512 tile
+        assert!(doc.pattern_swatch.is_some(), "Expected pattern swatch extracted from Sec 2");
+        let swatch = doc.pattern_swatch.as_ref().unwrap();
+        assert_eq!(swatch.width(), 512);
+        assert_eq!(swatch.height(), 512);
+
+        // 2. Verify no full-mat background layer exists
+        for (idx, shape) in doc.shapes.iter().enumerate() {
+            assert!(
+                shape.text != "#1 Print Background",
+                "Shape #{} must not be full-mat background",
+                idx
+            );
+        }
+
+        // 3. Verify multi-subpath grass cutout shapes retain separate M commands and zero diagonal bridge lines
+        let mut multi_subpath_grass_found = false;
+        for (i, shape) in doc.shapes.iter().enumerate() {
+            if shape.is_svg_path {
+                let m_count = shape.text.matches('M').count();
+                if m_count >= 50 {
+                    multi_subpath_grass_found = true;
+                    // Grass cutouts must have >= 86 subpaths for individual blades/islands
+                    assert!(
+                        m_count >= 86,
+                        "Grass shape #{} must have >= 86 subpaths, got {}",
+                        i,
+                        m_count
+                    );
+                }
+
+                // Verify every subpath starts with M and ends with Z, never connected by diagonal Z L
+                assert!(
+                    !shape.text.contains("Z L"),
+                    "Shape #{} contains stray diagonal bridge line 'Z L'",
+                    i
+                );
+
+                let subpaths: Vec<&str> = shape.text.split('M').filter(|s| !s.trim().is_empty()).collect();
+                assert_eq!(subpaths.len(), m_count);
+                for (sub_idx, sub) in subpaths.iter().enumerate() {
+                    let trimmed = sub.trim();
+                    assert!(
+                        trimmed.ends_with('Z'),
+                        "Subpath {} in Shape #{} must end with 'Z', got {:?}",
+                        sub_idx,
+                        i,
+                        trimmed
+                    );
+                }
+
+                // Verify pre-rendered pixmap exists and has rendered pixels
+                assert!(
+                    shape.pixmap.is_some(),
+                    "Shape #{} must have pre-rendered tiny_skia pixmap",
+                    i
+                );
+                let pm = shape.pixmap.as_ref().unwrap();
+                let non_zero_pixels = pm.data().iter().filter(|&&b| b > 0).count();
+                assert!(
+                    non_zero_pixels > 0,
+                    "Shape #{} pixmap must contain non-transparent pixels",
+                    i
+                );
+
+                // Verify cut line stroke is visible red (#ff2626)
+                assert!(
+                    shape.stroke_color.is_some(),
+                    "Shape #{} must have cut line stroke",
+                    i
+                );
+                assert_eq!(
+                    shape.stroke_color.unwrap(),
+                    egui::Color32::from_rgb(255, 38, 38),
+                    "Shape #{} must have #ff2626 cut line stroke",
+                    i
+                );
+            }
+        }
+        assert!(multi_subpath_grass_found, "Must find multi-subpath grass cutout shapes with >= 86 blades");
+
+        // 4. Verify SVG export contains pattern defs, EvenOdd fill rule, and visible red cut strokes
+        let svg = convert_studio_to_svg(&data).expect("Convert PL ZOO PAPER to SVG");
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("<pattern id=\"swatch_pattern\""));
+        assert!(svg.contains("stroke=\"#ff2626\""));
+        assert!(svg.contains("fill-rule=\"evenodd\""));
+        assert!(!svg.contains("Z L"), "SVG output must not contain diagonal bridge line 'Z L'");
     }
 }

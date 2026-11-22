@@ -2968,8 +2968,25 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
                     }
                 }
                 ShapeKind::Freehand => {
-                    if shape.points.len() >= 2 {
-                        let mut pb = tiny_skia::PathBuilder::new();
+                    let mut pb = tiny_skia::PathBuilder::new();
+                    let has_path = if shape.is_svg_path && shape.text.matches('M').count() > 1 {
+                        let subpaths: Vec<&str> = shape.text.split('M').filter(|s| !s.trim().is_empty()).collect();
+                        for sub in subpaths {
+                            let nums: Vec<f32> = sub
+                                .split(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                                .filter_map(|s| s.parse::<f32>().ok())
+                                .collect();
+                            let mut chunks = nums.chunks_exact(2);
+                            if let Some(first) = chunks.next() {
+                                pb.move_to(first[0] * dpi, first[1] * dpi);
+                                for p in chunks {
+                                    pb.line_to(p[0] * dpi, p[1] * dpi);
+                                }
+                                pb.close();
+                            }
+                        }
+                        pb.finish()
+                    } else if shape.points.len() >= 2 {
                         pb.move_to(shape.points[0].x * dpi, shape.points[0].y * dpi);
                         for p in &shape.points[1..] {
                             pb.line_to(p.x * dpi, p.y * dpi);
@@ -2977,21 +2994,30 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
                         if shape.is_closed {
                             pb.close();
                         }
-                        if let Some(path) = pb.finish() {
-                            if shape.fill_color.a() > 0 {
-                                pixmap.fill_path(&path, &fill_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
-                            }
-                            if let Some((sp, sw)) = &stroke_paint_and_width {
-                                let st = tiny_skia::Stroke {
-                                    width: *sw,
-                                    line_cap: tiny_skia::LineCap::Round,
-                                    line_join: tiny_skia::LineJoin::Round,
-                                    ..Default::default()
-                                };
-                                pixmap.stroke_path(&path, sp, &st, tiny_skia::Transform::identity(), None);
-                            } else if !shape.is_closed && shape.fill_color.a() == 0 {
-                                pixmap.stroke_path(&path, &black_paint, &black_stroke, tiny_skia::Transform::identity(), None);
-                            }
+                        pb.finish()
+                    } else {
+                        None
+                    };
+
+                    if let Some(path) = has_path {
+                        let fill_rule = if shape.is_svg_path && shape.text.matches('M').count() > 1 {
+                            tiny_skia::FillRule::EvenOdd
+                        } else {
+                            tiny_skia::FillRule::Winding
+                        };
+                        if shape.fill_color.a() > 0 {
+                            pixmap.fill_path(&path, &fill_paint, fill_rule, tiny_skia::Transform::identity(), None);
+                        }
+                        if let Some((sp, sw)) = &stroke_paint_and_width {
+                            let st = tiny_skia::Stroke {
+                                width: *sw,
+                                line_cap: tiny_skia::LineCap::Round,
+                                line_join: tiny_skia::LineJoin::Round,
+                                ..Default::default()
+                            };
+                            pixmap.stroke_path(&path, sp, &st, tiny_skia::Transform::identity(), None);
+                        } else if !shape.is_closed && shape.fill_color.a() == 0 {
+                            pixmap.stroke_path(&path, &black_paint, &black_stroke, tiny_skia::Transform::identity(), None);
                         }
                     }
                 }
