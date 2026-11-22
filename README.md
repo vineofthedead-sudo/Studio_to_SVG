@@ -18,12 +18,14 @@ A lightweight, native Linux replacement for Silhouette Studio built in Rust with
 - **Legacy Silhouette Studio Format Parser (`.studio` / `.studio3`)**:
   - Direct binary import and conversion of proprietary Silhouette Studio `.studio` (`silhouette04;`) and `.studio3` (`silhouette05;`) files on Linux without Windows or Wine.
   - Automatically identifies format headers and offsets (`0x0000` for v4, `0x0400` with section offset tables for v5).
-  - Isolates vector document streams from embedded PNG thumbnails (`89 50 4E 47`) for fast, clean extraction.
+  - Isolates vector document streams and decodes embedded PNG print-and-cut artwork (`89 50 4E 47`) underneath vector cut lines.
   - Zero-panic architecture: safe bounds checking and memory access across all stream offsets with zero naked unwraps.
-  - Parses official 34-byte cubic Bézier records (`01 21 00 00 00`), 2D affine transforms `[a, b, tx, c, d, ty]`, RGBA cut/fill colors, and mat presets (`12x12`, `letter`, in 72 pt/in units).
-  - Normalizes and scales coordinates directly onto the mat canvas.
+  - Parses both 34-byte 2-handle (`01 21 00 00 00`) and 26-byte 1-handle (`01 19 00 00 00`) cubic Bézier vertex records, 2D affine transforms `[a, b, tx, c, d, ty]`, and RGBA cut/fill colors.
+  - True physical unit scaling: converts Silhouette Studio native millimeters to inches (`1.0 / 25.4`) so designs appear at 100% true physical size on the mat.
+  - Compound paths & hole punching: detects concentric same-color contours (e.g. wheels, cutouts) and punches holes cleanly using `FillRule::EvenOdd`.
   - Flattens Bézier curves via adaptive de Casteljau subdivision into smooth canvas polylines.
   - **Batch Converter**: One-click folder batch conversion to export clean, standard vector `.svg` files for entire directories of Silhouette Studio files.
+  - **CLI File Loading**: Direct command-line file loading and headless verification via `ss_rebuild <file> --screenshot <path>`.
 - **High-Performance SVG Import**:
   - Parses complex multi-layer commercial SVG cutting files with `usvg` 0.45.
   - Renders exact SVG styles, CSS classes, linear/radial gradients, and `FillRule::EvenOdd` cutouts into a cached `egui::TextureHandle` via `resvg` 0.45.

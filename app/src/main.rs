@@ -5,11 +5,30 @@ use std::path::Path;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let screenshot_path = args.windows(2).find(|w| w[0] == "--screenshot").map(|w| w[1].clone());
+    let mut screenshot_path = None;
+    let mut initial_file = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--screenshot" && i + 1 < args.len() {
+            screenshot_path = Some(args[i + 1].clone());
+            i += 2;
+        } else if !args[i].starts_with("--") && initial_file.is_none() {
+            initial_file = Some(args[i].clone());
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]).with_title("Silhouette Studio");
     if screenshot_path.is_some() { viewport = viewport.with_active(false); }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("Silhouette Studio", options, Box::new(move |_cc| Box::new(StudioApp::new(screenshot_path))))
+    eframe::run_native("Silhouette Studio", options, Box::new(move |_cc| {
+        let mut app = StudioApp::new(screenshot_path);
+        if let Some(file) = initial_file {
+            app.load_file(Path::new(&file));
+        }
+        Box::new(app)
+    }))
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -682,6 +701,28 @@ impl StudioApp {
         }
     }
 
+    pub fn load_file(&mut self, path: &Path) {
+        if !path.exists() {
+            return;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if ext == "studio" || ext == "studio3" {
+            if let Ok(doc) = crate::studio_format::parse_studio_file(path) {
+                self.mat_width_in = doc.mat_width_in;
+                self.mat_height_in = doc.mat_height_in;
+                self.group_names = doc.group_names;
+                self.next_group_id = self.group_names.keys().max().copied().unwrap_or(0) + 1;
+                self.shapes = doc.shapes;
+                self.selected_indices.clear();
+                self.selected_index = None;
+                let msg = format!("Imported {} shapes from Silhouette Studio file", self.shapes.len());
+                self.status_message = Some((msg, std::time::Instant::now()));
+            }
+        } else if ext == "svg" {
+            let _ = self.import_svg_file(path);
+        }
+    }
+
     pub fn push_undo(&mut self) {
         let snapshot = CanvasSnapshot {
             shapes: self.shapes.clone(),
@@ -1156,6 +1197,19 @@ impl StudioApp {
         ));
 
         for shape in &self.shapes {
+            if let Some(ref pm) = shape.pixmap {
+                if !shape.is_svg_path {
+                    if let Ok(png_bytes) = pm.encode_png() {
+                        let b64 = crate::studio_format::base64_encode(&png_bytes);
+                        out.push_str(&format!(
+                            "  <image x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" href=\"data:image/png;base64,{}\" />\n",
+                            shape.x, shape.y, shape.width, shape.height, b64
+                        ));
+                        continue;
+                    }
+                }
+            }
+
             let hex = format!("#{:02x}{:02x}{:02x}", shape.fill_color.r(), shape.fill_color.g(), shape.fill_color.b());
             let opacity = shape.fill_color.a() as f32 / 255.0;
             let fill_str = if shape.fill_color.a() == 0 {
@@ -1208,7 +1262,12 @@ impl StudioApp {
                     }
                 }
                 ShapeKind::Freehand => {
-                    if shape.points.len() >= 2 {
+                    if shape.is_svg_path && !shape.text.is_empty() {
+                        out.push_str(&format!(
+                            "  <path d=\"{}\" fill-rule=\"evenodd\"{}{} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                            shape.text, fill_str, stroke_str
+                        ));
+                    } else if shape.points.len() >= 2 {
                         let pts_str = shape.points.iter()
                             .map(|p| format!("{:.3},{:.3}", p.x, p.y))
                             .collect::<Vec<_>>()

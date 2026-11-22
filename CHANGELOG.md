@@ -14,6 +14,21 @@ All notable changes, architectural implementations, and roadmap milestones for t
 - **Zero Panics & Safe Bounds Checking**:
   - Replaced all unchecked slice indexing, naked `unwrap()` calls, and unchecked allocations with safe `.get()` slice access and saturating bounds checking (`read_u8`, `read_u32_le`, `read_u64_le`, `read_f32_le`).
   - Gracefully handles malformed, truncated, or massive files without risking memory corruption or panics.
+- **Full Record-Tag Audit & 1-Handle Record Support (`01 19 00 00 00`)**:
+  - Decodes both 34-byte 2-handle records (`01 21 00 00 00`) and 26-byte 1-handle records (`01 19 00 00 00`), accounting for 100% of vertices and shapes in `Peeker Bears.studio` (224 vertices across 26 objects) without skipped segments or contour splits.
+- **True Physical Coordinate Scaling (Millimeters to Inches `1.0 / 25.4`)**:
+  - Corrected coordinate scaling from legacy 72 DPI points (`1.0 / 72.0`), which had shrunk imported designs to ~1/3 size, to true Silhouette Studio physical millimeters (`1.0 / 25.4`).
+  - Designs now appear at authentic 100% real-world cutting scale (e.g. `Peeker Bears.studio` fills the `8.5" x 11"` Letter page at ~7.5" x 6.4").
+- **Compound Paths & Hole Punching (`FillRule::EvenOdd`)**:
+  - Detects concentric contours sharing the same fill color (e.g. concentric blue wheels/circles in `Peeker Bears.studio`) and merges them into compound paths with `FillRule::EvenOdd`.
+  - Inner cutout holes punch cleanly through outer shapes instead of stacking as opaque disks.
+  - Pre-renders `tiny_skia::Pixmap` with `tiny_skia::FillRule::EvenOdd` for true canvas/PNG transparency and outputs SVG `<path d="M ... Z M ... Z" fill-rule="evenodd" />`.
+- **Embedded Raster Image Extraction (`.studio3` Print & Cut)**:
+  - Extracts embedded 512x512 PNG raster artwork from `.studio3` container sections (`DISNEY HEARTS.studio3`).
+  - Renders the image as a background `CanvasShape` on the cutting mat underneath red vector cut lines (`Print & Cut` preview).
+  - Exports embedded raster artwork directly to standalone SVG via `<image href="data:image/png;base64,..." />`.
+- **CLI File Loading & Headless Verification**:
+  - CLI supports passing an input `.studio`, `.studio3`, or `.svg` file directly (`ss_rebuild <file> --screenshot <path>`) for instant verification and headless rendering.
 - **Vector Document Stream Isolation**:
   - Detects embedded PNG preview raster chunks (`89 50 4E 47`) and confines vector stream decoding strictly to the document vector slice (`[0x0400..png_start]`), preventing false-positive marker matches and avoiding unnecessary scanning of large multi-megabyte thumbnail data.
 - **Resilient 34-Byte Bézier Record & Transform Extraction**:

@@ -31,6 +31,7 @@ pub const MAGIC_STUDIO_V5: &[u8] = b"silhouette05;";
 pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 pub const HEADER_OFFSET_V5: usize = 0x0400; // 1,024 bytes
 pub const BEZIER_VERTEX_MARKER: [u8; 5] = [0x01, 0x21, 0x00, 0x00, 0x00];
+pub const BEZIER_VERTEX_MARKER_1H: [u8; 5] = [0x01, 0x19, 0x00, 0x00, 0x00];
 
 pub const TAG_PATH_BLOCK: [u8; 4] = [0x53, 0x50, 0x54, 0x48]; // "SPTH"
 pub const TAG_TRANSFORM: [u8; 4] = [0x53, 0x58, 0x46, 0x4D];  // "SXFM"
@@ -292,6 +293,14 @@ pub fn parse_studio_data(data: &[u8]) -> Result<ParsedStudioDocument, StudioPars
     // 4. Normalize and center shapes onto the mat canvas
     normalize_shapes_onto_mat(&mut shapes, mat_w_in, mat_h_in);
 
+    // 5. Detect and merge compound paths (e.g. concentric wheels with inner cutouts)
+    let mut shapes = merge_compound_paths(shapes);
+
+    // 6. Extract embedded PNG raster image (e.g. Print & Cut artwork or preview) if present
+    if let Some(png_shape) = extract_embedded_png(data, mat_w_in, mat_h_in) {
+        shapes.insert(0, png_shape);
+    }
+
     Ok(ParsedStudioDocument {
         version,
         stream_offset: stream_start,
@@ -388,6 +397,19 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
         svg.push_str(&format!("  <g id=\"{}\">\n", escape_xml(&name)));
 
         for shape in shapes {
+            if let Some(ref pm) = shape.pixmap {
+                if !shape.is_svg_path {
+                    if let Ok(png_bytes) = pm.encode_png() {
+                        let b64 = base64_encode(&png_bytes);
+                        svg.push_str(&format!(
+                            "    <image x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" href=\"data:image/png;base64,{}\" />\n",
+                            shape.x, shape.y, shape.width, shape.height, b64
+                        ));
+                        continue;
+                    }
+                }
+            }
+
             let fill_str = if shape.fill_color.a() == 0 {
                 "fill=\"none\"".to_string()
             } else {
@@ -412,7 +434,12 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
                 "stroke=\"none\"".to_string()
             };
 
-            if shape.points.len() >= 2 {
+            if shape.is_svg_path && !shape.text.is_empty() {
+                svg.push_str(&format!(
+                    "    <path d=\"{}\" fill-rule=\"evenodd\" {} {} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                    shape.text, fill_str, stroke_str
+                ));
+            } else if shape.points.len() >= 2 {
                 let pts_str = shape
                     .points
                     .iter()
@@ -689,15 +716,22 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         }
     }
 
-    // Second attempt: General stream scanning for 01 21 00 00 00 records and affine matrices
+    // Second attempt: General stream scanning for 01 21 00 00 00 (2 handles) and 01 19 00 00 00 (1 handle) records
     let mut vertices_with_pos = Vec::new();
     let mut i = 0;
     while i + 5 <= stream.len() {
         if let Some(marker_slice) = stream.get(i..i + 5) {
-            if marker_slice == BEZIER_VERTEX_MARKER {
+            let is_2h = marker_slice == BEZIER_VERTEX_MARKER;
+            let is_1h = marker_slice == BEZIER_VERTEX_MARKER_1H;
+            if is_2h || is_1h {
                 if let Some(payload) = stream.get(i + 5..) {
-                    if let Some((v, len)) = parse_bezier_vertex(payload) {
-                        vertices_with_pos.push((i, v));
+                    let parsed = if is_2h {
+                        parse_bezier_vertex(payload)
+                    } else {
+                        parse_bezier_vertex_1h(payload)
+                    };
+                    if let Some((v, len)) = parsed {
+                        vertices_with_pos.push((i, 5 + len, v));
                         i = i.saturating_add(5 + len);
                         continue;
                     }
@@ -711,7 +745,7 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         return shapes;
     }
 
-    // Cluster consecutive vertices into paths based on stream proximity (nominal stride = 34 bytes)
+    // Cluster consecutive vertices into paths based on stream proximity (nominal stride = 26 or 34 bytes)
     struct PathCluster {
         start_pos: usize,
         end_pos: usize,
@@ -719,27 +753,27 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
     }
 
     let mut path_clusters: Vec<PathCluster> = Vec::new();
-    let mut cur_cluster: Vec<(usize, StudioBezierVertex)> = Vec::new();
+    let mut cur_cluster: Vec<(usize, usize, StudioBezierVertex)> = Vec::new();
 
-    for (pos, vert) in vertices_with_pos {
-        if let Some(&(prev_pos, _)) = cur_cluster.last() {
-            let gap = pos.saturating_sub(prev_pos);
+    for (pos, rec_len, vert) in vertices_with_pos {
+        if let Some(&(prev_pos, prev_len, _)) = cur_cluster.last() {
+            let gap = pos.saturating_sub(prev_pos + prev_len);
             if gap > 48 {
                 if cur_cluster.len() >= 2 {
                     let start_pos = cur_cluster.first().map(|p| p.0).unwrap_or(0);
-                    let end_pos = cur_cluster.last().map(|p| p.0 + 34).unwrap_or(start_pos);
-                    let vertices = cur_cluster.into_iter().map(|p| p.1).collect();
+                    let end_pos = cur_cluster.last().map(|p| p.0 + p.1).unwrap_or(start_pos);
+                    let vertices = cur_cluster.into_iter().map(|p| p.2).collect();
                     path_clusters.push(PathCluster { start_pos, end_pos, vertices });
                 }
                 cur_cluster = Vec::new();
             }
         }
-        cur_cluster.push((pos, vert));
+        cur_cluster.push((pos, rec_len, vert));
     }
     if cur_cluster.len() >= 2 {
         let start_pos = cur_cluster.first().map(|p| p.0).unwrap_or(0);
-        let end_pos = cur_cluster.last().map(|p| p.0 + 34).unwrap_or(start_pos);
-        let vertices = cur_cluster.into_iter().map(|p| p.1).collect();
+        let end_pos = cur_cluster.last().map(|p| p.0 + p.1).unwrap_or(start_pos);
+        let vertices = cur_cluster.into_iter().map(|p| p.2).collect();
         path_clusters.push(PathCluster { start_pos, end_pos, vertices });
     }
 
@@ -827,9 +861,11 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
         }
     }
 
-    // In Silhouette Studio, coordinates are in points (72 pt = 1 in).
-    // If transformed coords exceed 24.0 (the largest physical cutting mat size in inches), scale by 1/72.
-    let scale_to_in = if doc_max_coord > 24.0 { 1.0 / 72.0 } else { 1.0 };
+    // In Silhouette Studio, document coordinates and lengths are stored in millimeters (mm).
+    // 1 inch = 25.4 mm.
+    // If transformed coords exceed 24.0 (the largest physical cutting mat size in inches),
+    // they are in millimeters and must be scaled by 1.0 / 25.4 (not 1.0 / 72.0, which shrinks to 1/3 scale).
+    let scale_to_in = if doc_max_coord > 24.0 { 1.0 / 25.4 } else { 1.0 };
 
     let current_stroke = egui::Color32::from_rgb(255, 38, 38); // Silhouette cut line: Red (#ff2626)
     let current_stroke_width = 0.02_f32; // ~1.5 pt
@@ -921,7 +957,7 @@ fn parse_structured_paths(stream: &[u8]) -> Option<Vec<CanvasShape>> {
                     .iter()
                     .map(|v| v.anchor.x.abs().max(v.anchor.y.abs()))
                     .fold(0.0_f32, f32::max);
-                let scale_to_in = if max_coord > 36.0 { 1.0 / 72.0 } else { 1.0 };
+                let scale_to_in = if max_coord > 24.0 { 1.0 / 25.4 } else { 1.0 };
 
                 let polyline = path_vertices_to_polyline(&vertices, is_closed, Some(&transform), scale_to_in, 0.002);
                 if polyline.len() >= 2 {
@@ -1071,6 +1107,62 @@ fn parse_bezier_vertex(payload: &[u8]) -> Option<(StudioBezierVertex, usize)> {
                     handle_out: egui::pos2(cx2_0, cy2_0),
                 },
                 len,
+            ));
+        }
+    }
+
+    None
+}
+
+/// Parses a 1-handle 26-byte cubic Bézier vertex record (`01 19 00 00 00` marker + 21-byte payload).
+fn parse_bezier_vertex_1h(payload: &[u8]) -> Option<(StudioBezierVertex, usize)> {
+    if payload.len() < 21 {
+        return None;
+    }
+    let ax = read_f32_le(payload, 0)?;
+    let ay = read_f32_le(payload, 4)?;
+    let tag1 = read_u8(payload, 8)?;
+
+    if !is_plausible_coord(ax) || !is_plausible_coord(ay) {
+        return None;
+    }
+
+    if tag1 == 1 {
+        let h1x = read_f32_le(payload, 9)?;
+        let h1y = read_f32_le(payload, 13)?;
+        if is_plausible_coord(h1x) && is_plausible_coord(h1y) {
+            return Some((
+                StudioBezierVertex {
+                    anchor: egui::pos2(ax, ay),
+                    handle_in: egui::pos2(ax + h1x, ay + h1y),
+                    handle_out: egui::pos2(ax, ay),
+                },
+                21,
+            ));
+        }
+    } else {
+        let tag2 = read_u8(payload, 9)?;
+        if tag2 == 1 {
+            let h2x = read_f32_le(payload, 10)?;
+            let h2y = read_f32_le(payload, 14)?;
+            if is_plausible_coord(h2x) && is_plausible_coord(h2y) {
+                return Some((
+                    StudioBezierVertex {
+                        anchor: egui::pos2(ax, ay),
+                        handle_in: egui::pos2(ax, ay),
+                        handle_out: egui::pos2(ax + h2x, ay + h2y),
+                    },
+                    21,
+                ));
+            }
+        } else {
+            return Some((
+                StudioBezierVertex {
+                    anchor: egui::pos2(ax, ay),
+                    handle_in: egui::pos2(ax, ay),
+                    handle_out: egui::pos2(ax, ay),
+                },
+                21,
             ));
         }
     }
@@ -1280,6 +1372,206 @@ fn escape_xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+/// Standard Base64 encoder for embedding raster images in SVG.
+pub fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(CHARS[(b0 >> 2) as usize] as char);
+        out.push(CHARS[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(b2 & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Extracts embedded PNG raster image (e.g. Print & Cut artwork or preview) from Studio data.
+fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> Option<CanvasShape> {
+    // 1. Search for PNG signature in data
+    let png_start = find_subsequence(data, &PNG_SIGNATURE)?;
+    let png_data_slice = data.get(png_start..)?;
+
+    // 2. Locate IEND chunk to find the end of the PNG stream
+    let iend_marker = b"IEND";
+    let iend_offset = find_subsequence(png_data_slice, iend_marker)?;
+    let png_len = iend_offset.saturating_add(8); // include "IEND" (4) + CRC (4)
+    let png_bytes = png_data_slice.get(..png_len)?;
+
+    // 3. Decode PNG to tiny_skia::Pixmap
+    let pixmap = decode_png_to_pixmap(png_bytes)?;
+
+    // 4. Create CanvasShape covering the mat underneath the cut vectors
+    Some(CanvasShape {
+        kind: ShapeKind::Rectangle,
+        x: 0.0,
+        y: 0.0,
+        width: mat_w_in,
+        height: mat_h_in,
+        points: vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(mat_w_in, 0.0),
+            egui::pos2(mat_w_in, mat_h_in),
+            egui::pos2(0.0, mat_h_in),
+        ],
+        text: String::new(),
+        fill_color: egui::Color32::WHITE,
+        stroke_color: None,
+        stroke_width: 0.0,
+        is_closed: true,
+        is_svg_path: false,
+        is_modified: false,
+        triangles: Vec::new(),
+        group_id: None,
+        group_path: Vec::new(),
+        is_visible: true,
+        is_locked: true,
+        pixmap: Some(pixmap),
+        texture: None,
+    })
+}
+
+/// Robustly decodes PNG bytes to tiny_skia::Pixmap.
+fn decode_png_to_pixmap(bytes: &[u8]) -> Option<tiny_skia::Pixmap> {
+    if let Ok(pm) = tiny_skia::Pixmap::decode_png(bytes) {
+        return Some(pm);
+    }
+    if let Ok(dyn_img) = image::load_from_memory(bytes) {
+        let rgba = dyn_img.to_rgba8();
+        let (w, h) = (rgba.width(), rgba.height());
+        let int_size = tiny_skia::IntSize::from_wh(w, h)?;
+        return tiny_skia::Pixmap::from_vec(rgba.into_raw(), int_size);
+    }
+    None
+}
+
+/// Merges concentric closed shapes sharing the same solid fill color into a compound path with EvenOdd cutout.
+fn merge_compound_paths(shapes: Vec<CanvasShape>) -> Vec<CanvasShape> {
+    if shapes.len() < 2 {
+        return shapes;
+    }
+
+    let mut merged = Vec::with_capacity(shapes.len());
+    let mut consumed = vec![false; shapes.len()];
+
+    for i in 0..shapes.len() {
+        if consumed[i] {
+            continue;
+        }
+
+        let s1 = &shapes[i];
+        if !s1.is_closed || s1.fill_color.a() == 0 || s1.points.len() < 3 {
+            merged.push(s1.clone());
+            continue;
+        }
+
+        // Look for an inner hole candidate j
+        let mut hole_idx = None;
+        for j in 0..shapes.len() {
+            if i == j || consumed[j] {
+                continue;
+            }
+            let s2 = &shapes[j];
+            if !s2.is_closed || s2.fill_color != s1.fill_color || s2.points.len() < 3 {
+                continue;
+            }
+
+            // Check if s1 contains s2's bounding box with a margin
+            let s1_max_x = s1.x + s1.width;
+            let s1_max_y = s1.y + s1.height;
+            let s2_max_x = s2.x + s2.width;
+            let s2_max_y = s2.y + s2.height;
+
+            if s1.x <= s2.x + 0.05 && s1.y <= s2.y + 0.05 && s1_max_x >= s2_max_x - 0.05 && s1_max_y >= s2_max_y - 0.05 {
+                hole_idx = Some(j);
+                break;
+            }
+        }
+
+        if let Some(j) = hole_idx {
+            consumed[i] = true;
+            consumed[j] = true;
+            let outer = s1;
+            let inner = &shapes[j];
+
+            // Build compound SVG path d string: M {outer} Z M {inner} Z
+            let outer_str = outer.points.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" L ");
+            let inner_str = inner.points.iter().map(|p| format!("{:.3},{:.3}", p.x, p.y)).collect::<Vec<_>>().join(" L ");
+            let compound_d = format!("M {} Z M {} Z", outer_str, inner_str);
+
+            // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so the hole punches through
+            let dpi = 150.0_f32;
+            let pix_w = ((outer.width * dpi).ceil() as u32).max(16);
+            let pix_h = ((outer.height * dpi).ceil() as u32).max(16);
+
+            let mut pixmap = None;
+            if let Some(mut pm) = tiny_skia::Pixmap::new(pix_w, pix_h) {
+                let pad = 2.0_f32;
+                let sx = (pix_w as f32 - pad * 2.0) / outer.width.max(0.001);
+                let sy = (pix_h as f32 - pad * 2.0) / outer.height.max(0.001);
+
+                let mut pb = tiny_skia::PathBuilder::new();
+                if let Some(p0) = outer.points.first() {
+                    pb.move_to((p0.x - outer.x) * sx + pad, (p0.y - outer.y) * sy + pad);
+                    for p in outer.points.iter().skip(1) {
+                        pb.line_to((p.x - outer.x) * sx + pad, (p.y - outer.y) * sy + pad);
+                    }
+                    pb.close();
+                }
+                if let Some(p0) = inner.points.first() {
+                    pb.move_to((p0.x - outer.x) * sx + pad, (p0.y - outer.y) * sy + pad);
+                    for p in inner.points.iter().skip(1) {
+                        pb.line_to((p.x - outer.x) * sx + pad, (p.y - outer.y) * sy + pad);
+                    }
+                    pb.close();
+                }
+
+                if let Some(path) = pb.finish() {
+                    let mut fill_paint = tiny_skia::Paint::default();
+                    fill_paint.set_color_rgba8(outer.fill_color.r(), outer.fill_color.g(), outer.fill_color.b(), outer.fill_color.a());
+                    fill_paint.anti_alias = true;
+                    pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+
+                    if let Some(sc) = outer.stroke_color {
+                        let mut stroke_paint = tiny_skia::Paint::default();
+                        stroke_paint.set_color_rgba8(sc.r(), sc.g(), sc.b(), sc.a());
+                        stroke_paint.anti_alias = true;
+                        let st = tiny_skia::Stroke {
+                            width: (outer.stroke_width * sx).max(1.0),
+                            line_cap: tiny_skia::LineCap::Round,
+                            line_join: tiny_skia::LineJoin::Round,
+                            ..Default::default()
+                        };
+                        pm.stroke_path(&path, &stroke_paint, &st, tiny_skia::Transform::identity(), None);
+                    }
+                    pixmap = Some(pm);
+                }
+            }
+
+            let mut compound_shape = outer.clone();
+            compound_shape.text = compound_d;
+            compound_shape.is_svg_path = true;
+            compound_shape.pixmap = pixmap;
+            compound_shape.texture = None;
+            merged.push(compound_shape);
+        } else {
+            merged.push(s1.clone());
+        }
+    }
+
+    merged
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1631,11 +1923,12 @@ mod tests {
             // Verify shapes form a coherent, compact group on the 8.5x11 page instead of being scattered
             let design_w = max_x - min_x;
             let design_h = max_y - min_y;
-            assert!(design_w > 2.0 && design_w < 5.0, "Unexpected design width: {:.2} in", design_w);
-            assert!(design_h > 1.5 && design_h < 4.5, "Unexpected design height: {:.2} in", design_h);
+            assert!(design_w > 6.0 && design_w <= 8.5, "Unexpected design width: {:.2} in", design_w);
+            assert!(design_h > 5.0 && design_h <= 11.0, "Unexpected design height: {:.2} in", design_h);
 
             let svg1 = convert_studio_to_svg(&std::fs::read(path1).unwrap()).expect("Convert Peeker Bears to SVG");
             assert!(svg1.contains("<svg"));
+            assert!(svg1.contains("fill-rule=\"evenodd\"") || svg1.contains("<path"));
             assert!(svg1.contains("<polygon") || svg1.contains("<polyline"));
         }
 
@@ -1643,6 +1936,11 @@ mod tests {
             let doc2 = parse_studio_file(path2).expect("Parse DISNEY HEARTS.studio3");
             assert_eq!(doc2.version, StudioFormatVersion::StudioV5);
             assert!(doc2.shapes.len() >= 100, "Expected >= 100 shapes in DISNEY HEARTS, got {}", doc2.shapes.len());
+            // Verify embedded PNG raster artwork was extracted onto bottom shape
+            assert!(doc2.shapes[0].pixmap.is_some(), "Expected embedded PNG raster artwork on doc2.shapes[0]");
+            assert_eq!(doc2.shapes[0].width, doc2.mat_width_in);
+            assert_eq!(doc2.shapes[0].height, doc2.mat_height_in);
+
             for shape in &doc2.shapes {
                 assert!(shape.width > 0.0);
                 assert!(shape.height > 0.0);
@@ -1654,7 +1952,9 @@ mod tests {
 
             let svg2 = convert_studio_to_svg(&std::fs::read(path2).unwrap()).expect("Convert DISNEY HEARTS to SVG");
             assert!(svg2.contains("<svg"));
-            assert!(svg2.contains("<polygon") || svg2.contains("<polyline"));
+            assert!(svg2.contains("<image"));
+            assert!(svg2.contains("href=\"data:image/png;base64,"));
+            assert!(svg2.contains("<polygon") || svg2.contains("<polyline") || svg2.contains("<path"));
         }
     }
 }
