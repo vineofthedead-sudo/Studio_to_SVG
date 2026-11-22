@@ -4,6 +4,27 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.4.7] - 2026-11-22
+
+### Added & Improved
+- **Multi-PNG Stream Discovery & Pattern Swatch Extraction (`app/src/studio_format.rs`)**:
+  - Upgraded `extract_embedded_png` to scan all embedded PNG rasters across the entire binary stream instead of halting at the first thumbnail image.
+  - Accurately classifies square power-of-two texture tiles (`w == h && (w & (w - 1)) == 0 && w >= 64`, e.g. 512×512) as repeating `pattern_swatch` assets.
+  - Distinguishes high-resolution Print & Cut rasters (`w >= 400 && h >= 400 && !is_square`) from pattern swatches and low-res preview thumbnails (e.g. 225×225, 263×196), preventing preview thumbnails from ever spawning as full-mat background layers.
+- **Vector Shape Pattern-Fill Tiling & Clipping (`app/src/studio_format.rs`)**:
+  - Reordered `parse_studio_data` so `extract_embedded_png` runs before path parsing and compound-path merging, passing `pattern_swatch.as_ref()` into `parse_paths`, `create_canvas_shape_from_subpaths`, and `merge_compound_paths`.
+  - Implemented tiled `tiny_skia::Pattern` shaders with `SpreadMode::Repeat`, `FilterQuality::Bilinear`, and 2.0-inch tile scale matching SVG `<pattern width="2.000" height="2.000">` output.
+  - Pattern fills are rendered with `tiny_skia::FillRule::EvenOdd` and strictly clipped inside their referencing vector shapes, eliminating full-mat `#1 Print Background` overlays.
+- **Guaranteed Vector Cut-Line Visibility (`#ff2626`) (`app/src/studio_format.rs`, `app/src/main.rs`)**:
+  - In `create_canvas_shape_from_subpaths` and `merge_compound_paths`, if `stroke_color` is absent/transparent or the shape has a white fill (`#ffffff`) or pattern fill, automatically assign default cut-line stroke `egui::Color32::from_rgb(255, 38, 38)` (`#ff2626`) with stroke width `>= 0.02` in.
+  - In `convert_studio_to_svg` and `export_svg_string`, emit `stroke="#ff2626" stroke-width="0.020"` for pattern-filled and white shapes with stroke `none`, ensuring all cut contours remain clearly visible against the cutting mat grid.
+- **Integration Testing & Test Suite Verification**:
+  - Added `test_studio3_pattern_fill_and_cut_outline_visibility` verifying swatch extraction, pattern clipping, visible `#ff2626` cut lines, pre-rendered non-transparent pixmaps, and SVG pattern export across `DISNEY HEARTS.studio3`, `1 DISNEY PEOPLE.studio3`, and `1 HEADS.studio3`.
+  - Hardened `detect_format_and_stream` and `parse_studio_data` bounds checking against truncated or synthetic streams.
+  - All 61 tests passing cleanly (`cargo test`); release binary verified (`cargo build --release`).
+
+---
+
 ## [0.4.6] - 2026-11-22
 
 ### Added & Improved

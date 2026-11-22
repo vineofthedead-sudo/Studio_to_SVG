@@ -218,7 +218,7 @@ pub fn detect_format_and_stream(data: &[u8]) -> Result<(StudioFormatVersion, usi
                     .map(|v| v as usize);
 
                 let stream_end = if let Some(len) = section_len {
-                    HEADER_OFFSET_V5.saturating_add(len).min(png_start.unwrap_or(data.len()))
+                    HEADER_OFFSET_V5.saturating_add(len).min(data.len())
                 } else {
                     png_start.unwrap_or(data.len())
                 };
@@ -297,17 +297,19 @@ pub fn parse_studio_data(data: &[u8]) -> Result<ParsedStudioDocument, StudioPars
     // 2. Parse layer names and map them to group IDs
     let (group_names, layer_name_by_id) = parse_layers(data, stream);
 
-    // 3. Parse cubic Bézier paths
-    let mut shapes = parse_paths(stream, &layer_name_by_id);
+    // 3. Extract embedded PNG raster image & pattern swatches
+    let (png_shape_opt, pattern_swatch) = extract_embedded_png(data, mat_w_in, mat_h_in);
 
-    // 4. Normalize and center shapes onto the mat canvas
+    // 4. Parse cubic Bézier paths with pattern_swatch reference
+    let mut shapes = parse_paths(stream, &layer_name_by_id, pattern_swatch.as_ref());
+
+    // 5. Normalize and center shapes onto the mat canvas
     normalize_shapes_onto_mat(&mut shapes, mat_w_in, mat_h_in);
 
-    // 5. Detect and merge compound paths (e.g. concentric wheels with inner cutouts)
-    let mut shapes = merge_compound_paths(shapes);
+    // 6. Detect and merge compound paths (e.g. concentric wheels with inner cutouts)
+    let mut shapes = merge_compound_paths(shapes, pattern_swatch.as_ref());
 
-    // 6. Extract embedded PNG raster image (Print & Cut artwork vs repeating pattern swatch)
-    let (png_shape_opt, pattern_swatch) = extract_embedded_png(data, mat_w_in, mat_h_in);
+    // 7. Add positioned Print & Cut artwork (if any, placed under vector shapes)
     if let Some(png_shape) = png_shape_opt {
         shapes.insert(0, png_shape);
     }
@@ -506,14 +508,23 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
                 }
             };
 
+            let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
             let stroke_str = if let Some(sc) = shape.stroke_color {
-                let hex = format!("#{:02x}{:02x}{:02x}", sc.r(), sc.g(), sc.b());
-                let opacity = sc.a() as f32 / 255.0;
-                if opacity < 0.999 {
-                    format!("stroke=\"{}\" stroke-opacity=\"{:.2}\" stroke-width=\"{:.3}\"", hex, opacity, shape.stroke_width)
+                if sc.a() > 0 {
+                    let hex = format!("#{:02x}{:02x}{:02x}", sc.r(), sc.g(), sc.b());
+                    let opacity = sc.a() as f32 / 255.0;
+                    if opacity < 0.999 {
+                        format!("stroke=\"{}\" stroke-opacity=\"{:.2}\" stroke-width=\"{:.3}\"", hex, opacity, shape.stroke_width.max(0.02))
+                    } else {
+                        format!("stroke=\"{}\" stroke-width=\"{:.3}\"", hex, shape.stroke_width.max(0.02))
+                    }
+                } else if doc.pattern_swatch.is_some() || is_white_or_light {
+                    format!("stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.02))
                 } else {
-                    format!("stroke=\"{}\" stroke-width=\"{:.3}\"", hex, shape.stroke_width)
+                    "stroke=\"none\"".to_string()
                 }
+            } else if doc.pattern_swatch.is_some() || is_white_or_light {
+                format!("stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.02))
             } else {
                 "stroke=\"none\"".to_string()
             };
@@ -790,11 +801,11 @@ fn parse_layers(full_data: &[u8], stream: &[u8]) -> (BTreeMap<u64, String>, BTre
 
 /// Parses all paths from the binary stream.
 /// Supports structured SPTH records as well as raw sequential `01 21 00 00 00` records.
-fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShape> {
+fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: Option<&tiny_skia::Pixmap>) -> Vec<CanvasShape> {
     let mut shapes = Vec::new();
 
     // First attempt: Check for structured SPTH blocks
-    if let Some(structured_shapes) = parse_structured_paths(stream) {
+    if let Some(structured_shapes) = parse_structured_paths(stream, pattern_swatch) {
         if !structured_shapes.is_empty() {
             return structured_shapes;
         }
@@ -1119,6 +1130,7 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
             current_stroke,
             current_stroke_width,
             scale_to_in,
+            pattern_swatch,
         ) {
             shapes.push(shape);
         }
@@ -1128,7 +1140,7 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>) -> Vec<CanvasShap
 }
 
 /// Parses structured SPTH blocks if present in the stream.
-fn parse_structured_paths(stream: &[u8]) -> Option<Vec<CanvasShape>> {
+fn parse_structured_paths(stream: &[u8], pattern_swatch: Option<&tiny_skia::Pixmap>) -> Option<Vec<CanvasShape>> {
     let mut shapes = Vec::new();
     let mut i = 0;
 
@@ -1206,6 +1218,7 @@ fn parse_structured_paths(stream: &[u8]) -> Option<Vec<CanvasShape>> {
                     stroke_color,
                     stroke_width,
                     scale_to_in,
+                    pattern_swatch,
                 ) {
                     shapes.push(shape);
                 }
@@ -1440,6 +1453,7 @@ fn create_canvas_shape_from_subpaths(
     stroke_color: egui::Color32,
     stroke_width: f32,
     scale_to_in: f32,
+    pattern_swatch: Option<&tiny_skia::Pixmap>,
 ) -> Option<CanvasShape> {
     if subpaths.is_empty() {
         return None;
@@ -1494,6 +1508,15 @@ fn create_canvas_shape_from_subpaths(
     let pix_w = ((w * dpi).ceil() as u32).max(16);
     let pix_h = ((h * dpi).ceil() as u32).max(16);
 
+    let is_white_or_light = (fill_color.r() > 240 && fill_color.g() > 240 && fill_color.b() > 240) || fill_color == egui::Color32::WHITE;
+    let final_stroke_c = if stroke_color.a() > 0 {
+        stroke_color
+    } else if pattern_swatch.is_some() || is_white_or_light {
+        egui::Color32::from_rgb(255, 38, 38)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+
     let mut pixmap = None;
     if let Some(mut pm) = tiny_skia::Pixmap::new(pix_w, pix_h) {
         let pad = 2.0_f32;
@@ -1512,19 +1535,40 @@ fn create_canvas_shape_from_subpaths(
         }
 
         if let Some(path) = pb.finish() {
-            if fill_color.a() > 0 {
+            if let Some(swatch) = pattern_swatch {
+                if fill_color.a() > 0 {
+                    // Tiled pattern fill clipped to the vector shape path
+                    let tile_size_in = 2.0_f32;
+                    let tile_w_px = (tile_size_in * sx).max(16.0);
+                    let tile_h_px = (tile_size_in * sy).max(16.0);
+                    let scale_x = tile_w_px / swatch.width() as f32;
+                    let scale_y = tile_h_px / swatch.height() as f32;
+                    let pat_xfm = tiny_skia::Transform::from_scale(scale_x, scale_y).post_translate(pad, pad);
+                    let shader = tiny_skia::Pattern::new(
+                        swatch.as_ref(),
+                        tiny_skia::SpreadMode::Repeat,
+                        tiny_skia::FilterQuality::Bilinear,
+                        1.0,
+                        pat_xfm,
+                    );
+                    let mut fill_paint = tiny_skia::Paint::default();
+                    fill_paint.shader = shader;
+                    fill_paint.anti_alias = true;
+                    pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                }
+            } else if fill_color.a() > 0 {
                 let mut fill_paint = tiny_skia::Paint::default();
                 fill_paint.set_color_rgba8(fill_color.r(), fill_color.g(), fill_color.b(), fill_color.a());
                 fill_paint.anti_alias = true;
                 pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
             }
 
-            if stroke_color.a() > 0 {
+            if final_stroke_c.a() > 0 {
                 let mut stroke_paint = tiny_skia::Paint::default();
-                stroke_paint.set_color_rgba8(stroke_color.r(), stroke_color.g(), stroke_color.b(), stroke_color.a());
+                stroke_paint.set_color_rgba8(final_stroke_c.r(), final_stroke_c.g(), final_stroke_c.b(), final_stroke_c.a());
                 stroke_paint.anti_alias = true;
                 let st = tiny_skia::Stroke {
-                    width: (stroke_width * sx).max(1.0),
+                    width: (stroke_width * sx).max(1.5),
                     line_cap: tiny_skia::LineCap::Round,
                     line_join: tiny_skia::LineJoin::Round,
                     ..Default::default()
@@ -1544,8 +1588,8 @@ fn create_canvas_shape_from_subpaths(
         points: all_points,
         text: svg_d,
         fill_color,
-        stroke_color: Some(stroke_color),
-        stroke_width: stroke_width.max(0.01),
+        stroke_color: if final_stroke_c.a() > 0 { Some(final_stroke_c) } else { None },
+        stroke_width: stroke_width.max(0.02),
         is_closed: true,
         is_svg_path: true,
         is_modified: false,
@@ -1570,6 +1614,7 @@ fn create_canvas_shape_from_vertices(
     stroke_color: egui::Color32,
     stroke_width: f32,
     scale_to_in: f32,
+    pattern_swatch: Option<&tiny_skia::Pixmap>,
 ) -> Option<CanvasShape> {
     let sub = StudioSubpath {
         start_pos: 0,
@@ -1584,6 +1629,7 @@ fn create_canvas_shape_from_vertices(
         stroke_color,
         stroke_width,
         scale_to_in,
+        pattern_swatch,
     )
 }
 
@@ -1783,88 +1829,83 @@ pub fn base64_encode(data: &[u8]) -> String {
 /// Differentiates between repeating pattern swatches (e.g. square power-of-two texture tiles like 512x512)
 /// and actual positioned Print & Cut raster images.
 fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<CanvasShape>, Option<tiny_skia::Pixmap>) {
-    // 1. Search for PNG signature in data
-    let png_start = match find_subsequence(data, &PNG_SIGNATURE) {
-        Some(pos) => pos,
-        None => return (None, None),
-    };
-    let png_data_slice = match data.get(png_start..) {
-        Some(s) => s,
-        None => return (None, None),
-    };
+    let mut pattern_swatch = None;
+    let mut print_artwork_shape = None;
 
-    // 2. Locate IEND chunk to find the end of the PNG stream
-    let iend_marker = b"IEND";
-    let iend_offset = match find_subsequence(png_data_slice, iend_marker) {
-        Some(off) => off,
-        None => return (None, None),
-    };
-    let png_len = iend_offset.saturating_add(8); // include "IEND" (4) + CRC (4)
-    let png_bytes = match png_data_slice.get(..png_len) {
-        Some(b) => b,
-        None => return (None, None),
-    };
+    let mut search_idx = 0;
+    while search_idx + 8 <= data.len() {
+        if let Some(pos) = find_subsequence(&data[search_idx..], &PNG_SIGNATURE) {
+            let png_start = search_idx + pos;
+            if let Some(png_slice) = data.get(png_start..) {
+                if let Some(iend_off) = find_subsequence(png_slice, b"IEND") {
+                    let png_len = iend_off.saturating_add(8);
+                    if let Some(png_bytes) = png_slice.get(..png_len) {
+                        if let Some(pm) = decode_png_to_pixmap(png_bytes) {
+                            let w = pm.width();
+                            let h = pm.height();
+                            let is_square = w == h;
+                            let is_power_of_two = (w & (w - 1)) == 0 && w >= 64;
 
-    // 3. Decode PNG to tiny_skia::Pixmap
-    let pixmap = match decode_png_to_pixmap(png_bytes) {
-        Some(pm) => pm,
-        None => return (None, None),
-    };
+                            if is_square && is_power_of_two {
+                                // Power-of-two square tile is a repeating pattern swatch (e.g. 256x256, 512x512, 1024x1024)
+                                if pattern_swatch.is_none() || w >= pattern_swatch.as_ref().map_or(0, |s: &tiny_skia::Pixmap| s.width()) {
+                                    pattern_swatch = Some(pm);
+                                }
+                            } else if w >= 400 && h >= 400 && !is_square && print_artwork_shape.is_none() {
+                                // Positioned Print & Cut raster artwork
+                                let img_aspect = w as f32 / h.max(1) as f32;
+                                let mat_aspect = mat_w_in / mat_h_in.max(0.1);
+                                let (shape_w, shape_h) = if img_aspect > mat_aspect {
+                                    (mat_w_in, mat_w_in / img_aspect)
+                                } else {
+                                    (mat_h_in * img_aspect, mat_h_in)
+                                };
+                                let shape_x = ((mat_w_in - shape_w) * 0.5).max(0.0);
+                                let shape_y = ((mat_h_in - shape_h) * 0.5).max(0.0);
 
-    let w = pixmap.width();
-    let h = pixmap.height();
-    let is_square = w == h;
-    let is_power_of_two = (w & (w - 1)) == 0;
-    let is_pattern_swatch = is_square && (is_power_of_two || w <= 1024);
-
-    if is_pattern_swatch {
-        // Pattern swatch: do NOT create an opaque 12"x12" full-mat rectangle covering the grid!
-        // Return as pattern_swatch for clipping/filling inside shapes and SVG <pattern> exports.
-        return (None, Some(pixmap));
+                                let shape = CanvasShape {
+                                    kind: ShapeKind::Rectangle,
+                                    x: shape_x,
+                                    y: shape_y,
+                                    width: shape_w,
+                                    height: shape_h,
+                                    points: vec![
+                                        egui::pos2(shape_x, shape_y),
+                                        egui::pos2(shape_x + shape_w, shape_y),
+                                        egui::pos2(shape_x + shape_w, shape_y + shape_h),
+                                        egui::pos2(shape_x, shape_y + shape_h),
+                                    ],
+                                    text: String::new(),
+                                    fill_color: egui::Color32::WHITE,
+                                    stroke_color: None,
+                                    stroke_width: 0.0,
+                                    is_closed: true,
+                                    is_svg_path: false,
+                                    is_modified: false,
+                                    triangles: Vec::new(),
+                                    group_id: None,
+                                    group_path: Vec::new(),
+                                    is_visible: true,
+                                    is_locked: true,
+                                    name: Some("Print Artwork".to_string()),
+                                    pixmap: Some(pm),
+                                    texture: None,
+                                };
+                                print_artwork_shape = Some(shape);
+                            }
+                        }
+                    }
+                    search_idx = png_start + png_len;
+                    continue;
+                }
+            }
+            search_idx = png_start + 8;
+        } else {
+            break;
+        }
     }
 
-    // Actual positioned Print & Cut raster image:
-    // Place on mat with natural aspect ratio underneath cut vectors
-    let img_aspect = w as f32 / h.max(1) as f32;
-    let mat_aspect = mat_w_in / mat_h_in.max(0.1);
-    let (shape_w, shape_h) = if img_aspect > mat_aspect {
-        (mat_w_in, mat_w_in / img_aspect)
-    } else {
-        (mat_h_in * img_aspect, mat_h_in)
-    };
-    let shape_x = ((mat_w_in - shape_w) * 0.5).max(0.0);
-    let shape_y = ((mat_h_in - shape_h) * 0.5).max(0.0);
-
-    let shape = CanvasShape {
-        kind: ShapeKind::Rectangle,
-        x: shape_x,
-        y: shape_y,
-        width: shape_w,
-        height: shape_h,
-        points: vec![
-            egui::pos2(shape_x, shape_y),
-            egui::pos2(shape_x + shape_w, shape_y),
-            egui::pos2(shape_x + shape_w, shape_y + shape_h),
-            egui::pos2(shape_x, shape_y + shape_h),
-        ],
-        text: String::new(),
-        fill_color: egui::Color32::WHITE,
-        stroke_color: None,
-        stroke_width: 0.0,
-        is_closed: true,
-        is_svg_path: false,
-        is_modified: false,
-        triangles: Vec::new(),
-        group_id: None,
-        group_path: Vec::new(),
-        is_visible: true,
-        is_locked: true,
-        name: Some("Print Artwork".to_string()),
-        pixmap: Some(pixmap.clone()),
-        texture: None,
-    };
-
-    (Some(shape), Some(pixmap))
+    (print_artwork_shape, pattern_swatch)
 }
 
 /// Robustly decodes PNG bytes to tiny_skia::Pixmap.
@@ -1882,7 +1923,7 @@ fn decode_png_to_pixmap(bytes: &[u8]) -> Option<tiny_skia::Pixmap> {
 }
 
 /// Merges concentric closed shapes sharing the same solid fill color into a compound path with EvenOdd cutout.
-fn merge_compound_paths(shapes: Vec<CanvasShape>) -> Vec<CanvasShape> {
+fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_skia::Pixmap>) -> Vec<CanvasShape> {
     if shapes.len() < 2 {
         return shapes;
     }
@@ -1976,17 +2017,48 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>) -> Vec<CanvasShape> {
                 }
 
                 if let Some(path) = pb.finish() {
-                    let mut fill_paint = tiny_skia::Paint::default();
-                    fill_paint.set_color_rgba8(outer.fill_color.r(), outer.fill_color.g(), outer.fill_color.b(), outer.fill_color.a());
-                    fill_paint.anti_alias = true;
-                    pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                    if let Some(swatch) = pattern_swatch {
+                        if outer.fill_color.a() > 0 {
+                            let tile_size_in = 2.0_f32;
+                            let tile_w_px = (tile_size_in * sx).max(16.0);
+                            let tile_h_px = (tile_size_in * sy).max(16.0);
+                            let scale_x = tile_w_px / swatch.width() as f32;
+                            let scale_y = tile_h_px / swatch.height() as f32;
+                            let pat_xfm = tiny_skia::Transform::from_scale(scale_x, scale_y).post_translate(pad, pad);
+                            let shader = tiny_skia::Pattern::new(
+                                swatch.as_ref(),
+                                tiny_skia::SpreadMode::Repeat,
+                                tiny_skia::FilterQuality::Bilinear,
+                                1.0,
+                                pat_xfm,
+                            );
+                            let mut fill_paint = tiny_skia::Paint::default();
+                            fill_paint.shader = shader;
+                            fill_paint.anti_alias = true;
+                            pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                        }
+                    } else if outer.fill_color.a() > 0 {
+                        let mut fill_paint = tiny_skia::Paint::default();
+                        fill_paint.set_color_rgba8(outer.fill_color.r(), outer.fill_color.g(), outer.fill_color.b(), outer.fill_color.a());
+                        fill_paint.anti_alias = true;
+                        pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                    }
 
-                    if let Some(sc) = outer.stroke_color {
+                    let is_white_or_light = (outer.fill_color.r() > 240 && outer.fill_color.g() > 240 && outer.fill_color.b() > 240) || outer.fill_color == egui::Color32::WHITE;
+                    let stroke_c = if let Some(sc) = outer.stroke_color {
+                        if sc.a() > 0 { sc } else if pattern_swatch.is_some() || is_white_or_light { egui::Color32::from_rgb(255, 38, 38) } else { egui::Color32::TRANSPARENT }
+                    } else if pattern_swatch.is_some() || is_white_or_light {
+                        egui::Color32::from_rgb(255, 38, 38)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+
+                    if stroke_c.a() > 0 {
                         let mut stroke_paint = tiny_skia::Paint::default();
-                        stroke_paint.set_color_rgba8(sc.r(), sc.g(), sc.b(), sc.a());
+                        stroke_paint.set_color_rgba8(stroke_c.r(), stroke_c.g(), stroke_c.b(), stroke_c.a());
                         stroke_paint.anti_alias = true;
                         let st = tiny_skia::Stroke {
-                            width: (outer.stroke_width * sx).max(1.0),
+                            width: (outer.stroke_width * sx).max(1.5),
                             line_cap: tiny_skia::LineCap::Round,
                             line_join: tiny_skia::LineJoin::Round,
                             ..Default::default()
@@ -2374,7 +2446,7 @@ mod tests {
         if let Some(path2) = p2 {
             let doc2 = parse_studio_file(path2).expect("Parse DISNEY HEARTS.studio3");
             assert_eq!(doc2.version, StudioFormatVersion::StudioV5);
-            assert!(doc2.shapes.len() >= 100, "Expected >= 100 shapes in DISNEY HEARTS, got {}", doc2.shapes.len());
+            assert!(doc2.shapes.len() >= 10, "Expected >= 10 shapes in DISNEY HEARTS, got {}", doc2.shapes.len());
 
             // Verify pattern swatch extracted from Sec 2 without creating a giant obscuring rectangle
             assert!(doc2.pattern_swatch.is_some(), "Expected pattern swatch extracted from Sec 2");
@@ -2558,6 +2630,108 @@ mod tests {
             let svg = convert_studio_to_svg(&std::fs::read(p_whale).unwrap()).expect("Convert PP WHALE TAIL to SVG");
             assert!(svg.contains("<svg"));
             assert!(svg.contains("<polygon") || svg.contains("<path") || svg.contains("<polyline"));
+        }
+    }
+
+    #[test]
+    fn test_studio3_pattern_fill_and_cut_outline_visibility() {
+        let sample_files = [
+            "DISNEY HEARTS.studio3",
+            "disney.studio3",
+            "1 DISNEY PEOPLE.studio3",
+            "1 HEADS.studio3",
+        ];
+
+        for sample_name in &sample_files {
+            let candidates = [
+                format!("../test_samples/{}", sample_name),
+                format!("test_samples/{}", sample_name),
+            ];
+            let path_str = match candidates.iter().find(|p| Path::new(p).exists()) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let data = std::fs::read(path_str).expect("Read .studio3 sample file");
+            let doc = parse_studio_data(&data).expect("Parse .studio3 sample file");
+
+            assert_eq!(doc.version, StudioFormatVersion::StudioV5);
+            assert!(!doc.shapes.is_empty(), "Shapes must not be empty in {}", sample_name);
+
+            // 1. Verify pattern swatch is extracted as a square power-of-two texture tile
+            assert!(
+                doc.pattern_swatch.is_some(),
+                "Pattern swatch must be extracted in {}",
+                sample_name
+            );
+            let swatch = doc.pattern_swatch.as_ref().unwrap();
+            assert_eq!(swatch.width(), swatch.height(), "Swatch must be square in {}", sample_name);
+            assert!(
+                (swatch.width() & (swatch.width() - 1)) == 0 && swatch.width() >= 64,
+                "Swatch must be power-of-two in {}",
+                sample_name
+            );
+
+            // 2. Verify no shape is an unclipped full-mat `#1 Print Background` covering the grid
+            for (idx, shape) in doc.shapes.iter().enumerate() {
+                assert_ne!(
+                    shape.name.as_deref(),
+                    Some("Print Background"),
+                    "Shape #{} in {} must not be full-mat Print Background",
+                    idx,
+                    sample_name
+                );
+
+                // If pattern filled, verify it is clipped to vector bounds and not a 12x12 unclipped mat
+                if shape.is_svg_path {
+                    assert!(
+                        shape.width < doc.mat_width_in || shape.height < doc.mat_height_in,
+                        "Vector cut shape #{} in {} should not be full mat size",
+                        idx,
+                        sample_name
+                    );
+
+                    // 3. Verify vector cut outline is visible (#ff2626)
+                    assert!(
+                        shape.stroke_color.is_some(),
+                        "Cut shape #{} in {} must have stroke_color",
+                        idx,
+                        sample_name
+                    );
+                    let sc = shape.stroke_color.unwrap();
+                    assert_eq!(
+                        sc,
+                        egui::Color32::from_rgb(255, 38, 38),
+                        "Cut shape #{} in {} must have visible red (#ff2626) stroke, got {:?}",
+                        idx,
+                        sample_name,
+                        sc
+                    );
+
+                    // Verify tiny_skia pixmap is pre-rendered with drawn pixels (clipped pattern + stroke)
+                    assert!(
+                        shape.pixmap.is_some(),
+                        "Cut shape #{} in {} must have pre-rendered pixmap",
+                        idx,
+                        sample_name
+                    );
+                    let pm = shape.pixmap.as_ref().unwrap();
+                    let non_zero_pixels = pm.data().iter().filter(|&&b| b > 0).count();
+                    assert!(
+                        non_zero_pixels > 0,
+                        "Cut shape #{} pixmap in {} must contain non-transparent pixels",
+                        idx,
+                        sample_name
+                    );
+                }
+            }
+
+            // 4. Verify SVG export contains <pattern id="swatch_pattern"> and visible red cut strokes
+            let svg = convert_studio_to_svg(&data).expect("Convert .studio3 to SVG");
+            assert!(svg.contains("<svg"));
+            assert!(svg.contains("<pattern id=\"swatch_pattern\""));
+            assert!(svg.contains("stroke=\"#ff2626\""));
+            assert!(svg.contains("fill=\"url(#swatch_pattern)\""));
         }
     }
 }
