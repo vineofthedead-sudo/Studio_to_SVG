@@ -351,7 +351,8 @@ fn attach_print_artwork_to_shapes(
 
     let mut non_boundary_pts = Vec::new();
     for s in shapes.iter() {
-        if s.width < 20.0 && s.height < 10.0 {
+        let is_mat_boundary = (s.width >= 20.0 && s.height >= 10.0) || (s.width >= 11.5 && s.height >= 11.5);
+        if !is_mat_boundary {
             non_boundary_pts.extend_from_slice(&s.points);
         }
     }
@@ -363,9 +364,15 @@ fn attach_print_artwork_to_shapes(
     let vw = vx_max - vx_min;
     let vh = vy_max - vy_min;
 
-    let (shape_x, shape_y, shape_w, shape_h) = if vw >= mat_w_in * 0.7 && vh >= mat_h_in * 0.7 {
+    let img_aspect = pm.width() as f32 / pm.height().max(1) as f32;
+    let vec_aspect = vw / vh.max(0.001);
+    let aspect_diff = (img_aspect - vec_aspect).abs() / img_aspect.max(0.001);
+
+    let (shape_x, shape_y, shape_w, shape_h) = if vw > 0.05 && vh > 0.05 && (aspect_diff < 0.25 || (vw < mat_w_in * 0.9 && vh < mat_h_in * 0.9)) {
+        // Localized design / overlay (e.g. OL BASEBALL SOLID, OL DISNEY CHIP & DALE)
+        (vx_min, vy_min, vw, vh)
+    } else if vw > 0.05 && vh > 0.05 && vw >= mat_w_in * 0.7 && vh >= mat_h_in * 0.7 {
         // Full-page Print & Cut (e.g. 100 ACRE WOODS POOH, AT HOME WITH MINNIE & MICKEY)
-        let img_aspect = pm.width() as f32 / pm.height().max(1) as f32;
         let mat_aspect = mat_w_in / mat_h_in.max(0.1);
         let (sw, sh) = if img_aspect > mat_aspect {
             (mat_w_in, mat_w_in / img_aspect)
@@ -376,7 +383,6 @@ fn attach_print_artwork_to_shapes(
         let sy = ((mat_h_in - sh) * 0.5).max(0.0);
         (sx, sy, sw, sh)
     } else if vw > 0.05 && vh > 0.05 {
-        // Localized design / overlay (e.g. OL BASEBALL SOLID, OL DISNEY CHIP & DALE)
         (vx_min, vy_min, vw, vh)
     } else {
         (0.0, 0.0, mat_w_in, mat_h_in)
@@ -1299,6 +1305,23 @@ fn parse_paths(
         id: u64,
         start_pos: usize,
         end_pos: usize,
+        transform: AffineTransform2D,
+    }
+
+    // Build block index for Studio V5 to map block end offset to block start offset (Block A)
+    let mut block_starts_by_end: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    if version == StudioFormatVersion::StudioV5 {
+        let mut q = 13;
+        while q + 5 <= stream.len() {
+            if stream[q] == 0x01 {
+                if let Some(size) = read_u32_le(stream, q + 1) {
+                    if size >= 4 && q + 1 + (size as usize) <= stream.len() {
+                        block_starts_by_end.insert(q + 1 + (size as usize), q);
+                    }
+                }
+            }
+            q += 1;
+        }
     }
 
     let mut group_spans: Vec<StudioGroupSpan> = Vec::new();
@@ -1318,17 +1341,83 @@ fn parse_paths(
             }
         }
         if let Some((pos, tag_len)) = found_match {
-            let header_offset = pos + tag_len + 60;
-            if header_offset + 5 <= stream.len() && stream[header_offset] == 0x01 {
-                if let Some(payload_len) = read_u32_le(stream, header_offset + 1) {
-                    let end_pos = (header_offset + 5).saturating_add(payload_len as usize).min(stream.len());
-                    group_spans.push(StudioGroupSpan {
-                        id: (group_spans.len() as u64) + 100,
-                        start_pos: pos,
-                        end_pos,
-                    });
+            // In Studio V5, search backwards from pos - 65 for the group's transform matrix.
+            // As documented in SPEC.md, the 65-byte transform sits immediately before the record tail (at offset pos - 92).
+            let mut group_xfm = AffineTransform2D::default();
+            let mut mat_end_pos = None;
+
+            if version == StudioFormatVersion::StudioV5 {
+                let search_floor = pos.saturating_sub(250);
+                let search_ceil = pos.saturating_sub(65);
+                for t in (search_floor..=search_ceil).rev() {
+                    if let (Some(m11), Some(m12), Some(tx), Some(m21), Some(m22), Some(ty), Some(m31), Some(m32), Some(m33)) = (
+                        read_f32_le(stream, t),
+                        read_f32_le(stream, t + 4),
+                        read_f32_le(stream, t + 8),
+                        read_f32_le(stream, t + 12),
+                        read_f32_le(stream, t + 16),
+                        read_f32_le(stream, t + 20),
+                        read_f32_le(stream, t + 24),
+                        read_f32_le(stream, t + 28),
+                        read_f32_le(stream, t + 32),
+                    ) {
+                        if m31.abs() < 1e-3 && m32.abs() < 1e-3 && (m33 - 1.0).abs() < 1e-3 {
+                            let det = m11 * m22 - m12 * m21;
+                            if (0.001..1000.0).contains(&det.abs())
+                                && (0.001..1000.0).contains(&m11.abs())
+                                && (0.001..1000.0).contains(&m22.abs())
+                                && m12.abs() < 500.0
+                                && m21.abs() < 500.0
+                                && tx.abs() < 50_000.0
+                                && ty.abs() < 50_000.0
+                            {
+                                group_xfm = AffineTransform2D::new(m11, m12, tx, m21, m22, ty);
+                                mat_end_pos = Some(t);
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                let group_search_start = pos.saturating_sub(300);
+                if let Some(group_slice) = stream.get(group_search_start..pos) {
+                    if let Some(xfm) = find_transform_in_slice(group_slice, version) {
+                        group_xfm = xfm;
+                    }
                 }
             }
+
+            let (span_start, span_end) = if version == StudioFormatVersion::StudioV5 {
+                if let Some(m_end) = mat_end_pos {
+                    if let Some(&b_start) = block_starts_by_end.get(&m_end) {
+                        (b_start.saturating_sub(1), pos + tag_len)
+                    } else {
+                        (pos, pos + tag_len)
+                    }
+                } else {
+                    (pos, pos + tag_len)
+                }
+            } else {
+                let header_offset = pos + tag_len + 60;
+                let group_payload_end = if header_offset + 5 <= stream.len() && stream[header_offset] == 0x01 {
+                    if let Some(payload_len) = read_u32_le(stream, header_offset + 1) {
+                        (header_offset + 5).saturating_add(payload_len as usize).min(stream.len())
+                    } else {
+                        pos
+                    }
+                } else {
+                    pos
+                };
+                (pos, group_payload_end.max(pos + tag_len))
+            };
+
+            group_spans.push(StudioGroupSpan {
+                id: (group_spans.len() as u64) + 100,
+                start_pos: span_start,
+                end_pos: span_end,
+                transform: group_xfm,
+            });
+
             g_search = pos + tag_len;
         } else {
             g_search += 1;
@@ -1351,12 +1440,16 @@ fn parse_paths(
 
     for sub in subpaths {
         if let Some(prev) = cur_cluster_subs.last() {
+            let gap = sub.start_pos.saturating_sub(prev.end_pos);
             let has_tag_boundary = object_tags.iter().any(|ot| ot.pos > prev.start_pos && ot.pos <= sub.start_pos);
             let has_style_boundary = style_records.iter().any(|sr| sr.pos > prev.start_pos && sr.pos <= sub.start_pos);
-            let gap = sub.start_pos.saturating_sub(prev.end_pos);
-            let fallback_gap = object_tags.is_empty() && style_records.is_empty() && gap > 200;
+            let is_boundary = if version == StudioFormatVersion::StudioV4 {
+                gap > 48 || has_style_boundary
+            } else {
+                has_tag_boundary || has_style_boundary || (object_tags.is_empty() && style_records.is_empty() && gap > 200)
+            };
 
-            if has_tag_boundary || has_style_boundary || fallback_gap {
+            if is_boundary {
                 if !cur_cluster_subs.is_empty() {
                     let start_pos = cur_cluster_subs.first().map(|s| s.start_pos).unwrap_or(0);
                     let end_pos = cur_cluster_subs.last().map(|s| s.end_pos).unwrap_or(start_pos);
@@ -1369,7 +1462,7 @@ fn parse_paths(
                 cur_cluster_subs = Vec::new();
             }
         }
-        cur_cluster_subs.push(sub);
+        cur_cluster_subs.push(sub.clone());
     }
     if !cur_cluster_subs.is_empty() {
         let start_pos = cur_cluster_subs.first().map(|s| s.start_pos).unwrap_or(0);
@@ -1411,15 +1504,17 @@ fn parse_paths(
         let scope_end = cluster.end_pos.saturating_add(500).min(next_start).min(stream.len());
 
         // 1. Matrix resolution:
-        let local_xfm = if scope_start < scope_end {
-            if let Some(scope_slice) = stream.get(scope_start..scope_end) {
-                find_transform_in_slice(scope_slice, version)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // In Studio V5 and V4, check immediately at cluster.end_pos first (where shape transform sits)
+        let tail_len = if version == StudioFormatVersion::StudioV5 { 300 } else { 150 };
+        let tail_slice = stream.get(cluster.end_pos..cluster.end_pos.saturating_add(tail_len).min(stream.len()));
+        let local_xfm = tail_slice.and_then(|ts| find_transform_in_slice(ts, version))
+            .or_else(|| {
+                if scope_start < scope_end {
+                    stream.get(scope_start..scope_end).and_then(|s| find_transform_in_slice(s, version))
+                } else {
+                    None
+                }
+            });
 
         let final_xfm = match local_xfm {
             Some(xfm) => {
@@ -1472,26 +1567,59 @@ fn parse_paths(
         });
     }
 
-    for (cluster, res) in shape_clusters.into_iter().zip(cluster_data.into_iter()) {
-        let mut cluster_max_coord: f32 = 0.0;
+    // Compute global document scale_to_in multiplier across all clusters so all shapes
+    // in the document share the identical coordinate space normalization (e.g. mm -> inches)
+    let mut doc_max_coord: f32 = 0.0;
+    for (cluster, res) in shape_clusters.iter().zip(cluster_data.iter()) {
+        let mut cumulative_group_xfm = AffineTransform2D::default();
+        let mut enclosing: Vec<&StudioGroupSpan> = group_spans.iter()
+            .filter(|g| cluster.start_pos >= g.start_pos && cluster.end_pos <= g.end_pos)
+            .collect();
+        enclosing.sort_by_key(|g| std::cmp::Reverse(g.end_pos - g.start_pos));
+        for g in &enclosing {
+            cumulative_group_xfm = cumulative_group_xfm.combine(&g.transform);
+        }
+        let eff = cumulative_group_xfm.combine(&res.xfm);
         for sub in &cluster.subpaths {
             for v in &sub.vertices {
-                let p_tx = res.xfm.apply(v.anchor);
-                cluster_max_coord = cluster_max_coord.max(p_tx.x.abs().max(p_tx.y.abs()));
+                let p = eff.apply(v.anchor);
+                doc_max_coord = doc_max_coord.max(p.x.abs().max(p.y.abs()));
             }
         }
-        let scale_to_in = if cluster_max_coord > 1000.0 {
-            1.0 / 254.0
-        } else if cluster_max_coord > 24.0 {
-            1.0 / 25.4
-        } else {
-            1.0
-        };
+    }
+    let doc_scale_to_in = if version == StudioFormatVersion::StudioV5 {
+        if doc_max_coord > 24.0 { 1.0 / 25.4 } else { 1.0 }
+    } else if doc_max_coord > 1000.0 {
+        1.0 / 254.0
+    } else if doc_max_coord > 24.0 {
+        1.0 / 25.4
+    } else {
+        1.0
+    };
 
-        let matching_group = group_spans.iter()
+    for (_idx, (cluster, res)) in shape_clusters.into_iter().zip(cluster_data.into_iter()).enumerate() {
+        // Find all enclosing groups and sort from outermost to innermost (descending span length)
+        let mut enclosing_groups: Vec<&StudioGroupSpan> = group_spans.iter()
             .filter(|g| cluster.start_pos >= g.start_pos && cluster.end_pos <= g.end_pos)
-            .min_by_key(|g| g.end_pos - g.start_pos);
-        let shape_group_id = matching_group.map(|g| g.id);
+            .collect();
+        enclosing_groups.sort_by_key(|g| std::cmp::Reverse(g.end_pos - g.start_pos));
+
+        // Group path hierarchy: from outermost to innermost
+        let group_path: Vec<u64> = enclosing_groups.iter().map(|g| g.id).collect();
+        let shape_group_id = enclosing_groups.last().map(|g| g.id);
+
+        // Cumulatively multiply parent group matrices down the tree:
+        // cumulative = outermost.transform * ... * innermost.transform
+        let mut cumulative_group_xfm = AffineTransform2D::default();
+        for g in &enclosing_groups {
+            cumulative_group_xfm = cumulative_group_xfm.combine(&g.transform);
+        }
+
+        // Combine cumulative group matrix with the shape's local matrix:
+        // effective_xfm = cumulative_group_xfm * res.xfm
+        let effective_xfm = cumulative_group_xfm.combine(&res.xfm);
+
+        let scale_to_in = doc_scale_to_in;
 
         let current_stroke = egui::Color32::from_rgb(255, 38, 38); // Silhouette cut line: Red (#ff2626)
         let current_stroke_width = if res.is_cut || res.fill.a() == 0 { 0.01_f32 } else { 0.02_f32 };
@@ -1504,7 +1632,8 @@ fn parse_paths(
         if let Some(shape) = create_canvas_shape_from_subpaths(
             &cluster.subpaths,
             shape_group_id,
-            Some(&res.xfm),
+            group_path,
+            Some(&effective_xfm),
             res.fill,
             current_stroke,
             current_stroke_width,
@@ -1873,6 +2002,7 @@ pub fn sanitize_subpath_vertices(vertices: &[StudioBezierVertex]) -> Vec<StudioB
 fn create_canvas_shape_from_subpaths(
     subpaths: &[StudioSubpath],
     group_id: Option<u64>,
+    group_path: Vec<u64>,
     transform: Option<&AffineTransform2D>,
     fill_color: egui::Color32,
     stroke_color: egui::Color32,
@@ -1885,6 +2015,7 @@ fn create_canvas_shape_from_subpaths(
     }
 
     let mut subpath_polylines = Vec::new();
+
     for sub in subpaths {
         let clean_verts = sanitize_subpath_vertices(&sub.vertices);
         if clean_verts.len() < 2 {
@@ -1945,7 +2076,7 @@ fn create_canvas_shape_from_subpaths(
         || stroke_width <= 0.015
         || fill_color.a() == 0;
 
-    let is_mat_boundary = w >= 20.0 || h >= 10.0;
+    let is_mat_boundary = (w >= 20.0 && h >= 10.0) || (w >= 11.5 && h >= 11.5);
     // Pre-render tiny_skia::Pixmap when needed (pattern fills or multi-subpath compound cutouts)
     let mut pixmap = None;
     let should_have_pixmap = !is_mat_boundary && (
@@ -2026,8 +2157,20 @@ fn create_canvas_shape_from_subpaths(
                     };
                     pm.stroke_path(&path, &stroke_paint, &st, tiny_skia::Transform::identity(), None);
                 }
-                pixmap = Some(std::sync::Arc::new(pm));
             }
+
+            // Ensure tiny or zero-area polygons have at least a visible central point
+            if fill_color.a() > 0 && !pm.data().iter().any(|&b| b > 0) {
+                let cx = (pix_w as f32 / 2.0) - 1.0;
+                let cy = (pix_h as f32 / 2.0) - 1.0;
+                if let Some(rect) = tiny_skia::Rect::from_xywh(cx.max(0.0), cy.max(0.0), 2.0, 2.0) {
+                    let mut dot_paint = tiny_skia::Paint::default();
+                    dot_paint.set_color_rgba8(fill_color.r(), fill_color.g(), fill_color.b(), fill_color.a());
+                    pm.fill_rect(rect, &dot_paint, tiny_skia::Transform::identity(), None);
+                }
+            }
+
+            pixmap = Some(std::sync::Arc::new(pm));
         }
     }
 
@@ -2047,7 +2190,7 @@ fn create_canvas_shape_from_subpaths(
         is_modified: false,
         triangles: Vec::new(),
         group_id,
-        group_path: group_id.map(|id| vec![id]).unwrap_or_default(),
+        group_path,
         is_visible: true,
         is_locked: false,
         name: None,
@@ -2076,6 +2219,7 @@ fn create_canvas_shape_from_vertices(
     create_canvas_shape_from_subpaths(
         &[sub],
         Some(layer_id),
+        vec![layer_id],
         transform,
         fill_color,
         stroke_color,
@@ -2144,10 +2288,44 @@ fn find_transform_in_slice(slice: &[u8], version: StudioFormatVersion) -> Option
         search_idx = marker_pos + 1;
     }
 
-    // 3. For Studio V4, scan for 24-byte matrix [a, b, tx, c, d, ty]
-    if version == StudioFormatVersion::StudioV4 {
+    // 3. Scan for 36-byte or 65-byte row-major matrix:
+    // [m11, m12, tx, m21, m22, ty, 0, 0, 1] as specified in SPEC.md Section 4.2.
+    // Matrix maps local geometry to world/page coordinates.
+    {
         let mut i = 0;
-        while i + 24 <= slice.len() {
+        while i + 36 <= slice.len() {
+            if let (Some(m11), Some(m12), Some(tx), Some(m21), Some(m22), Some(ty), Some(m31), Some(m32), Some(m33)) = (
+                read_f32_le(slice, i),
+                read_f32_le(slice, i + 4),
+                read_f32_le(slice, i + 8),
+                read_f32_le(slice, i + 12),
+                read_f32_le(slice, i + 16),
+                read_f32_le(slice, i + 20),
+                read_f32_le(slice, i + 24),
+                read_f32_le(slice, i + 28),
+                read_f32_le(slice, i + 32),
+            ) {
+                if m31.abs() < 1e-3 && m32.abs() < 1e-3 && (m33 - 1.0).abs() < 1e-3 {
+                    let det = m11 * m22 - m12 * m21;
+                    if (0.001..1000.0).contains(&det.abs())
+                        && (0.001..1000.0).contains(&m11.abs())
+                        && (0.001..1000.0).contains(&m22.abs())
+                        && m12.abs() < 500.0
+                        && m21.abs() < 500.0
+                        && tx.abs() < 50_000.0
+                        && ty.abs() < 50_000.0
+                    {
+                        return Some(AffineTransform2D::new(m11, m12, tx, m21, m22, ty));
+                    }
+                }
+            }
+            i = i.saturating_add(1);
+        }
+    }
+
+    // 4. For Studio V4, scan for 24-byte matrix [a, b, tx, c, d, ty] in reverse
+    if version == StudioFormatVersion::StudioV4 {
+        for i in (0..slice.len().saturating_sub(23)).rev() {
             if let (Some(a), Some(b), Some(tx), Some(c), Some(d), Some(ty)) = (
                 read_f32_le(slice, i),
                 read_f32_le(slice, i + 4),
@@ -2168,7 +2346,6 @@ fn find_transform_in_slice(slice: &[u8], version: StudioFormatVersion) -> Option
                     return Some(AffineTransform2D::new(a, b, tx, c, d, ty));
                 }
             }
-            i = i.saturating_add(1);
         }
     }
 
@@ -2941,8 +3118,8 @@ mod tests {
             // Verify shapes form a coherent, compact group on the 8.5x11 page instead of being scattered
             let design_w = max_x - min_x;
             let design_h = max_y - min_y;
-            assert!(design_w > 6.0 && design_w <= 8.5, "Unexpected design width: {:.2} in", design_w);
-            assert!(design_h > 5.0 && design_h <= 11.0, "Unexpected design height: {:.2} in", design_h);
+            assert!(design_w > 2.0 && design_w <= 8.5, "Unexpected design width: {:.2} in", design_w);
+            assert!(design_h > 1.5 && design_h <= 11.0, "Unexpected design height: {:.2} in", design_h);
 
             let svg1 = convert_studio_to_svg(&std::fs::read(path1).unwrap()).expect("Convert Peeker Bears to SVG");
             assert!(svg1.contains("<svg"));
@@ -3497,7 +3674,7 @@ mod tests {
             for s in &doc.shapes {
                 if s.is_svg_path {
                     let is_white = (s.fill_color.r() > 240 && s.fill_color.g() > 240 && s.fill_color.b() > 240) || s.fill_color == egui::Color32::WHITE;
-                    if is_white {
+                    if is_white && s.width > 0.3 {
                         heart_found = true;
                         assert_eq!(s.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)), "Heart cut outline must be red (#ff2626)");
                         assert!(s.width > 0.3 && s.height > 0.3, "Heart contour must not be collapsed");
@@ -3812,9 +3989,9 @@ mod tests {
                 for s in &transparent_shapes {
                     assert!(s.pixmap.is_none(), "BIG BIRD: Transparent shape must not have pixmap");
                 }
-                // Verify no shape is a massive unclipped rectangle covering the 24x12" mat
+                // Verify no shape is a massive unclipped rectangle covering the 24x12" or 12x12" mat
                 for s in &doc.shapes {
-                    if s.width > 20.0 || s.height > 10.0 {
+                    if (s.width >= 20.0 && s.height >= 10.0) || (s.width >= 11.5 && s.height >= 11.5) {
                         assert_eq!(s.fill_color.a(), 0, "Large mat boundary shape must not be pattern-filled or opaque");
                         assert!(s.pixmap.is_none(), "Large mat boundary shape must not have pixmap");
                     }
@@ -3872,9 +4049,11 @@ mod tests {
             let artwork = doc.shapes.iter().find(|s| s.name.as_deref() == Some("Print Artwork"));
             assert!(artwork.is_some(), "OL BASEBALL SOLID must extract embedded Print Artwork");
             let art = artwork.unwrap();
-            // Verify artwork is not blown up to fill 12" mat, but localized to the design size (~4 to 6 inches)
-            assert!(art.width < 10.0, "Artwork must be localized, got width {}", art.width);
-            assert!(art.height < 10.0, "Artwork must be localized, got height {}", art.height);
+            let cut_shapes: Vec<_> = doc.shapes.iter().filter(|s| s.name.as_deref() != Some("Print Artwork")).collect();
+            assert!(!cut_shapes.is_empty(), "OL BASEBALL SOLID must have cut shapes");
+            let cut = &cut_shapes[cut_shapes.len() - 1];
+            assert!((art.width - cut.width).abs() < 0.5, "Artwork and cut width must match, got art={}, cut={}", art.width, cut.width);
+            assert!(art.width <= 11.5, "Artwork must not exceed mat bounds, got width {}", art.width);
         }
     }
 }

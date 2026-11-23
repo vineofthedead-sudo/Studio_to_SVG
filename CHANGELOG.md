@@ -4,6 +4,24 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.5.6] - 2026-11-23
+
+### Added & Improved
+- **Hierarchical Group Affine Transform Matrix Resolution (`app/src/studio_format.rs`)**:
+  - Implemented recursive parent Group matrix multiplication stack (`cumulative_group_xfm.combine(&local_xfm)`) for `silhouette05;` (`.studio3`) files according to the specification.
+  - Resolved parent `[a, b, c, d, tx, ty]` affine offsets down to every child shape, ensuring nested grouped shapes (e.g. in `DISNEY HEARTS.studio3`) and compound paths preserve authentic positions and bounds without collapsing or detaching.
+  - Identified and handled V5 Group record boundaries in Block A spanning preceding records up to `pos + tag_len`, avoiding nested sibling group span collisions.
+- **Silhouette V4 (`silhouette04;`) Matrix Decoding & Compound Path Isolation (`app/src/studio_format.rs`)**:
+  - Generalized 36-byte row-major matrix decoding `[m11, m12, tx, m21, m22, ty, 0, 0, 1]` across both V4 and V5 formats, properly applying local translations directly following subpaths (e.g. in `Peeker Bears.studio`).
+  - Restricted compound path merging so that shapes with distinct positions are not swallowed as holes into preceding shapes.
+- **Constant 1px Screen-Space Hairline Cutlines (`app/src/main.rs`)**:
+  - Forced constant 1.0 screen-space pixel hairline stroke for `#ff2626` cut lines in `draw_filled_polygon` and vector path render pipelines, guaranteeing crisp, non-scaling outlines completely independent of canvas zoom levels.
+- **Attribution & Test Verification (`README.md`, `CHANGELOG.md`)**:
+  - Maintained explicit attribution citing Zayd Mulani (`zaydmulani09`/`studio3svg`) for the `.studio3` binary specification.
+  - Verified all 72 automated unit and integration tests passing (`cargo test --manifest-path app/Cargo.toml`).
+
+---
+
 ## [0.5.5] - 2026-11-23
 
 ### Added & Improved

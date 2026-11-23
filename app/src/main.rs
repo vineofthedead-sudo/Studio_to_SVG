@@ -3838,8 +3838,14 @@ fn draw_filled_polygon(
         }
     }
 
-    if let Some(s) = stroke {
+    if let Some(mut s) = stroke {
         if s.width > 0.0 && s.color.a() > 0 {
+            // Cutlines (#ff2626) must render with constant 1-pixel screen-space hairline thickness
+            if s.color == egui::Color32::from_rgb(255, 38, 38)
+                || (s.color.r() >= 200 && s.color.g() <= 50 && s.color.b() <= 50)
+            {
+                s.width = 1.0_f32;
+            }
             let mut closed_pts = screen_pts.to_vec();
             if let (Some(first), Some(last)) = (closed_pts.first(), closed_pts.last()) {
                 if (*first - *last).length() > 0.5 {
