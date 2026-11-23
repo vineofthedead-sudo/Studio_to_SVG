@@ -515,17 +515,17 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
                     let hex = format!("#{:02x}{:02x}{:02x}", sc.r(), sc.g(), sc.b());
                     let opacity = sc.a() as f32 / 255.0;
                     if opacity < 0.999 {
-                        format!("stroke=\"{}\" stroke-opacity=\"{:.2}\" stroke-width=\"{:.3}\"", hex, opacity, shape.stroke_width.max(0.02))
+                        format!("stroke=\"{}\" stroke-opacity=\"{:.2}\" stroke-width=\"{:.3}\"", hex, opacity, shape.stroke_width.max(0.01))
                     } else {
-                        format!("stroke=\"{}\" stroke-width=\"{:.3}\"", hex, shape.stroke_width.max(0.02))
+                        format!("stroke=\"{}\" stroke-width=\"{:.3}\"", hex, shape.stroke_width.max(0.01))
                     }
                 } else if doc.pattern_swatch.is_some() || is_white_or_light || shape.fill_color.a() == 0 {
-                    format!("stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.02))
+                    format!("stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.01))
                 } else {
                     "stroke=\"none\"".to_string()
                 }
             } else if doc.pattern_swatch.is_some() || is_white_or_light || shape.fill_color.a() == 0 {
-                format!("stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.02))
+                format!("stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.01))
             } else {
                 "stroke=\"none\"".to_string()
             };
@@ -1201,7 +1201,7 @@ fn parse_paths(
     }
 
     let current_stroke = egui::Color32::from_rgb(255, 38, 38); // Silhouette cut line: Red (#ff2626)
-    let current_stroke_width = 0.02_f32; // ~1.5 pt
+    let current_stroke_width = 0.01_f32; // hairline cut line
     let current_layer_id = 1_u64;
 
     for (cluster, (xfm, fill)) in shape_clusters.into_iter().zip(cluster_data.into_iter()) {
@@ -1546,7 +1546,47 @@ fn parse_bezier_vertex_0h(payload: &[u8]) -> Option<(StudioBezierVertex, usize)>
 
 #[inline]
 fn is_plausible_coord(val: f32) -> bool {
-    val.is_finite() && val.abs() < 50_000.0
+    val.is_finite() && val.abs() < 50_000.0 && !val.is_subnormal()
+}
+
+/// Sanitizes subpath vertices by removing stray (0,0) or extreme outlier vertices
+/// caused by trailing padding or corrupt bytes at the end of subpath records.
+pub fn sanitize_subpath_vertices(vertices: &[StudioBezierVertex]) -> Vec<StudioBezierVertex> {
+    if vertices.len() < 2 {
+        return vertices.to_vec();
+    }
+
+    // Check if authentic vertices in the subpath are positioned away from the origin.
+    let non_zero_count = vertices.iter().filter(|v| v.anchor.x.abs() >= 1.0 || v.anchor.y.abs() >= 1.0).count();
+    let has_non_zero = non_zero_count >= 2;
+
+    if !has_non_zero {
+        return vertices.to_vec();
+    }
+
+    let mut cleaned: Vec<StudioBezierVertex> = Vec::with_capacity(vertices.len());
+    for (i, v) in vertices.iter().enumerate() {
+        let is_zero = v.anchor.x.abs() < 1e-3 && v.anchor.y.abs() < 1e-3;
+        if is_zero {
+            let prev_dist = if i > 0 {
+                vertices[i - 1].anchor.x.hypot(vertices[i - 1].anchor.y)
+            } else {
+                f32::INFINITY
+            };
+            let next_dist = if i + 1 < vertices.len() {
+                vertices[i + 1].anchor.x.hypot(vertices[i + 1].anchor.y)
+            } else {
+                f32::INFINITY
+            };
+            if prev_dist > 5.0 || next_dist > 5.0 {
+                // Stray zero-origin outlier: skip
+                continue;
+            }
+        }
+        cleaned.push(*v);
+    }
+
+    cleaned
 }
 
 fn create_canvas_shape_from_subpaths(
@@ -1565,15 +1605,16 @@ fn create_canvas_shape_from_subpaths(
 
     let mut subpath_polylines = Vec::new();
     for sub in subpaths {
-        if sub.vertices.len() < 2 {
+        let clean_verts = sanitize_subpath_vertices(&sub.vertices);
+        if clean_verts.len() < 2 {
             continue;
         }
-        let first = sub.vertices.first()?;
-        let last = sub.vertices.last()?;
+        let first = clean_verts.first()?;
+        let last = clean_verts.last()?;
         let d = (first.anchor.x - last.anchor.x).hypot(first.anchor.y - last.anchor.y);
-        let is_closed = d < 1.0 || sub.vertices.len() >= 3;
+        let is_closed = d < 1.0 || clean_verts.len() >= 3;
 
-        let polyline = path_vertices_to_polyline(&sub.vertices, is_closed, transform, scale_to_in, 0.002);
+        let polyline = path_vertices_to_polyline(&clean_verts, is_closed, transform, scale_to_in, 0.002);
         if polyline.len() >= 2 {
             subpath_polylines.push(polyline);
         }
@@ -1686,8 +1727,11 @@ fn create_canvas_shape_from_subpaths(
                     let mut stroke_paint = tiny_skia::Paint::default();
                     stroke_paint.set_color_rgba8(final_stroke_c.r(), final_stroke_c.g(), final_stroke_c.b(), final_stroke_c.a());
                     stroke_paint.anti_alias = true;
+                    let is_cut_stroke = final_stroke_c == egui::Color32::from_rgb(255, 38, 38)
+                        || (final_stroke_c.r() > 240 && final_stroke_c.g() < 50 && final_stroke_c.b() < 50)
+                        || stroke_width <= 0.015;
                     let st = tiny_skia::Stroke {
-                        width: (stroke_width * sx).max(1.5),
+                        width: if is_cut_stroke { 1.25 } else { (stroke_width * sx).max(1.0) },
                         line_cap: tiny_skia::LineCap::Round,
                         line_join: tiny_skia::LineJoin::Round,
                         ..Default::default()
@@ -1709,7 +1753,7 @@ fn create_canvas_shape_from_subpaths(
         text: svg_d,
         fill_color,
         stroke_color: if final_stroke_c.a() > 0 { Some(final_stroke_c) } else { None },
-        stroke_width: stroke_width.max(0.02),
+        stroke_width: stroke_width.max(0.01),
         is_closed: true,
         is_svg_path: true,
         is_modified: false,
@@ -2037,6 +2081,13 @@ fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<Ca
         }
     }
 
+    // If a repeating pattern swatch exists, any non-square embedded PNG is a document composite preview,
+    // not a standalone Print Artwork rectangle. Discard print_artwork_shape to prevent oversized
+    // unclipped rectangular blocks from rendering across the canvas.
+    if pattern_swatch.is_some() {
+        print_artwork_shape = None;
+    }
+
     (print_artwork_shape, pattern_swatch)
 }
 
@@ -2234,8 +2285,11 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
                             let mut stroke_paint = tiny_skia::Paint::default();
                             stroke_paint.set_color_rgba8(stroke_c.r(), stroke_c.g(), stroke_c.b(), stroke_c.a());
                             stroke_paint.anti_alias = true;
+                            let is_cut_stroke = stroke_c == egui::Color32::from_rgb(255, 38, 38)
+                                || (stroke_c.r() > 240 && stroke_c.g() < 50 && stroke_c.b() < 50)
+                                || outer.stroke_width <= 0.015;
                             let st = tiny_skia::Stroke {
-                                width: (outer.stroke_width * sx).max(1.5),
+                                width: if is_cut_stroke { 1.25 } else { (outer.stroke_width * sx).max(1.0) },
                                 line_cap: tiny_skia::LineCap::Round,
                                 line_join: tiny_skia::LineJoin::Round,
                                 ..Default::default()
@@ -3236,6 +3290,60 @@ mod tests {
             assert!(heart_shape.is_some(), "Must find heart cutout shape with realistic dimensions");
             let heart = heart_shape.unwrap();
             assert_eq!(heart.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)), "Heart cut outline must be red (#ff2626)");
+        }
+    }
+
+    #[test]
+    fn test_unicorn_paper_zero_origin_and_pattern_clipping() {
+        let test_files = [
+            "AN UNICORN PAPER #1.studio3",
+            "AN UNICORN PAPER #2.studio3",
+        ];
+
+        for filename in &test_files {
+            let candidates = [
+                std::path::PathBuf::from(format!("../test_samples/{}", filename)),
+                std::path::PathBuf::from(format!("test_samples/{}", filename)),
+            ];
+            let path = match candidates.iter().find(|p| p.exists()) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let data = std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read {}: {}", filename, e));
+
+            // 1. Verify pattern swatch is extracted and print artwork shape is suppressed to prevent unclipped rectangle
+            let (print_art, swatch) = extract_embedded_png(&data, 12.0, 12.0);
+            assert!(swatch.is_some(), "{}: Pattern swatch must be extracted", filename);
+            assert!(print_art.is_none(), "{}: Print artwork rectangle must be suppressed when pattern swatch is present", filename);
+
+            // 2. Parse full studio document
+            let doc = parse_studio_data(&data).unwrap_or_else(|e| panic!("Failed to parse {}: {}", filename, e));
+            assert!(!doc.shapes.is_empty(), "{}: Must extract vector shapes", filename);
+
+            // 3. Verify no unclipped Print Artwork rectangle shape was created
+            let has_unclipped_print_art = doc.shapes.iter().any(|s| {
+                s.name.as_deref() == Some("Print Artwork")
+            });
+            assert!(!has_unclipped_print_art, "{}: Must not contain unclipped Print Artwork rectangle", filename);
+
+            // 4. Verify no shape contains stray zero-origin vertices or extreme spikes
+            for (idx, shape) in doc.shapes.iter().enumerate() {
+                if shape.points.len() >= 3 {
+                    let has_non_zero = shape.points.iter().any(|p| p.x.abs() >= 1.0 || p.y.abs() >= 1.0);
+                    if has_non_zero {
+                        let zero_pt_count = shape.points.iter().filter(|p| p.x.abs() < 1e-3 && p.y.abs() < 1e-3).count();
+                        assert_eq!(zero_pt_count, 0,
+                            "{}: Shape #{} contains stray (0,0) vertices while positioned at ({:.2},{:.2})!",
+                            filename, idx, shape.x, shape.y
+                        );
+                    }
+                }
+
+                // Verify stroke width and cut line color
+                assert!(shape.stroke_width <= 0.015, "{}: Stroke width must be hairline (<= 0.015), got {}", filename, shape.stroke_width);
+                assert_eq!(shape.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)), "{}: Stroke color must be red (#ff2626)", filename);
+            }
         }
     }
 }

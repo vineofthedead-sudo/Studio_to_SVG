@@ -4,6 +4,23 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.5.1] - 2026-11-22
+
+### Added & Improved
+- **Hairline Cut-Line Stroke Rendering (`app/src/main.rs`)**:
+  - Rendered Silhouette cut lines (`#ff2626`, `shape.stroke_width <= 0.015`, or default cut line strokes) as crisp, constant screen-space hairlines (`1.25px` regardless of zoom level) rather than thick blurry strokes that expand when zoomed in (`HUDSON FALLS NY.studio`).
+  - Preserved geometric physical stroke scaling for intentional thick non-cut artistic strokes (`sw = (shape.stroke_width * px_per_in).max(1.0)`).
+- **Sanitized `.studio3` Zero-Origin & Subnormal Outlier Vertices (`app/src/studio_format.rs`)**:
+  - Filtered subnormal floating-point bit patterns (`!val.is_subnormal()`) in `is_plausible_coord` to reject non-float binary metadata and trailer bytes while preserving valid millimeter and sub-mil vector path coordinates.
+  - Implemented `sanitize_subpath_vertices`: detected and removed stray `(0.0, 0.0)` origin jump vertices caused by trailing padding or metadata records in `.studio3` (`silhouette05;`) subpaths (e.g. subpath #3178 in `AN UNICORN PAPER #1.studio3`), eliminating long diagonal spikes and stretched horizontal bars across the canvas.
+- **Embedded Pattern Swatch Clipping & Unclipped Rectangle Suppression (`app/src/studio_format.rs`)**:
+  - In `extract_embedded_png`, detected presence of square repeating pattern tiles (`pattern_swatch.is_some()`) and suppressed the generation of unclipped `ShapeKind::Rectangle` "Print Artwork" background layers from full-page raster previews. Vector shapes now clip repeating pattern fills cleanly via `tiny_skia` without oversized background blocks obscuring the canvas.
+- **Integration Testing & Test Suite Verification**:
+  - Added `test_unicorn_paper_zero_origin_and_pattern_clipping` verifying that `AN UNICORN PAPER #1.studio3` and `AN UNICORN PAPER #2.studio3` parse cleanly with extracted pattern swatches, zero unclipped "Print Artwork" background shapes, zero stray (0,0) vertices, and hairline red cut outlines.
+  - Verified all 68 unit and integration tests passing (`cargo test`) and clean release build (`cargo build --release`).
+
+---
+
 ## [0.5.0] - 2026-11-22
 
 ### Added & Improved

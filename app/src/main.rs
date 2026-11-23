@@ -5531,7 +5531,7 @@ impl eframe::App for StudioApp {
             }
 
             // Render shapes over the grid using fill_color and stroke settings
-            let black_stroke = egui::Stroke::new(2.0_f32, egui::Color32::BLACK);
+            let black_stroke = egui::Stroke::new(1.25_f32, egui::Color32::BLACK);
             for shape in self.shapes.iter_mut() {
                 if !shape.is_visible {
                     continue;
@@ -5553,18 +5553,25 @@ impl eframe::App for StudioApp {
                         egui::Color32::WHITE,
                     );
 
-                    // Ensure vector cut-line contours are visible on top of pattern/image textures
+                    // Ensure vector cut-line contours are visible on top of pattern/image textures as crisp constant hairlines
                     let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
                     let stroke_to_draw = shape.stroke_color.and_then(|c| {
                         if c.a() > 0 && !(c.r() > 240 && c.g() > 240 && c.b() > 240) {
-                            let sw = (shape.stroke_width * px_per_in).max(1.0);
+                            let is_cut_stroke = c == egui::Color32::from_rgb(255, 38, 38)
+                                || (c.r() > 240 && c.g() < 50 && c.b() < 50)
+                                || shape.stroke_width <= 0.015;
+                            let sw = if is_cut_stroke {
+                                1.25_f32
+                            } else {
+                                (shape.stroke_width * px_per_in).max(1.0)
+                            };
                             Some(egui::Stroke::new(sw, c))
                         } else {
                             None
                         }
                     }).or_else(|| {
                         if is_white_or_light || shape.fill_color.a() == 0 || shape.stroke_color.is_some() {
-                            Some(egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 38, 38)))
+                            Some(egui::Stroke::new(1.25_f32, egui::Color32::from_rgb(255, 38, 38)))
                         } else {
                             None
                         }
@@ -5608,14 +5615,21 @@ impl eframe::App for StudioApp {
                 let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
                 let stroke_opt = shape.stroke_color.and_then(|c| {
                     if c.a() > 0 && !(c.r() > 240 && c.g() > 240 && c.b() > 240) {
-                        let sw = (shape.stroke_width * px_per_in).max(1.0);
+                        let is_cut_stroke = c == egui::Color32::from_rgb(255, 38, 38)
+                            || (c.r() > 240 && c.g() < 50 && c.b() < 50)
+                            || shape.stroke_width <= 0.015;
+                        let sw = if is_cut_stroke {
+                            1.25_f32
+                        } else {
+                            (shape.stroke_width * px_per_in).max(1.0)
+                        };
                         Some(egui::Stroke::new(sw, c))
                     } else {
                         None
                     }
                 }).or_else(|| {
                     if is_white_or_light || shape.fill_color.a() == 0 {
-                        Some(egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 38, 38)))
+                        Some(egui::Stroke::new(1.25_f32, egui::Color32::from_rgb(255, 38, 38)))
                     } else {
                         None
                     }
@@ -5659,9 +5673,9 @@ impl eframe::App for StudioApp {
                             let p2 = mat_to_screen(shape.points[1]);
                             let s = stroke_opt.unwrap_or_else(|| {
                                 if shape.fill_color.a() > 0 {
-                                    egui::Stroke::new(2.0_f32, shape.fill_color)
+                                    egui::Stroke::new(1.25_f32, shape.fill_color)
                                 } else {
-                                    egui::Stroke::new(2.0_f32, egui::Color32::BLACK)
+                                    egui::Stroke::new(1.25_f32, egui::Color32::BLACK)
                                 }
                             });
                             painter.line_segment([p1, p2], s);
