@@ -495,7 +495,7 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
             }
 
             let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
-            let fill_str = if doc.pattern_swatch.is_some() && (is_white_or_light || shape.fill_color.a() == 0) {
+            let fill_str = if doc.pattern_swatch.is_some() && shape.fill_color.a() > 0 && is_white_or_light {
                 "fill=\"url(#swatch_pattern)\"".to_string()
             } else if shape.fill_color.a() == 0 {
                 "fill=\"none\"".to_string()
@@ -974,7 +974,10 @@ fn parse_paths(
     #[derive(Debug, Clone, Copy)]
     struct StyleRecord {
         pos: usize,
-        color: egui::Color32,
+        stroke_color: egui::Color32,
+        fill_color: egui::Color32,
+        is_pattern: bool,
+        is_cut: bool,
     }
 
     let mut style_records: Vec<StyleRecord> = Vec::new();
@@ -983,29 +986,127 @@ fn parse_paths(
         if stream[s_idx] == 0x01 && stream[s_idx + 5] == 0x00 && stream[s_idx + 6] == 0x01 {
             if let Some(len) = read_u32_le(stream, s_idx + 1) {
                 if (16..=2000).contains(&len) {
-                    if let (Some(r), Some(g), Some(b), Some(a)) = (
-                        read_f32_le(stream, s_idx + 7),
-                        read_f32_le(stream, s_idx + 11),
-                        read_f32_le(stream, s_idx + 15),
-                        read_f32_le(stream, s_idx + 19),
-                    ) {
-                        if (0.0..=1.0).contains(&r)
-                            && (0.0..=1.0).contains(&g)
-                            && (0.0..=1.0).contains(&b)
-                            && (a - 1.0).abs() < 1e-3
-                        {
-                            style_records.push(StyleRecord {
-                                pos: s_idx,
-                                color: egui::Color32::from_rgba_unmultiplied(
-                                    (r * 255.0).round() as u8,
-                                    (g * 255.0).round() as u8,
-                                    (b * 255.0).round() as u8,
-                                    255,
-                                ),
-                            });
-                            s_idx = s_idx.saturating_add(5 + (len as usize).min(200));
-                            continue;
+                    let end = (s_idx + 5 + len as usize).min(stream.len());
+                    let rec = &stream[s_idx + 7..end];
+
+                    if version == StudioFormatVersion::StudioV4 {
+                        if let (Some(r), Some(g), Some(b), Some(a)) = (
+                            read_f32_le(stream, s_idx + 7),
+                            read_f32_le(stream, s_idx + 11),
+                            read_f32_le(stream, s_idx + 15),
+                            read_f32_le(stream, s_idx + 19),
+                        ) {
+                            if (0.0..=1.0).contains(&r)
+                                && (0.0..=1.0).contains(&g)
+                                && (0.0..=1.0).contains(&b)
+                                && (a - 1.0).abs() < 1e-3
+                            {
+                                style_records.push(StyleRecord {
+                                    pos: s_idx,
+                                    stroke_color: egui::Color32::from_rgb(255, 38, 38),
+                                    fill_color: egui::Color32::from_rgba_unmultiplied(
+                                        (r * 255.0).round() as u8,
+                                        (g * 255.0).round() as u8,
+                                        (b * 255.0).round() as u8,
+                                        255,
+                                    ),
+                                    is_pattern: false,
+                                    is_cut: false,
+                                });
+                                s_idx = s_idx.saturating_add(5 + (len as usize).min(200));
+                                continue;
+                            }
                         }
+                    } else {
+                        // Studio V5
+                        let stroke_c = if let (Some(r), Some(g), Some(b), Some(a)) = (
+                            read_f32_le(stream, s_idx + 7),
+                            read_f32_le(stream, s_idx + 11),
+                            read_f32_le(stream, s_idx + 15),
+                            read_f32_le(stream, s_idx + 19),
+                        ) {
+                            if (0.0..=1.01).contains(&r) && (0.0..=1.01).contains(&g) && (0.0..=1.01).contains(&b) && (0.0..=1.01).contains(&a) {
+                                Some(egui::Color32::from_rgba_unmultiplied(
+                                    (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                ))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        let is_cut = rec.windows(3).any(|w| w.eq_ignore_ascii_case(b"cut"))
+                            || stroke_c.map_or(false, |sc| sc.r() >= 200 && sc.g() <= 50 && sc.b() <= 50);
+
+                        // Join/cap keyword search for fill flag
+                        let join_keywords: [&[u8]; 5] = [b"rounded", b"corner", b"flat", b"bevel", b"miter"];
+                        let mut last_pos = None;
+                        let mut last_kw_len = 0;
+                        for kw in &join_keywords {
+                            let mut p = 0;
+                            while let Some(idx) = find_subsequence(&rec[p..], kw) {
+                                let abs_idx = p + idx;
+                                if last_pos.map_or(true, |lp| abs_idx > lp) {
+                                    last_pos = Some(abs_idx);
+                                    last_kw_len = kw.len();
+                                }
+                                p = abs_idx + 1;
+                            }
+                        }
+
+                        let mut fill_color = egui::Color32::TRANSPARENT;
+                        let mut is_pattern = false;
+
+                        if let Some(lp) = last_pos {
+                            let flag_idx = lp + last_kw_len;
+                            if flag_idx < rec.len() {
+                                let flag = rec[flag_idx];
+                                if flag == 1 && flag_idx + 1 + 16 <= rec.len() {
+                                    if let (Some(r), Some(g), Some(b), Some(a)) = (
+                                        read_f32_le(rec, flag_idx + 1),
+                                        read_f32_le(rec, flag_idx + 5),
+                                        read_f32_le(rec, flag_idx + 9),
+                                        read_f32_le(rec, flag_idx + 13),
+                                    ) {
+                                        if (0.0..=1.01).contains(&r) && (0.0..=1.01).contains(&g) && (0.0..=1.01).contains(&b) && (0.0..=1.01).contains(&a) {
+                                            fill_color = egui::Color32::from_rgba_unmultiplied(
+                                                (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                                (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                                (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                                (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                            );
+                                        }
+                                    }
+                                } else if flag == 5 {
+                                    fill_color = egui::Color32::WHITE;
+                                    is_pattern = true;
+                                }
+                            }
+                        }
+
+                        if is_cut && fill_color.a() == 0 {
+                            fill_color = egui::Color32::TRANSPARENT;
+                        }
+
+                        let final_stroke = if is_cut {
+                            egui::Color32::from_rgb(255, 38, 38)
+                        } else {
+                            stroke_c.unwrap_or(egui::Color32::from_rgb(255, 38, 38))
+                        };
+
+                        style_records.push(StyleRecord {
+                            pos: s_idx,
+                            stroke_color: final_stroke,
+                            fill_color,
+                            is_pattern,
+                            is_cut,
+                        });
+                        s_idx = s_idx.saturating_add(5 + (len as usize).min(200));
+                        continue;
                     }
                 }
             }
@@ -1144,17 +1245,29 @@ fn parse_paths(
         return shapes;
     }
 
-    // Determine matrix and fill for each cluster deterministically
-    let mut cluster_data: Vec<(AffineTransform2D, egui::Color32)> = Vec::new();
-    let mut last_valid_fill = egui::Color32::TRANSPARENT;
+    // Determine matrix and style for each cluster deterministically
+    #[derive(Debug, Clone)]
+    struct ResolvedCluster {
+        xfm: AffineTransform2D,
+        fill: egui::Color32,
+        _stroke: egui::Color32,
+        is_pattern: bool,
+        is_cut: bool,
+    }
+
+    let mut cluster_data: Vec<ResolvedCluster> = Vec::new();
     let mut last_valid_xfm = AffineTransform2D::default();
+    let mut last_valid_fill = egui::Color32::TRANSPARENT;
+    let mut last_valid_stroke = egui::Color32::from_rgb(255, 38, 38);
+    let mut last_valid_is_pattern = false;
+    let mut last_valid_is_cut = true;
 
     for idx in 0..shape_clusters.len() {
         let cluster = &shape_clusters[idx];
         let prev_end = if idx > 0 { shape_clusters[idx - 1].end_pos } else { 0 };
         let next_start = shape_clusters.get(idx + 1).map(|p| p.start_pos).unwrap_or(stream.len());
 
-        let scope_start = cluster.start_pos.saturating_sub(500).max(prev_end);
+        let scope_start = prev_end;
         let scope_end = cluster.end_pos.saturating_add(500).min(next_start).min(stream.len());
 
         // 1. Matrix resolution:
@@ -1182,38 +1295,48 @@ fn parse_paths(
             }
         };
 
-        // 2. Fill color resolution:
+        // 2. Style resolution:
         let cur_style = style_records.iter().rev().find(|sr| sr.pos <= cluster.end_pos && sr.pos >= scope_start);
-        let final_fill = match cur_style {
+        let (final_fill, final_stroke, is_pattern, is_cut) = match cur_style {
             Some(s) => {
-                last_valid_fill = s.color;
-                s.color
+                last_valid_fill = s.fill_color;
+                last_valid_stroke = s.stroke_color;
+                last_valid_is_pattern = s.is_pattern;
+                last_valid_is_cut = s.is_cut;
+                (s.fill_color, s.stroke_color, s.is_pattern, s.is_cut)
             }
             None => {
-                if let Some(prefix_slice) = stream.get(scope_start..cluster.start_pos) {
-                    if let Some(fc) = find_fill_color_in_slice(prefix_slice) {
-                        last_valid_fill = fc;
-                        fc
+                if version == StudioFormatVersion::StudioV4 {
+                    (last_valid_fill, last_valid_stroke, false, false)
+                } else {
+                    let fc = if let Some(prefix_slice) = stream.get(scope_start..cluster.start_pos) {
+                        find_fill_color_in_slice(prefix_slice).unwrap_or_else(|| {
+                            if last_valid_is_cut { egui::Color32::TRANSPARENT } else { last_valid_fill }
+                        })
+                    } else if last_valid_is_cut {
+                        egui::Color32::TRANSPARENT
                     } else {
                         last_valid_fill
-                    }
-                } else {
-                    last_valid_fill
+                    };
+                    (fc, last_valid_stroke, last_valid_is_pattern, last_valid_is_cut)
                 }
             }
         };
 
-        cluster_data.push((final_xfm, final_fill));
+        cluster_data.push(ResolvedCluster {
+            xfm: final_xfm,
+            fill: final_fill,
+            _stroke: final_stroke,
+            is_pattern,
+            is_cut,
+        });
     }
 
-    let current_stroke = egui::Color32::from_rgb(255, 38, 38); // Silhouette cut line: Red (#ff2626)
-    let current_stroke_width = 0.01_f32; // hairline cut line
-
-    for (cluster, (xfm, fill)) in shape_clusters.into_iter().zip(cluster_data.into_iter()) {
+    for (cluster, res) in shape_clusters.into_iter().zip(cluster_data.into_iter()) {
         let mut cluster_max_coord: f32 = 0.0;
         for sub in &cluster.subpaths {
             for v in &sub.vertices {
-                let p_tx = xfm.apply(v.anchor);
+                let p_tx = res.xfm.apply(v.anchor);
                 cluster_max_coord = cluster_max_coord.max(p_tx.x.abs().max(p_tx.y.abs()));
             }
         }
@@ -1230,15 +1353,23 @@ fn parse_paths(
             .min_by_key(|g| g.end_pos - g.start_pos);
         let shape_group_id = matching_group.map(|g| g.id);
 
+        let current_stroke = egui::Color32::from_rgb(255, 38, 38); // Silhouette cut line: Red (#ff2626)
+        let current_stroke_width = if res.is_cut || res.fill.a() == 0 { 0.01_f32 } else { 0.02_f32 };
+        let active_pattern_swatch = if res.is_pattern || (pattern_swatch.is_some() && res.fill.a() > 0) {
+            pattern_swatch
+        } else {
+            None
+        };
+
         if let Some(shape) = create_canvas_shape_from_subpaths(
             &cluster.subpaths,
             shape_group_id,
-            Some(&xfm),
-            fill,
+            Some(&res.xfm),
+            res.fill,
             current_stroke,
             current_stroke_width,
             scale_to_in,
-            pattern_swatch,
+            active_pattern_swatch,
         ) {
             shapes.push(shape);
         }
@@ -1669,9 +1800,19 @@ fn create_canvas_shape_from_subpaths(
         egui::Color32::TRANSPARENT
     };
 
+    let is_cut_stroke = final_stroke_c == egui::Color32::from_rgb(255, 38, 38)
+        || (final_stroke_c.r() >= 200 && final_stroke_c.g() <= 50 && final_stroke_c.b() <= 50)
+        || stroke_width <= 0.015
+        || fill_color.a() == 0;
+
+    let is_mat_boundary = w >= 20.0 || h >= 10.0;
     // Pre-render tiny_skia::Pixmap when needed (pattern fills or multi-subpath compound cutouts)
     let mut pixmap = None;
-    if pattern_swatch.is_some() || subpath_polylines.len() > 1 {
+    let should_have_pixmap = !is_mat_boundary && (
+        (pattern_swatch.is_some() && (fill_color.a() > 0 || is_white_or_light))
+        || (subpath_polylines.len() > 1 && fill_color.a() > 0)
+    );
+    if should_have_pixmap {
         let dpi = 48.0_f32;
         let raw_w = ((w * dpi).ceil() as u32).max(16);
         let raw_h = ((h * dpi).ceil() as u32).max(16);
@@ -1701,7 +1842,7 @@ fn create_canvas_shape_from_subpaths(
 
             if let Some(path) = pb.finish() {
                 if let Some(swatch) = pattern_swatch {
-                    if is_white_or_light || fill_color.a() == 0 {
+                    if is_white_or_light {
                         // Tiled pattern fill clipped to the vector shape path
                         let tile_size_in = 2.0_f32;
                         let tile_w_px = (tile_size_in * sx).max(16.0);
@@ -1720,28 +1861,25 @@ fn create_canvas_shape_from_subpaths(
                         fill_paint.shader = shader;
                         fill_paint.anti_alias = true;
                         pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
-                    } else if fill_color.a() > 0 {
+                    } else {
                         let mut fill_paint = tiny_skia::Paint::default();
                         fill_paint.set_color_rgba8(fill_color.r(), fill_color.g(), fill_color.b(), fill_color.a());
                         fill_paint.anti_alias = true;
                         pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
                     }
-                } else if fill_color.a() > 0 {
+                } else {
                     let mut fill_paint = tiny_skia::Paint::default();
                     fill_paint.set_color_rgba8(fill_color.r(), fill_color.g(), fill_color.b(), fill_color.a());
                     fill_paint.anti_alias = true;
                     pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
                 }
 
-                if final_stroke_c.a() > 0 {
+                if !is_cut_stroke && final_stroke_c.a() > 0 {
                     let mut stroke_paint = tiny_skia::Paint::default();
                     stroke_paint.set_color_rgba8(final_stroke_c.r(), final_stroke_c.g(), final_stroke_c.b(), final_stroke_c.a());
                     stroke_paint.anti_alias = true;
-                    let is_cut_stroke = final_stroke_c == egui::Color32::from_rgb(255, 38, 38)
-                        || (final_stroke_c.r() > 240 && final_stroke_c.g() < 50 && final_stroke_c.b() < 50)
-                        || stroke_width <= 0.015;
                     let st = tiny_skia::Stroke {
-                        width: if is_cut_stroke { 1.25 } else { (stroke_width * sx).max(1.0) },
+                        width: (stroke_width * sx).max(1.0),
                         line_cap: tiny_skia::LineCap::Round,
                         line_join: tiny_skia::LineJoin::Round,
                         ..Default::default()
@@ -1902,57 +2040,67 @@ fn find_fill_color_in_slice(slice: &[u8]) -> Option<egui::Color32> {
         return None;
     }
 
-    // 1. Scan backwards from end of slice for official style record:
-    // 01 [len: 4 bytes] 00 01 [r: f32] [g: f32] [b: f32] [a: f32]
-    // where 0.0 <= r,g,b <= 1.0 and (a - 1.0).abs() < 1e-3
+    // Scan backwards from end of slice for official style record:
+    // 01 [len: 4 bytes] 00 01
     for i in (0..slice.len().saturating_sub(22)).rev() {
         if slice[i] == 0x01 && slice[i + 5] == 0x00 && slice[i + 6] == 0x01 {
             if let Some(len) = read_u32_le(slice, i + 1) {
                 if (16..=2000).contains(&len) {
-                    if let (Some(r), Some(g), Some(b), Some(a)) = (
+                    let end = (i + 5 + len as usize).min(slice.len());
+                    let rec = &slice[i + 7..end];
+                    let join_keywords: [&[u8]; 5] = [b"rounded", b"corner", b"flat", b"bevel", b"miter"];
+                    let mut last_pos = None;
+                    let mut last_kw_len = 0;
+                    for kw in &join_keywords {
+                        let mut p = 0;
+                        while let Some(idx) = find_subsequence(&rec[p..], kw) {
+                            let abs_idx = p + idx;
+                            if last_pos.map_or(true, |lp| abs_idx > lp) {
+                                last_pos = Some(abs_idx);
+                                last_kw_len = kw.len();
+                            }
+                            p = abs_idx + 1;
+                        }
+                    }
+                    if let Some(lp) = last_pos {
+                        let flag_idx = lp + last_kw_len;
+                        if flag_idx < rec.len() {
+                            let flag = rec[flag_idx];
+                            if flag == 1 && flag_idx + 1 + 16 <= rec.len() {
+                                if let (Some(r), Some(g), Some(b), Some(a)) = (
+                                    read_f32_le(rec, flag_idx + 1),
+                                    read_f32_le(rec, flag_idx + 5),
+                                    read_f32_le(rec, flag_idx + 9),
+                                    read_f32_le(rec, flag_idx + 13),
+                                ) {
+                                    if (0.0..=1.01).contains(&r) && (0.0..=1.01).contains(&g) && (0.0..=1.01).contains(&b) && (0.0..=1.01).contains(&a) {
+                                        return Some(egui::Color32::from_rgba_unmultiplied(
+                                            (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                            (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                            (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                            (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                        ));
+                                    }
+                                }
+                            } else if flag == 0 {
+                                return Some(egui::Color32::TRANSPARENT);
+                            }
+                        }
+                    } else if let (Some(r), Some(g), Some(b), Some(a)) = (
                         read_f32_le(slice, i + 7),
                         read_f32_le(slice, i + 11),
                         read_f32_le(slice, i + 15),
                         read_f32_le(slice, i + 19),
                     ) {
-                        if (0.0..=1.0).contains(&r)
-                            && (0.0..=1.0).contains(&g)
-                            && (0.0..=1.0).contains(&b)
-                            && (a - 1.0).abs() < 1e-3
-                        {
+                        if (0.0..=1.01).contains(&r) && (0.0..=1.01).contains(&g) && (0.0..=1.01).contains(&b) && (0.0..=1.01).contains(&a) {
                             return Some(egui::Color32::from_rgba_unmultiplied(
-                                (r * 255.0).round() as u8,
-                                (g * 255.0).round() as u8,
-                                (b * 255.0).round() as u8,
-                                255,
+                                (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                (a.clamp(0.0, 1.0) * 255.0).round() as u8,
                             ));
                         }
                     }
-                }
-            }
-        }
-    }
-
-    // 2. Fallback: scan backwards for 00 01 [r, g, b, a] directly
-    for i in (0..slice.len().saturating_sub(17)).rev() {
-        if slice[i] == 0x00 && slice[i + 1] == 0x01 {
-            if let (Some(r), Some(g), Some(b), Some(a)) = (
-                read_f32_le(slice, i + 2),
-                read_f32_le(slice, i + 6),
-                read_f32_le(slice, i + 10),
-                read_f32_le(slice, i + 14),
-            ) {
-                if (0.0..=1.0).contains(&r)
-                    && (0.0..=1.0).contains(&g)
-                    && (0.0..=1.0).contains(&b)
-                    && (a - 1.0).abs() < 1e-3
-                {
-                    return Some(egui::Color32::from_rgba_unmultiplied(
-                        (r * 255.0).round() as u8,
-                        (g * 255.0).round() as u8,
-                        (b * 255.0).round() as u8,
-                        255,
-                    ));
                 }
             }
         }
@@ -2236,8 +2384,9 @@ fn merge_compound_paths(
                 (raw_w, raw_h)
             };
 
+            let is_white_or_light = (outer.fill_color.r() > 240 && outer.fill_color.g() > 240 && outer.fill_color.b() > 240) || outer.fill_color == egui::Color32::WHITE;
             let mut pixmap = None;
-            if pattern_swatch.is_some() || !hole_indices.is_empty() {
+            if outer.fill_color.a() > 0 && ((pattern_swatch.is_some() && is_white_or_light) || !hole_indices.is_empty()) {
                 if let Some(mut pm) = tiny_skia::Pixmap::new(pix_w, pix_h) {
                     let pad = 2.0_f32;
                     let sx = (pix_w as f32 - pad * 2.0) / outer.width.max(0.001);
@@ -2264,9 +2413,8 @@ fn merge_compound_paths(
                     }
 
                     if let Some(path) = pb.finish() {
-                        let is_white_or_light = (outer.fill_color.r() > 240 && outer.fill_color.g() > 240 && outer.fill_color.b() > 240) || outer.fill_color == egui::Color32::WHITE;
                         if let Some(swatch) = pattern_swatch {
-                            if is_white_or_light || outer.fill_color.a() == 0 {
+                            if is_white_or_light {
                                 let tile_size_in = 2.0_f32;
                                 let tile_w_px = (tile_size_in * sx).max(16.0);
                                 let tile_h_px = (tile_size_in * sy).max(16.0);
@@ -2284,13 +2432,13 @@ fn merge_compound_paths(
                                 fill_paint.shader = shader;
                                 fill_paint.anti_alias = true;
                                 pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
-                            } else if outer.fill_color.a() > 0 {
+                            } else {
                                 let mut fill_paint = tiny_skia::Paint::default();
                                 fill_paint.set_color_rgba8(outer.fill_color.r(), outer.fill_color.g(), outer.fill_color.b(), outer.fill_color.a());
                                 fill_paint.anti_alias = true;
                                 pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
                             }
-                        } else if outer.fill_color.a() > 0 {
+                        } else {
                             let mut fill_paint = tiny_skia::Paint::default();
                             fill_paint.set_color_rgba8(outer.fill_color.r(), outer.fill_color.g(), outer.fill_color.b(), outer.fill_color.a());
                             fill_paint.anti_alias = true;
@@ -2305,15 +2453,17 @@ fn merge_compound_paths(
                             egui::Color32::TRANSPARENT
                         };
 
-                        if stroke_c.a() > 0 {
+                        let is_cut_stroke = stroke_c == egui::Color32::from_rgb(255, 38, 38)
+                            || (stroke_c.r() >= 200 && stroke_c.g() <= 50 && stroke_c.b() <= 50)
+                            || outer.stroke_width <= 0.015
+                            || outer.fill_color.a() == 0;
+
+                        if !is_cut_stroke && stroke_c.a() > 0 {
                             let mut stroke_paint = tiny_skia::Paint::default();
                             stroke_paint.set_color_rgba8(stroke_c.r(), stroke_c.g(), stroke_c.b(), stroke_c.a());
                             stroke_paint.anti_alias = true;
-                            let is_cut_stroke = stroke_c == egui::Color32::from_rgb(255, 38, 38)
-                                || (stroke_c.r() > 240 && stroke_c.g() < 50 && stroke_c.b() < 50)
-                                || outer.stroke_width <= 0.015;
                             let st = tiny_skia::Stroke {
-                                width: if is_cut_stroke { 1.25 } else { (outer.stroke_width * sx).max(1.0) },
+                                width: (outer.stroke_width * sx).max(1.0),
                                 line_cap: tiny_skia::LineCap::Round,
                                 line_join: tiny_skia::LineJoin::Round,
                                 ..Default::default()
@@ -2963,22 +3113,23 @@ mod tests {
                         sample_name,
                         sc
                     );
-
-                    // Verify tiny_skia pixmap is pre-rendered with drawn pixels (clipped pattern + stroke)
-                    assert!(
-                        shape.pixmap.is_some(),
-                        "Cut shape #{} in {} must have pre-rendered pixmap",
-                        idx,
-                        sample_name
-                    );
-                    let pm = shape.pixmap.as_ref().unwrap();
-                    let non_zero_pixels = pm.data().iter().filter(|&&b| b > 0).count();
-                    assert!(
-                        non_zero_pixels > 0,
-                        "Cut shape #{} pixmap in {} must contain non-transparent pixels",
-                        idx,
-                        sample_name
-                    );
+                    // Verify tiny_skia pixmap is pre-rendered for filled / pattern shapes
+                    if shape.fill_color.a() > 0 {
+                        assert!(
+                            shape.pixmap.is_some(),
+                            "Cut shape #{} in {} must have pre-rendered pixmap",
+                            idx,
+                            sample_name
+                        );
+                        let pm = shape.pixmap.as_ref().unwrap();
+                        let non_zero_pixels = pm.data().iter().filter(|&&b| b > 0).count();
+                        assert!(
+                            non_zero_pixels > 0,
+                            "Cut shape #{} pixmap in {} must contain non-transparent pixels",
+                            idx,
+                            sample_name
+                        );
+                    }
                 }
             }
 
@@ -3124,7 +3275,7 @@ mod tests {
 
         // Verify per-shape pixmap dimensions are capped to max 1024x1024 and RAM stays low
         let mut total_pixmap_bytes: usize = 0;
-        let mut white_shape_count = 0;
+        let mut cut_shape_count = 0;
         for s in &doc.shapes {
             if let Some(ref pm) = s.pixmap {
                 let b = pm.data().len();
@@ -3135,15 +3286,12 @@ mod tests {
                 }
             }
             if s.is_svg_path {
-                let is_white = (s.fill_color.r() > 240 && s.fill_color.g() > 240 && s.fill_color.b() > 240) || s.fill_color == egui::Color32::WHITE;
-                if is_white || s.fill_color.a() == 0 {
-                    white_shape_count += 1;
-                    assert_eq!(s.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)),
-                        "White or unstroked vector path must have visible #ff2626 cut outline");
-                }
+                assert_eq!(s.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)),
+                    "Vector path must have visible #ff2626 cut outline");
+                cut_shape_count += 1;
             }
         }
-        assert!(white_shape_count >= 500, "Must contain >= 500 white vector cut shapes with visible red cutlines");
+        assert!(cut_shape_count >= 500, "Must contain >= 500 vector cut shapes with visible red cutlines");
         assert!(total_pixmap_bytes < 50_000_000,
             "Total pixmap RAM must stay under 50 MB, got {:.2} MB", total_pixmap_bytes as f64 / 1_048_576.0);
 
@@ -3515,6 +3663,69 @@ mod tests {
                 if let Ok(doc) = parse_studio_data(&data) {
                     assert!(doc.shapes.len() >= 5, "Train sample should retain individual parts, got {}", doc.shapes.len());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_target_files_print_cut_and_pattern_rendering() {
+        let files = [
+            "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/100 ACRE WOODS POOH.studio3",
+            "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/AT HOME WITH MINNIE & MICKEY.studio3",
+            "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/BIG BIRD.studio3",
+            "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/CHIP & DALE #2.studio3",
+        ];
+        for f in &files {
+            let path = Path::new(f);
+            if !path.exists() {
+                println!("File not found (drive not mounted): {}", f);
+                continue;
+            }
+            let data = std::fs::read(path).unwrap();
+            let doc = parse_studio_data(&data).unwrap();
+            let fname = path.file_name().unwrap().to_string_lossy();
+            println!("=== FILE: {} ===", fname);
+            println!("Version: {:?}, Mat: {}x{}, Shapes count: {}", doc.version, doc.mat_width_in, doc.mat_height_in, doc.shapes.len());
+
+            let has_print_artwork = doc.shapes.iter().any(|s| s.name.as_deref() == Some("Print Artwork"));
+            let transparent_shapes: Vec<_> = doc.shapes.iter().filter(|s| s.fill_color.a() == 0).collect();
+            let opaque_shapes: Vec<_> = doc.shapes.iter().filter(|s| s.fill_color.a() > 0 && s.name.as_deref() != Some("Print Artwork")).collect();
+
+            println!("  Print Artwork present: {}", has_print_artwork);
+            println!("  Transparent shapes (cut lines): {}", transparent_shapes.len());
+            println!("  Opaque shapes: {}", opaque_shapes.len());
+
+            // 1. In Print & Cut files (Pooh & Minnie/Mickey), verify cut lines over artwork are transparent
+            if fname.contains("POOH") || fname.contains("MINNIE") {
+                assert!(has_print_artwork, "{}: Expected Print Artwork embedded image", fname);
+                assert!(!transparent_shapes.is_empty(), "{}: Expected transparent vector cut-lines", fname);
+                // Cut-lines must not have pixmaps (no low-res raster stroke)
+                for s in &transparent_shapes {
+                    assert!(s.pixmap.is_none(), "{}: Transparent cut line must not have pixmap", fname);
+                }
+            }
+
+            // 2. In BIG BIRD, verify pattern swatch is extracted and no shape with transparent fill has pixmap
+            if fname.contains("BIG BIRD") {
+                assert!(doc.pattern_swatch.is_some(), "BIG BIRD must have pattern swatch");
+                for s in &transparent_shapes {
+                    assert!(s.pixmap.is_none(), "BIG BIRD: Transparent shape must not have pixmap");
+                }
+                // Verify no shape is a massive unclipped rectangle covering the 24x12" mat
+                for s in &doc.shapes {
+                    if s.width > 20.0 || s.height > 10.0 {
+                        assert_eq!(s.fill_color.a(), 0, "Large mat boundary shape must not be pattern-filled or opaque");
+                        assert!(s.pixmap.is_none(), "Large mat boundary shape must not have pixmap");
+                    }
+                }
+            }
+
+            // 3. Verify SVG export contains visible red cut stroke for cut lines
+            let svg = convert_studio_to_svg(&data).expect("Convert to SVG");
+            assert!(svg.contains("<svg"), "{}: SVG must contain svg tag", fname);
+            assert!(svg.contains("stroke=\"#ff2626\""), "{}: SVG must have red cut lines", fname);
+            if !transparent_shapes.is_empty() {
+                assert!(svg.contains("fill=\"none\""), "{}: SVG must have fill=\"none\" for cut lines", fname);
             }
         }
     }

@@ -5563,7 +5563,7 @@ impl eframe::App for StudioApp {
                     let stroke_to_draw = shape.stroke_color.and_then(|c| {
                         if c.a() > 0 && !(c.r() > 240 && c.g() > 240 && c.b() > 240) {
                             let is_cut_stroke = c == egui::Color32::from_rgb(255, 38, 38)
-                                || (c.r() > 240 && c.g() < 50 && c.b() < 50)
+                                || (c.r() >= 200 && c.g() <= 50 && c.b() <= 50)
                                 || shape.stroke_width <= 0.015
                                 || shape.fill_color.a() == 0;
                             let sw = if is_cut_stroke {
@@ -5622,7 +5622,7 @@ impl eframe::App for StudioApp {
                 let stroke_opt = shape.stroke_color.and_then(|c| {
                     if c.a() > 0 && !(c.r() > 240 && c.g() > 240 && c.b() > 240) {
                         let is_cut_stroke = c == egui::Color32::from_rgb(255, 38, 38)
-                            || (c.r() > 240 && c.g() < 50 && c.b() < 50)
+                            || (c.r() >= 200 && c.g() <= 50 && c.b() <= 50)
                             || shape.stroke_width <= 0.015
                             || shape.fill_color.a() == 0;
                         let sw = if is_cut_stroke {

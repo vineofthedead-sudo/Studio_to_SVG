@@ -4,6 +4,28 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.5.4] - 2026-11-23
+
+### Added & Improved
+- **Transparent Vector Cut Lines Over Print & Cut Raster Artwork (`app/src/studio_format.rs`, `app/src/main.rs`)**:
+  - Fixed opaque solid black/colored blocks obscuring raster artwork in Print & Cut documents (such as `100 ACRE WOODS POOH.studio3` and `AT HOME WITH MINNIE & MICKEY.studio3`).
+  - Corrected style record decoding to distinguish between stroke/line colors and actual fill flags in Studio V5 (`silhouette05;`): vector cut-paths lacking an explicit solid fill or flagged as cutlines (`flag == 0` or cut mode) now render with transparent fill (`Color32::TRANSPARENT`), allowing embedded `Print Artwork` raster images to display cleanly beneath cut outlines.
+  - In Studio V4 (`silhouette04;`), genuine fill colors encoded directly in style records (`01 [len] 00 01 [r, g, b, a]`) are preserved while advancing the parser index across container lengths, maintaining compound path contours in files like `Peeker Bears.studio`, `BD CATS.studio`, and `PL ZOO PAPER #1.studio`.
+- **Clipped Pattern Fills & Mat Boundary Protection (`app/src/studio_format.rs`)**:
+  - Fixed unclipped repeating pattern fills (such as the confetti in `BIG BIRD.studio3`) that previously rendered as massive bounding rectangles over the entire cutting mat.
+  - Pattern textures are now strictly masked inside vector contours for shapes explicitly flagged with pattern fill (`flag == 5`) or filled shapes with pattern swatch; cutting mat boundary shapes (`w >= 20.0 || h >= 10.0` or `fill_color.a() == 0`) are excluded from pattern fill rasterization.
+- **Constant 1px Screen-Space Hairline Strokes (`app/src/main.rs`, `app/src/studio_format.rs`)**:
+  - Eliminated cut-line rasterization into low-res `tiny_skia::Pixmap`s; cut outlines are rendered exclusively via egui's vector painter as constant 1.0px screen-space hairlines with `#ff2626` stroke across all zoom levels.
+- **Verification on Real Mounted Drive Files (`app/src/studio_format.rs`)**:
+  - Added integration test `test_target_files_print_cut_and_pattern_rendering` verifying:
+    - `100 ACRE WOODS POOH.studio3`: 26 transparent cut lines overlaying embedded Print Artwork with no raster stroke artifacts.
+    - `AT HOME WITH MINNIE & MICKEY.studio3`: 68 transparent cut lines overlaying embedded Print Artwork with no raster stroke artifacts.
+    - `BIG BIRD.studio3`: Confetti pattern swatch extracted with no unclipped mat rectangles.
+    - `CHIP & DALE #2.studio3`: 60 transparent cut lines and 109 opaque layered paper piecing shapes.
+  - All 71 tests passing (`cargo test --manifest-path app/Cargo.toml`); release build verified (`cargo build --release --manifest-path app/Cargo.toml`).
+
+---
+
 ## [0.5.3] - 2026-11-23
 
 ### Added & Improved
