@@ -4,6 +4,24 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.5.7] - 2026-11-23
+
+### Added & Improved
+- **Recursive Matrix Transforms & Global Page Offset (`app/src/studio_format.rs`)**:
+  - Implemented recursive matrix transform rollup: every child path now multiplies its local coordinates by its parent Group's affine matrix, rolling all the way up to the global Page/Document root matrix `doc_root_xfm` (`doc_root_xfm.combine(&outermost).combine(&inner)...combine(&shape_local)`).
+  - Integrated `SPEC.md` Section 3.2 binary page size extraction in `parse_mat_dimensions`: reads physical page dimensions (`widthMm`, `heightMm`) at offset `0x29` in the root's second child block when present, ensuring authentic millimeter-to-inch mat scaling.
+  - Protected binary block extraction: strictly maintained our robust binary block extraction that grabs all shapes, embedded rasters, and color fills without succumbing to trailing section truncation errors.
+- **Coordinate Space Normalization for Silhouette V4 (`.studio`) Files (`app/src/studio_format.rs`)**:
+  - Enforced unified coordinate space scaling across vector geometry (mm scaled to inches via `1.0 / 25.4`) and raster bounding boxes (pixels converted to inches via DPI), preventing vector cutlines from shrinking to the top-left or detaching from companion/embedded raster artwork.
+- **Renderer Enforcements for Cutlines and Rasters (`app/src/main.rs`)**:
+  - Enforced that red cut lines (`#ff2626` or $r \ge 200, g \le 50, b \le 50$ or $w \le 0.015$) strictly render with a 1.0 screen-pixel non-scaling hairline stroke across all canvas zoom levels.
+  - Enforced that vector shapes acting as cut-lines or cut-masks over raster artwork render with `Color32::TRANSPARENT` fill, completely preventing solid opaque blocks from obscuring underlying print artwork.
+- **Attribution & Spec Acknowledgements (`README.md`, `CHANGELOG.md`)**:
+  - Specifically cited Zayd Mulani (`zaydmulani09/studio3svg`) for the 2D affine transformation matrix composition and vector geometry math specifications.
+  - Verified all 72 automated unit and integration tests passing (`cargo test --manifest-path app/Cargo.toml`) and verified release build (`cargo build --release --manifest-path app/Cargo.toml`).
+
+---
+
 ## [0.5.6] - 2026-11-23
 
 ### Added & Improved

@@ -818,6 +818,27 @@ pub fn path_vertices_to_polyline(
 // -------------------------------------------------------------------------------------------------
 
 fn parse_mat_dimensions(full_data: &[u8], stream: &[u8]) -> (f32, f32) {
+    // Check SPEC.md Section 3.2: binary page size in root's second child block at offset 0x29
+    // The root block starts at offset 13 (following magic "silhouette05;").
+    // First child is at offset 18, and second child block immediately follows it.
+    if stream.starts_with(MAGIC_STUDIO_V5) && stream.len() >= 65 {
+        if stream.get(13) == Some(&0x01) {
+            if let Some(c1_size) = read_u32_le(stream, 19) {
+                let first_end = 18 + 1 + (c1_size as usize);
+                if first_end + 5 + 0x29 + 8 <= stream.len() && stream.get(first_end) == Some(&0x01) {
+                    if let (Some(w_mm), Some(h_mm)) = (
+                        read_f32_le(stream, first_end + 5 + 0x29),
+                        read_f32_le(stream, first_end + 5 + 0x29 + 4),
+                    ) {
+                        if w_mm > 10.0 && h_mm > 10.0 && w_mm < 50_000.0 && h_mm < 50_000.0 {
+                            return (w_mm / 25.4, h_mm / 25.4);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let slice_to_check = if full_data.len() > stream.len() { full_data } else { stream };
     let preview_len = slice_to_check.len().min(32_768);
     let preview_slice = slice_to_check.get(..preview_len).unwrap_or(slice_to_check);
@@ -1299,6 +1320,18 @@ fn parse_paths(
         }
     }
 
+    // Scan for global Document / Page root transform matrix (SPEC.md Section 3 / Section 4.2)
+    let doc_root_xfm = if version == StudioFormatVersion::StudioV5 {
+        let header_scan_limit = stream.len().min(4096);
+        if let Some(header_slice) = stream.get(13..header_scan_limit) {
+            find_transform_in_slice(header_slice, version).unwrap_or_default()
+        } else {
+            AffineTransform2D::default()
+        }
+    } else {
+        AffineTransform2D::default()
+    };
+
     // Pre-scan explicit Group and CompoundPath spans to preserve genuine hierarchical grouping
     #[derive(Debug, Clone)]
     struct StudioGroupSpan {
@@ -1571,7 +1604,7 @@ fn parse_paths(
     // in the document share the identical coordinate space normalization (e.g. mm -> inches)
     let mut doc_max_coord: f32 = 0.0;
     for (cluster, res) in shape_clusters.iter().zip(cluster_data.iter()) {
-        let mut cumulative_group_xfm = AffineTransform2D::default();
+        let mut cumulative_group_xfm = doc_root_xfm;
         let mut enclosing: Vec<&StudioGroupSpan> = group_spans.iter()
             .filter(|g| cluster.start_pos >= g.start_pos && cluster.end_pos <= g.end_pos)
             .collect();
@@ -1608,9 +1641,9 @@ fn parse_paths(
         let group_path: Vec<u64> = enclosing_groups.iter().map(|g| g.id).collect();
         let shape_group_id = enclosing_groups.last().map(|g| g.id);
 
-        // Cumulatively multiply parent group matrices down the tree:
-        // cumulative = outermost.transform * ... * innermost.transform
-        let mut cumulative_group_xfm = AffineTransform2D::default();
+        // Cumulatively multiply parent group matrices down the tree, rolling all the way up to doc_root_xfm:
+        // cumulative = doc_root_xfm * outermost.transform * ... * innermost.transform
+        let mut cumulative_group_xfm = doc_root_xfm;
         for g in &enclosing_groups {
             cumulative_group_xfm = cumulative_group_xfm.combine(&g.transform);
         }
@@ -3947,18 +3980,39 @@ mod tests {
 
     #[test]
     fn test_target_files_print_cut_and_pattern_rendering() {
-        let files = [
-            "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/100 ACRE WOODS POOH.studio3",
-            "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/AT HOME WITH MINNIE & MICKEY.studio3",
-            "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/BIG BIRD.studio3",
-            "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/CHIP & DALE #2.studio3",
+        let file_tuples = [
+            (
+                "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/100 ACRE WOODS POOH.studio3",
+                "/home/vineofthedead/Documents/Studio to SVG files for testing/100 ACRE WOODS POOH.studio3",
+            ),
+            (
+                "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/AT HOME WITH MINNIE & MICKEY.studio3",
+                "/home/vineofthedead/Documents/Studio to SVG files for testing/AT HOME WITH MINNIE & MICKEY.studio3",
+            ),
+            (
+                "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/BIG BIRD.studio3",
+                "/home/vineofthedead/Documents/Studio to SVG files for testing/BIG BIRD.studio3",
+            ),
+            (
+                "/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/DISNEY/D - KITS IN SILHOUETTE/CHIP & DALE #2.studio3",
+                "/home/vineofthedead/Documents/Studio to SVG files for testing/Chip and Dale/CHIP & DALE #2.studio3",
+            ),
+            (
+                "/home/vineofthedead/Documents/Studio to SVG files for testing/CHIP & DALE #1.studio3",
+                "/home/vineofthedead/Documents/Studio to SVG files for testing/Chip and Dale/CHIP & DALE #1.studio3",
+            ),
         ];
-        for f in &files {
-            let path = Path::new(f);
-            if !path.exists() {
-                println!("File not found (drive not mounted): {}", f);
+        for (f1, f2) in &file_tuples {
+            let p1 = Path::new(f1);
+            let p2 = Path::new(f2);
+            let path = if p1.exists() {
+                p1
+            } else if p2.exists() {
+                p2
+            } else {
+                println!("File not found (drive not mounted): {} / {}", f1, f2);
                 continue;
-            }
+            };
             let data = std::fs::read(path).unwrap();
             let doc = parse_studio_data(&data).unwrap();
             let fname = path.file_name().unwrap().to_string_lossy();
@@ -4000,6 +4054,10 @@ mod tests {
 
             // 3. Verify SVG export contains visible red cut stroke for cut lines
             let svg = convert_studio_to_svg(&data).expect("Convert to SVG");
+            if fname.contains("CHIP & DALE #2") {
+                let first_lines: Vec<&str> = svg.lines().take(20).collect();
+                println!("CHIP & DALE #2 SVG FIRST LINES:\n{}", first_lines.join("\n"));
+            }
             assert!(svg.contains("<svg"), "{}: SVG must contain svg tag", fname);
             assert!(svg.contains("stroke=\"#ff2626\""), "{}: SVG must have red cut lines", fname);
             if !transparent_shapes.is_empty() {

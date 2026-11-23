@@ -3843,6 +3843,7 @@ fn draw_filled_polygon(
             // Cutlines (#ff2626) must render with constant 1-pixel screen-space hairline thickness
             if s.color == egui::Color32::from_rgb(255, 38, 38)
                 || (s.color.r() >= 200 && s.color.g() <= 50 && s.color.b() <= 50)
+                || s.width <= 0.015
             {
                 s.width = 1.0_f32;
             }
@@ -5537,10 +5538,21 @@ impl eframe::App for StudioApp {
             }
 
             // Render shapes over the grid using fill_color and stroke settings
+            let has_raster_artwork = self.shapes.iter().any(|s| s.name.as_deref() == Some("Print Artwork") || s.pixmap.is_some());
             let black_stroke = egui::Stroke::new(1.0_f32, egui::Color32::BLACK);
             for shape in self.shapes.iter_mut() {
                 if !shape.is_visible {
                     continue;
+                }
+
+                // If document has raster artwork, vector cut lines and masks over rasters must render with transparent fill
+                if has_raster_artwork && shape.name.as_deref() != Some("Print Artwork") {
+                    let is_cut = shape.stroke_color.map_or(false, |c| {
+                        (c.r() >= 200 && c.g() <= 50 && c.b() <= 50) || shape.stroke_width <= 0.015
+                    }) || shape.fill_color.a() == 0 || shape.is_svg_path;
+                    if is_cut {
+                        shape.fill_color = egui::Color32::TRANSPARENT;
+                    }
                 }
 
                 let is_in_active_cached_group = shape.group_id.map_or(false, |gid| active_cached_groups.contains(&gid));
