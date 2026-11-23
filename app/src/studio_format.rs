@@ -1013,9 +1013,46 @@ fn parse_paths(
         s_idx = s_idx.saturating_add(1);
     }
 
-    // Group consecutive subpaths into shapes.
-    // Consecutive subpaths belonging to the same compound path are separated by 10-byte contour headers (gap <= 48)
-    // and share the same style record. Different shapes are separated by gap > 48 or by style records.
+    // Pre-scan explicit object tags (primarily Studio V5 / silhouette05; files)
+    #[derive(Debug, Clone)]
+    struct StudioObjectTag {
+        pos: usize,
+        _name: String,
+    }
+
+    let mut object_tags: Vec<StudioObjectTag> = Vec::new();
+    let known_tags: [&[u8]; 6] = [
+        b"\x07\x00\x00\x00Polygon",
+        b"\x09\x00\x00\x00Rectangle",
+        b"\x05\x00\x00\x00Group",
+        b"\x04\x00\x00\x00Text",
+        b"\x07\x00\x00\x00Ellipse",
+        b"\x04\x00\x00\x00Path",
+    ];
+    let mut t_idx = 0;
+    while t_idx + 8 <= stream.len() {
+        let mut matched = false;
+        for kt in &known_tags {
+            if stream[t_idx..].starts_with(kt) {
+                let tag_name = String::from_utf8_lossy(&kt[4..]).to_string();
+                object_tags.push(StudioObjectTag {
+                    pos: t_idx,
+                    _name: tag_name,
+                });
+                t_idx = t_idx.saturating_add(kt.len());
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            t_idx += 1;
+        }
+    }
+
+    // Group consecutive subpaths deterministically into compound shapes.
+    // In Studio V5: Object tags and style records demarcate shape boundaries.
+    // In Studio V4: Style records demarcate shape boundaries.
+    // Consecutive subpaths within the same object tag and style belong to the same compound path.
     #[derive(Debug, Clone)]
     struct StudioShapeCluster {
         start_pos: usize,
@@ -1028,9 +1065,12 @@ fn parse_paths(
 
     for sub in subpaths {
         if let Some(prev) = cur_cluster_subs.last() {
-            let gap = sub.start_pos.saturating_sub(prev.end_pos);
+            let has_tag_boundary = object_tags.iter().any(|ot| ot.pos > prev.start_pos && ot.pos <= sub.start_pos);
             let has_style_boundary = style_records.iter().any(|sr| sr.pos > prev.start_pos && sr.pos <= sub.start_pos);
-            if gap > 48 || has_style_boundary {
+            let gap = sub.start_pos.saturating_sub(prev.end_pos);
+            let fallback_gap = object_tags.is_empty() && style_records.is_empty() && gap > 200;
+
+            if has_tag_boundary || has_style_boundary || fallback_gap {
                 if !cur_cluster_subs.is_empty() {
                     let start_pos = cur_cluster_subs.first().map(|s| s.start_pos).unwrap_or(0);
                     let end_pos = cur_cluster_subs.last().map(|s| s.end_pos).unwrap_or(start_pos);
@@ -1059,143 +1099,64 @@ fn parse_paths(
         return shapes;
     }
 
-    // Pre-scan explicit Group records (primarily Studio V5 / silhouette05; files)
-    #[derive(Debug, Clone, Copy)]
-    struct StudioGroupRecord {
-        pos: usize,
-        transform: AffineTransform2D,
-    }
-
-    let mut group_records: Vec<StudioGroupRecord> = Vec::new();
-    let group_tag_prefixed = b"\x05\x00\x00\x00Group";
-    let mut g_idx = 0;
-    while g_idx + 5 <= stream.len() {
-        let is_prefixed = g_idx + 9 <= stream.len() && &stream[g_idx..g_idx + 9] == group_tag_prefixed;
-        let is_plain = &stream[g_idx..g_idx + 5] == b"Group";
-        if is_prefixed || is_plain {
-            let tag_offset = if is_prefixed { g_idx + 4 } else { g_idx };
-            // Scan backwards up to 200 bytes for the 3x3 matrix preceding this group closure
-            let bwd_start = tag_offset.saturating_sub(200);
-            if let Some(bwd_slice) = stream.get(bwd_start..tag_offset) {
-                if let Some(xfm) = find_transform_in_slice(bwd_slice, version) {
-                    group_records.push(StudioGroupRecord {
-                        pos: tag_offset,
-                        transform: xfm,
-                    });
-                }
-            }
-            g_idx = tag_offset + 5;
-            continue;
-        }
-        g_idx += 1;
-    }
-
-    // Macro/layer groups: Group records that immediately follow another Group record (within 350 bytes)
-    let mut macro_groups: Vec<StudioGroupRecord> = Vec::new();
-    for window in group_records.windows(2) {
-        if window[1].pos.saturating_sub(window[0].pos) < 350 {
-            macro_groups.push(window[1]);
-        }
-    }
-
-    // Determine matrix and fill for each cluster
+    // Determine matrix and fill for each cluster deterministically
     let mut cluster_data: Vec<(AffineTransform2D, egui::Color32)> = Vec::new();
     let mut last_valid_fill = egui::Color32::TRANSPARENT;
     let mut last_valid_xfm = AffineTransform2D::default();
 
     for idx in 0..shape_clusters.len() {
         let cluster = &shape_clusters[idx];
+        let prev_end = if idx > 0 { shape_clusters[idx - 1].end_pos } else { 0 };
         let next_start = shape_clusters.get(idx + 1).map(|p| p.start_pos).unwrap_or(stream.len());
 
-        let cur_style = style_records.iter().rev().find(|sr| sr.pos <= cluster.start_pos);
-        let next_style_pos = style_records
-            .iter()
-            .find(|sr| sr.pos > cluster.start_pos)
-            .map(|sr| sr.pos)
-            .unwrap_or(stream.len());
-
-        let group_start = cur_style.map(|s| s.pos).unwrap_or(0);
-        let group_end = next_style_pos.min(stream.len());
+        let scope_start = cluster.start_pos.saturating_sub(500).max(prev_end);
+        let scope_end = cluster.end_pos.saturating_add(500).min(next_start).min(stream.len());
 
         // 1. Matrix resolution:
-        // A. Check gap immediately following this cluster
-        let gap_start = cluster.end_pos;
-        let gap_end = next_start.min(gap_start.saturating_add(150)).min(stream.len());
-        let mut local_xfm = None;
-        if gap_start < gap_end {
-            if let Some(gap_slice) = stream.get(gap_start..gap_end) {
-                local_xfm = find_transform_in_slice(gap_slice, version);
-            }
-        }
-
-        // B. Search for group-level transform:
-        let final_xfm = if !group_records.is_empty() {
-            // Studio V5 explicit hierarchical Group records:
-            let imm_group = group_records.iter().find(|g| g.pos >= cluster.end_pos).map(|g| g.transform);
-            let layer_group = macro_groups.iter().find(|g| g.pos >= cluster.end_pos).map(|g| g.transform);
-
-            let mut combined_group = AffineTransform2D::default();
-            if let Some(imm) = imm_group {
-                combined_group = imm;
-            }
-            if let Some(layer) = layer_group {
-                if Some(layer) != imm_group {
-                    combined_group = layer.combine(&combined_group);
-                }
-            }
-
-            match local_xfm {
-                Some(local) => combined_group.combine(&local),
-                None => combined_group,
+        let local_xfm = if scope_start < scope_end {
+            if let Some(scope_slice) = stream.get(scope_start..scope_end) {
+                find_transform_in_slice(scope_slice, version)
+            } else {
+                None
             }
         } else {
-            // Studio V4: Group interval search
-            let mut group_xfm = None;
-            if gap_start < group_end {
-                if let Some(fwd_slice) = stream.get(gap_start..group_end) {
-                    group_xfm = find_transform_in_slice(fwd_slice, version);
-                }
-            }
-            if group_xfm.is_none() && group_start < cluster.start_pos {
-                if let Some(bwd_slice) = stream.get(group_start..cluster.start_pos) {
-                    group_xfm = find_transform_in_slice(bwd_slice, version);
-                }
-            }
+            None
+        };
 
-            match (group_xfm, local_xfm) {
-                (Some(parent), Some(child)) => {
-                    if parent != child {
-                        parent.combine(&child)
-                    } else {
-                        parent
-                    }
-                }
-                (Some(parent), None) => parent,
-                (None, Some(child)) => child,
-                (None, None) => {
-                    if version == StudioFormatVersion::StudioV4 {
-                        last_valid_xfm
-                    } else {
-                        AffineTransform2D::default()
-                    }
+        let final_xfm = match local_xfm {
+            Some(xfm) => {
+                last_valid_xfm = xfm;
+                xfm
+            }
+            None => {
+                if version == StudioFormatVersion::StudioV4 {
+                    last_valid_xfm
+                } else {
+                    AffineTransform2D::default()
                 }
             }
         };
-        last_valid_xfm = final_xfm;
 
         // 2. Fill color resolution:
+        let cur_style = style_records.iter().rev().find(|sr| sr.pos <= cluster.end_pos && sr.pos >= scope_start);
         let final_fill = match cur_style {
-            Some(s) => s.color,
+            Some(s) => {
+                last_valid_fill = s.color;
+                s.color
+            }
             None => {
-                let prefix_start = cluster.start_pos.saturating_sub(600);
-                if let Some(prefix_slice) = stream.get(prefix_start..cluster.start_pos) {
-                    find_fill_color_in_slice(prefix_slice).unwrap_or(last_valid_fill)
+                if let Some(prefix_slice) = stream.get(scope_start..cluster.start_pos) {
+                    if let Some(fc) = find_fill_color_in_slice(prefix_slice) {
+                        last_valid_fill = fc;
+                        fc
+                    } else {
+                        last_valid_fill
+                    }
                 } else {
                     last_valid_fill
                 }
             }
         };
-        last_valid_fill = final_fill;
 
         cluster_data.push((final_xfm, final_fill));
     }
@@ -1817,38 +1778,43 @@ fn find_transform_in_slice(slice: &[u8], version: StudioFormatVersion) -> Option
         }
     }
 
-    // 2. Look for valid 36-byte Qt 3x3 matrix [m11, m12, 0.0, m21, m22, 0.0, dx, dy, 1.0] in slice
-    let mut i = 0;
-    while i + 36 <= slice.len() {
-        if let (Some(m11), Some(m12), Some(m13), Some(m21), Some(m22), Some(m23), Some(dx), Some(dy), Some(m33)) = (
-            read_f32_le(slice, i),
-            read_f32_le(slice, i + 4),
-            read_f32_le(slice, i + 8),
-            read_f32_le(slice, i + 12),
-            read_f32_le(slice, i + 16),
-            read_f32_le(slice, i + 20),
-            read_f32_le(slice, i + 24),
-            read_f32_le(slice, i + 28),
-            read_f32_le(slice, i + 32),
-        ) {
-            if m13.abs() < 1e-4 && m23.abs() < 1e-4 && (m33 - 1.0).abs() < 1e-4 {
-                let det = m11 * m22 - m12 * m21;
-                if (0.05..20.0).contains(&det.abs())
-                    && (0.05..20.0).contains(&m11.abs())
-                    && (0.05..20.0).contains(&m22.abs())
-                    && m12.abs() < 10.0
-                    && m21.abs() < 10.0
-                    && dx.abs() < 20_000.0
-                    && dy.abs() < 20_000.0
-                {
-                    // Map Qt [m11, m12, 0, m21, m22, 0, dx, dy, 1] to AffineTransform2D:
-                    // x' = m11 * x + m21 * y + dx
-                    // y' = m12 * x + m22 * y + dy
-                    return Some(AffineTransform2D::new(m11, m21, dx, m12, m22, dy));
+    // 2. Look for anchored 36-byte Qt 3x3 matrix [m11, m12, 0.0, m21, m22, 0.0, dx, dy, 1.0]
+    // preceded deterministically by Qt stream marker 00 01 00 01
+    let mut search_idx = 0;
+    while let Some(rel) = find_subsequence(&slice[search_idx..], b"\x00\x01\x00\x01") {
+        let marker_pos = search_idx + rel;
+        let mat_start = marker_pos + 4;
+        if mat_start + 36 <= slice.len() {
+            if let (Some(m11), Some(m12), Some(m13), Some(m21), Some(m22), Some(m23), Some(dx), Some(dy), Some(m33)) = (
+                read_f32_le(slice, mat_start),
+                read_f32_le(slice, mat_start + 4),
+                read_f32_le(slice, mat_start + 8),
+                read_f32_le(slice, mat_start + 12),
+                read_f32_le(slice, mat_start + 16),
+                read_f32_le(slice, mat_start + 20),
+                read_f32_le(slice, mat_start + 24),
+                read_f32_le(slice, mat_start + 28),
+                read_f32_le(slice, mat_start + 32),
+            ) {
+                if m13.abs() < 1e-4 && m23.abs() < 1e-4 && (m33 - 1.0).abs() < 1e-4 {
+                    let det = m11 * m22 - m12 * m21;
+                    if (0.01..100.0).contains(&det.abs())
+                        && (0.01..100.0).contains(&m11.abs())
+                        && (0.01..100.0).contains(&m22.abs())
+                        && m12.abs() < 10.0
+                        && m21.abs() < 10.0
+                        && dx.abs() < 20_000.0
+                        && dy.abs() < 20_000.0
+                    {
+                        // Map Qt [m11, m12, 0, m21, m22, 0, dx, dy, 1] to AffineTransform2D:
+                        // x' = m11 * x + m21 * y + dx
+                        // y' = m12 * x + m22 * y + dy
+                        return Some(AffineTransform2D::new(m11, m21, dx, m12, m22, dy));
+                    }
                 }
             }
         }
-        i = i.saturating_add(1);
+        search_idx = marker_pos + 1;
     }
 
     // 3. For Studio V4, scan for 24-byte matrix [a, b, tx, c, d, ty]
@@ -3344,6 +3310,56 @@ mod tests {
                 assert!(shape.stroke_width <= 0.015, "{}: Stroke width must be hairline (<= 0.015), got {}", filename, shape.stroke_width);
                 assert_eq!(shape.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)), "{}: Stroke color must be red (#ff2626)", filename);
             }
+        }
+    }
+
+    #[test]
+    fn test_all_samples_corpus_transforms_and_bounds() {
+        let dir_candidates = [
+            Path::new("../test_samples"),
+            Path::new("test_samples"),
+        ];
+        let sample_dir = dir_candidates.iter().find(|p| p.is_dir()).expect("test_samples dir must exist");
+        let mut sample_files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(sample_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ext == "studio" || ext == "studio3" {
+                        sample_files.push(path);
+                    }
+                }
+            }
+        }
+        assert!(sample_files.len() >= 8, "Expected at least 8 corpus sample files, found {}", sample_files.len());
+
+        for path in sample_files {
+            let filename = path.file_name().unwrap().to_string_lossy().to_string();
+            let data = std::fs::read(&path).unwrap_or_else(|e| panic!("Read {}: {}", filename, e));
+            let doc = parse_studio_data(&data).unwrap_or_else(|e| panic!("Parse {}: {}", filename, e));
+
+            assert!(!doc.shapes.is_empty(), "{}: Must extract vector shapes", filename);
+            assert!(doc.mat_width_in > 0.0 && doc.mat_height_in > 0.0, "{}: Mat size must be valid", filename);
+
+            let max_dim = doc.mat_width_in.max(doc.mat_height_in) * 4.0;
+            for (idx, shape) in doc.shapes.iter().enumerate() {
+                assert!(shape.width > 0.0, "{}: Shape #{} width must be > 0, got {}", filename, idx, shape.width);
+                assert!(shape.height > 0.0, "{}: Shape #{} height must be > 0, got {}", filename, idx, shape.height);
+                assert!(shape.width <= max_dim, "{}: Shape #{} width too large ({:.2} in > {:.2} in)", filename, idx, shape.width, max_dim);
+                assert!(shape.height <= max_dim, "{}: Shape #{} height too large ({:.2} in > {:.2} in)", filename, idx, shape.height, max_dim);
+                assert!(shape.x.is_finite() && shape.y.is_finite(), "{}: Shape #{} pos not finite", filename, idx);
+
+                if shape.is_svg_path {
+                    assert!(!shape.text.is_empty(), "{}: SVG path d string must not be empty", filename);
+                    assert!(shape.text.starts_with('M'), "{}: SVG path d string must start with M", filename);
+                }
+            }
+
+            // Verify clean SVG export
+            let svg = convert_studio_to_svg(&data).unwrap_or_else(|e| panic!("SVG export {}: {}", filename, e));
+            assert!(svg.starts_with("<?xml"), "{}: SVG export missing XML declaration", filename);
+            assert!(svg.contains("</svg>"), "{}: SVG export missing closing tag", filename);
+            assert!(svg.len() > 100, "{}: SVG export output unexpectedly short ({} bytes)", filename, svg.len());
         }
     }
 }

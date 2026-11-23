@@ -4,6 +4,30 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.5.2] - 2026-11-23
+
+### Added & Improved
+- **Deterministic Anchored Qt Transform Decoding (`app/src/studio_format.rs`)**:
+  - Reverse-engineered the exact binary stream layout of serialized `QTransform` records across `.studio` (`silhouette04;`) and `.studio3` (`silhouette05;`) files.
+  - Anchored matrix search to the explicit Qt binary stream marker `\x00\x01\x00\x01` followed by the 36-byte matrix `[m11, m12, 0.0, m21, m22, 0.0, dx, dy, 1.0]`.
+  - Completely eliminated unaligned sliding-window float scanning that previously landed 16 bytes prior to the matrix on `1.0 1.0 0.0 2.35e-38 1.0 ...`, which erroneously assigned `m12 = 1.0` and sheared paths by 45° in files like `AN UNICORN.studio3` and `AN UNICORN PAPER #2.studio3`.
+  - Removed backward bounding-box float scanning on `Group` records that previously mistook bounding box coordinates for parent affine matrices and compounded false distortions onto child shapes.
+- **Deterministic Compound Path & Object Clustering (`app/src/studio_format.rs`)**:
+  - Replaced arbitrary byte gap threshold heuristics (`gap > 48`) with deterministic structural boundaries:
+    - **Studio V5 (`silhouette05;`)**: Shapes are demarcated by explicit binary object tags (`\x07\x00\x00\x00Polygon`, `\x09\x00\x00\x00Rectangle`, `\x05\x00\x00\x00Group`, `\x04\x00\x00\x00Text`, `\x07\x00\x00\x00Ellipse`, `\x04\x00\x00\x00Path`) and style records (`01 [len] 00 01 [r, g, b, 1.0]`). Multi-subpath polygons (e.g. 16-subpath heart cutouts in `DISNEY HEARTS.studio3`, 83-subpath cutouts in `PL ZOO PAPER.studio3`) are assembled cleanly into unified compound paths with `EvenOdd` fill/cut rule without fragmenting or losing interior cutout contours.
+    - **Studio V4 (`silhouette04;`)**: Shapes are demarcated by style records (`01 [len] 00 01 [r, g, b, 1.0]`), grouping all subpaths between consecutive style headers into their respective multi-subpath compound shapes (e.g. exactly 5 compound cats in `BD CATS.studio`, 26 shapes in `Peeker Bears.studio`).
+- **Comprehensive Corpus Integration Test Suite (`app/src/studio_format.rs`)**:
+  - Added `test_all_samples_corpus_transforms_and_bounds` iterating dynamically over all `.studio` and `.studio3` files in `test_samples/`:
+    - Asserts non-empty vector shape extraction for every file.
+    - Asserts positive width and height bounded cleanly within artboard dimensions (no NaN/Inf coordinates, no runaway dimensions).
+    - Asserts all SVG path `d` strings are valid and start with `M`.
+    - Asserts clean XML SVG export (`convert_studio_to_svg`) for every corpus sample.
+- **Test Suite & Build Verification**:
+  - All 69 unit and integration tests passing (`cargo test --release --manifest-path app/Cargo.toml`).
+  - Clean optimized release build (`cargo build --release --manifest-path app/Cargo.toml`).
+
+---
+
 ## [0.5.1] - 2026-11-22
 
 ### Added & Improved
