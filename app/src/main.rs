@@ -5531,7 +5531,7 @@ impl eframe::App for StudioApp {
             }
 
             // Render shapes over the grid using fill_color and stroke settings
-            let black_stroke = egui::Stroke::new(1.25_f32, egui::Color32::BLACK);
+            let black_stroke = egui::Stroke::new(1.0_f32, egui::Color32::BLACK);
             for shape in self.shapes.iter_mut() {
                 if !shape.is_visible {
                     continue;
@@ -5543,15 +5543,20 @@ impl eframe::App for StudioApp {
                 }
 
                 if let Some(tex) = &shape.texture {
-                    let screen_min = mat_to_screen(egui::pos2(shape.x, shape.y));
-                    let screen_size = egui::vec2(shape.width * px_per_in, shape.height * px_per_in);
-                    let screen_rect = egui::Rect::from_min_size(screen_min, screen_size);
-                    painter.image(
-                        tex.id(),
-                        screen_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                    // Only draw raster texture for shapes with a filled pattern or non-transparent fill.
+                    // For pure cut lines / unfilled shapes (fill_color.a() == 0), skip painter.image
+                    // so the raster texture doesn't render blurry 10px+ lines when zoomed in!
+                    if shape.fill_color.a() > 0 {
+                        let screen_min = mat_to_screen(egui::pos2(shape.x, shape.y));
+                        let screen_size = egui::vec2(shape.width * px_per_in, shape.height * px_per_in);
+                        let screen_rect = egui::Rect::from_min_size(screen_min, screen_size);
+                        painter.image(
+                            tex.id(),
+                            screen_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
 
                     // Ensure vector cut-line contours are visible on top of pattern/image textures as crisp constant hairlines
                     let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
@@ -5559,9 +5564,10 @@ impl eframe::App for StudioApp {
                         if c.a() > 0 && !(c.r() > 240 && c.g() > 240 && c.b() > 240) {
                             let is_cut_stroke = c == egui::Color32::from_rgb(255, 38, 38)
                                 || (c.r() > 240 && c.g() < 50 && c.b() < 50)
-                                || shape.stroke_width <= 0.015;
+                                || shape.stroke_width <= 0.015
+                                || shape.fill_color.a() == 0;
                             let sw = if is_cut_stroke {
-                                1.25_f32
+                                1.0_f32
                             } else {
                                 (shape.stroke_width * px_per_in).max(1.0)
                             };
@@ -5571,7 +5577,7 @@ impl eframe::App for StudioApp {
                         }
                     }).or_else(|| {
                         if is_white_or_light || shape.fill_color.a() == 0 || shape.stroke_color.is_some() {
-                            Some(egui::Stroke::new(1.25_f32, egui::Color32::from_rgb(255, 38, 38)))
+                            Some(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 38, 38)))
                         } else {
                             None
                         }
@@ -5617,9 +5623,10 @@ impl eframe::App for StudioApp {
                     if c.a() > 0 && !(c.r() > 240 && c.g() > 240 && c.b() > 240) {
                         let is_cut_stroke = c == egui::Color32::from_rgb(255, 38, 38)
                             || (c.r() > 240 && c.g() < 50 && c.b() < 50)
-                            || shape.stroke_width <= 0.015;
+                            || shape.stroke_width <= 0.015
+                            || shape.fill_color.a() == 0;
                         let sw = if is_cut_stroke {
-                            1.25_f32
+                            1.0_f32
                         } else {
                             (shape.stroke_width * px_per_in).max(1.0)
                         };
@@ -5629,7 +5636,7 @@ impl eframe::App for StudioApp {
                     }
                 }).or_else(|| {
                     if is_white_or_light || shape.fill_color.a() == 0 {
-                        Some(egui::Stroke::new(1.25_f32, egui::Color32::from_rgb(255, 38, 38)))
+                        Some(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 38, 38)))
                     } else {
                         None
                     }
@@ -5673,9 +5680,9 @@ impl eframe::App for StudioApp {
                             let p2 = mat_to_screen(shape.points[1]);
                             let s = stroke_opt.unwrap_or_else(|| {
                                 if shape.fill_color.a() > 0 {
-                                    egui::Stroke::new(1.25_f32, shape.fill_color)
+                                    egui::Stroke::new(1.0_f32, shape.fill_color)
                                 } else {
-                                    egui::Stroke::new(1.25_f32, egui::Color32::BLACK)
+                                    egui::Stroke::new(1.0_f32, egui::Color32::BLACK)
                                 }
                             });
                             painter.line_segment([p1, p2], s);

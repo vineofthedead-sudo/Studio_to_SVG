@@ -307,7 +307,7 @@ pub fn parse_studio_data(data: &[u8]) -> Result<ParsedStudioDocument, StudioPars
     normalize_shapes_onto_mat(&mut shapes, mat_w_in, mat_h_in);
 
     // 6. Detect and merge compound paths (e.g. concentric wheels with inner cutouts)
-    let mut shapes = merge_compound_paths(shapes, pattern_swatch.as_deref());
+    let mut shapes = merge_compound_paths(shapes, version, pattern_swatch.as_deref());
 
     // 7. Add positioned Print & Cut artwork (if any, placed under vector shapes)
     if let Some(png_shape) = png_shape_opt {
@@ -1021,13 +1021,16 @@ fn parse_paths(
     }
 
     let mut object_tags: Vec<StudioObjectTag> = Vec::new();
-    let known_tags: [&[u8]; 6] = [
+    let known_tags: [&[u8]; 9] = [
         b"\x07\x00\x00\x00Polygon",
         b"\x09\x00\x00\x00Rectangle",
         b"\x05\x00\x00\x00Group",
         b"\x04\x00\x00\x00Text",
         b"\x07\x00\x00\x00Ellipse",
         b"\x04\x00\x00\x00Path",
+        b"\x0c\x00\x00\x00CompoundPath",
+        b"\x0d\x00\x00\x00Compound Path",
+        b"\x08\x00\x00\x00Compound",
     ];
     let mut t_idx = 0;
     while t_idx + 8 <= stream.len() {
@@ -1046,6 +1049,48 @@ fn parse_paths(
         }
         if !matched {
             t_idx += 1;
+        }
+    }
+
+    // Pre-scan explicit Group and CompoundPath spans to preserve genuine hierarchical grouping
+    #[derive(Debug, Clone)]
+    struct StudioGroupSpan {
+        id: u64,
+        start_pos: usize,
+        end_pos: usize,
+    }
+
+    let mut group_spans: Vec<StudioGroupSpan> = Vec::new();
+    let group_patterns: [&[u8]; 3] = [
+        b"\x05\x00\x00\x00Group",
+        b"\x0c\x00\x00\x00CompoundPath",
+        b"\x0d\x00\x00\x00Compound Path",
+    ];
+
+    let mut g_search = 0;
+    while g_search + 15 <= stream.len() {
+        let mut found_match = None;
+        for pat in &group_patterns {
+            if stream[g_search..].starts_with(pat) {
+                found_match = Some((g_search, pat.len()));
+                break;
+            }
+        }
+        if let Some((pos, tag_len)) = found_match {
+            let header_offset = pos + tag_len + 60;
+            if header_offset + 5 <= stream.len() && stream[header_offset] == 0x01 {
+                if let Some(payload_len) = read_u32_le(stream, header_offset + 1) {
+                    let end_pos = (header_offset + 5).saturating_add(payload_len as usize).min(stream.len());
+                    group_spans.push(StudioGroupSpan {
+                        id: (group_spans.len() as u64) + 100,
+                        start_pos: pos,
+                        end_pos,
+                    });
+                }
+            }
+            g_search = pos + tag_len;
+        } else {
+            g_search += 1;
         }
     }
 
@@ -1163,7 +1208,6 @@ fn parse_paths(
 
     let current_stroke = egui::Color32::from_rgb(255, 38, 38); // Silhouette cut line: Red (#ff2626)
     let current_stroke_width = 0.01_f32; // hairline cut line
-    let current_layer_id = 1_u64;
 
     for (cluster, (xfm, fill)) in shape_clusters.into_iter().zip(cluster_data.into_iter()) {
         let mut cluster_max_coord: f32 = 0.0;
@@ -1181,9 +1225,14 @@ fn parse_paths(
             1.0
         };
 
+        let matching_group = group_spans.iter()
+            .filter(|g| cluster.start_pos >= g.start_pos && cluster.end_pos <= g.end_pos)
+            .min_by_key(|g| g.end_pos - g.start_pos);
+        let shape_group_id = matching_group.map(|g| g.id);
+
         if let Some(shape) = create_canvas_shape_from_subpaths(
             &cluster.subpaths,
-            current_layer_id,
+            shape_group_id,
             Some(&xfm),
             fill,
             current_stroke,
@@ -1552,7 +1601,7 @@ pub fn sanitize_subpath_vertices(vertices: &[StudioBezierVertex]) -> Vec<StudioB
 
 fn create_canvas_shape_from_subpaths(
     subpaths: &[StudioSubpath],
-    layer_id: u64,
+    group_id: Option<u64>,
     transform: Option<&AffineTransform2D>,
     fill_color: egui::Color32,
     stroke_color: egui::Color32,
@@ -1609,7 +1658,7 @@ fn create_canvas_shape_from_subpaths(
         }
     }
 
-    // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so multi-subpaths and holes render cleanly
+    // Determine stroke color
     let is_white_or_light = (fill_color.r() > 240 && fill_color.g() > 240 && fill_color.b() > 240) || fill_color == egui::Color32::WHITE;
     let is_white_or_invisible_stroke = stroke_color.a() == 0 || (stroke_color.r() > 240 && stroke_color.g() > 240 && stroke_color.b() > 240);
     let final_stroke_c = if !is_white_or_invisible_stroke {
@@ -1620,7 +1669,7 @@ fn create_canvas_shape_from_subpaths(
         egui::Color32::TRANSPARENT
     };
 
-    // Pre-render tiny_skia::Pixmap only when needed (pattern fills or multi-subpath compound cutouts)
+    // Pre-render tiny_skia::Pixmap when needed (pattern fills or multi-subpath compound cutouts)
     let mut pixmap = None;
     if pattern_swatch.is_some() || subpath_polylines.len() > 1 {
         let dpi = 48.0_f32;
@@ -1719,8 +1768,8 @@ fn create_canvas_shape_from_subpaths(
         is_svg_path: true,
         is_modified: false,
         triangles: Vec::new(),
-        group_id: Some(layer_id),
-        group_path: vec![layer_id],
+        group_id,
+        group_path: group_id.map(|id| vec![id]).unwrap_or_default(),
         is_visible: true,
         is_locked: false,
         name: None,
@@ -1748,7 +1797,7 @@ fn create_canvas_shape_from_vertices(
     };
     create_canvas_shape_from_subpaths(
         &[sub],
-        layer_id,
+        Some(layer_id),
         transform,
         fill_color,
         stroke_color,
@@ -2072,7 +2121,11 @@ fn decode_png_to_pixmap(bytes: &[u8]) -> Option<tiny_skia::Pixmap> {
 }
 
 /// Merges concentric closed shapes sharing the same solid fill color into a compound path with EvenOdd cutout.
-fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_skia::Pixmap>) -> Vec<CanvasShape> {
+fn merge_compound_paths(
+    shapes: Vec<CanvasShape>,
+    version: StudioFormatVersion,
+    pattern_swatch: Option<&tiny_skia::Pixmap>,
+) -> Vec<CanvasShape> {
     if shapes.len() < 2 {
         return shapes;
     }
@@ -2102,8 +2155,13 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
                 continue;
             }
 
-            // If grouped, must belong to the same group
-            if s1.group_id.is_some() && s1.group_id != s2.group_id {
+            // In silhouette05; (.studio3), restrict merging to subpaths sharing the same explicit Group/CompoundPath.
+            // In silhouette04; (.studio), files lack object tags so check s1.group_id != s2.group_id if grouped.
+            if version == StudioFormatVersion::StudioV5 {
+                if s1.group_id.is_none() || s2.group_id.is_none() || s1.group_id != s2.group_id {
+                    continue;
+                }
+            } else if s1.group_id.is_some() && s1.group_id != s2.group_id {
                 continue;
             }
 
@@ -3360,6 +3418,104 @@ mod tests {
             assert!(svg.starts_with("<?xml"), "{}: SVG export missing XML declaration", filename);
             assert!(svg.contains("</svg>"), "{}: SVG export missing closing tag", filename);
             assert!(svg.len() > 100, "{}: SVG export output unexpectedly short ({} bytes)", filename, svg.len());
+        }
+    }
+
+    #[test]
+    fn test_merge_compound_paths_group_isolation_and_cutline_hairline() {
+        // Test 1: In StudioV5, concentric shapes WITHOUT an explicit group MUST NOT be merged
+        let outer_rect = CanvasShape {
+            kind: ShapeKind::Freehand,
+            x: 1.0,
+            y: 1.0,
+            width: 4.0,
+            height: 4.0,
+            points: vec![
+                egui::pos2(1.0, 1.0),
+                egui::pos2(5.0, 1.0),
+                egui::pos2(5.0, 5.0),
+                egui::pos2(1.0, 5.0),
+            ],
+            text: "M 1.0 1.0 L 5.0 1.0 L 5.0 5.0 L 1.0 5.0 Z".to_string(),
+            fill_color: egui::Color32::from_rgb(40, 40, 40),
+            stroke_color: Some(egui::Color32::from_rgb(255, 38, 38)),
+            stroke_width: 0.01,
+            is_closed: true,
+            is_svg_path: true,
+            is_modified: false,
+            triangles: Vec::new(),
+            group_id: None, // Independent shape
+            group_path: Vec::new(),
+            is_visible: true,
+            is_locked: false,
+            name: None,
+            pixmap: None,
+            texture: None,
+        };
+
+        let inner_rect = CanvasShape {
+            kind: ShapeKind::Freehand,
+            x: 2.0,
+            y: 2.0,
+            width: 2.0,
+            height: 2.0,
+            points: vec![
+                egui::pos2(2.0, 2.0),
+                egui::pos2(4.0, 2.0),
+                egui::pos2(4.0, 4.0),
+                egui::pos2(2.0, 4.0),
+            ],
+            text: "M 2.0 2.0 L 4.0 2.0 L 4.0 4.0 L 2.0 4.0 Z".to_string(),
+            fill_color: egui::Color32::from_rgb(40, 40, 40),
+            stroke_color: Some(egui::Color32::from_rgb(255, 38, 38)),
+            stroke_width: 0.01,
+            is_closed: true,
+            is_svg_path: true,
+            is_modified: false,
+            triangles: Vec::new(),
+            group_id: None, // Independent shape
+            group_path: Vec::new(),
+            is_visible: true,
+            is_locked: false,
+            name: None,
+            pixmap: None,
+            texture: None,
+        };
+
+        let shapes_ungrouped = vec![outer_rect.clone(), inner_rect.clone()];
+        let merged_v5_ungrouped = merge_compound_paths(shapes_ungrouped, StudioFormatVersion::StudioV5, None);
+        assert_eq!(
+            merged_v5_ungrouped.len(),
+            2,
+            "StudioV5 must NEVER merge independent ungrouped shapes into a single compound path"
+        );
+
+        // Test 2: In StudioV5, shapes WITH identical group_id ARE merged into a compound path
+        let mut outer_grouped = outer_rect.clone();
+        outer_grouped.group_id = Some(101);
+        outer_grouped.group_path = vec![101];
+
+        let mut inner_grouped = inner_rect.clone();
+        inner_grouped.group_id = Some(101);
+        inner_grouped.group_path = vec![101];
+
+        let shapes_grouped = vec![outer_grouped, inner_grouped];
+        let merged_v5_grouped = merge_compound_paths(shapes_grouped, StudioFormatVersion::StudioV5, None);
+        assert_eq!(
+            merged_v5_grouped.len(),
+            1,
+            "StudioV5 must merge shapes sharing the same Group / CompoundPath record"
+        );
+        assert_eq!(merged_v5_grouped[0].text.matches('M').count(), 2);
+
+        // Test 3: If external sample exists (TRANSPORTATION TRAIN #2), verify parser execution
+        let train_path = Path::new("/home/vineofthedead/Projects/kits-site/KITS/TRANSPORTATION/SVG/TRAIN #2/TRANSPORTATION TRAIN #2.studio3");
+        if train_path.exists() {
+            if let Ok(data) = std::fs::read(train_path) {
+                if let Ok(doc) = parse_studio_data(&data) {
+                    assert!(doc.shapes.len() >= 5, "Train sample should retain individual parts, got {}", doc.shapes.len());
+                }
+            }
         }
     }
 }

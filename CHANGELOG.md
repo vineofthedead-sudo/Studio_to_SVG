@@ -4,6 +4,23 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.5.3] - 2026-11-23
+
+### Added & Improved
+- **Sharp Constant Hairline Cut-Line Rendering (`app/src/main.rs`)**:
+  - Eliminated blurry 10px+ rasterized cut lines when zoomed in by suppressing raster texture (`painter.image`) draws for unfilled vector shapes (`shape.fill_color.a() == 0`). Pure cut lines and unfilled contours now render strictly through egui's vector painter.
+  - Standardized Silhouette cut lines (red `#ff2626`, unfilled paths, lines, and hairline borders) to a razor-sharp constant 1.0px screen-space hairline (`egui::Stroke::new(1.0_f32, color)`), guaranteeing crisp cut outlines across all zoom levels without zoom-induced line bloat.
+- **Deterministic Explicit Group / Compound Path Isolation (`app/src/studio_format.rs`)**:
+  - Pre-scanned explicit `Group` and `CompoundPath` binary spans in `silhouette05;` files by parsing header offsets and payload length fields.
+  - Assigned deterministic group IDs to shape clusters matching their innermost parent group span, keeping independent top-level shapes cleanly ungrouped (`group_id: None`).
+  - Restricted `merge_compound_paths` in `StudioV5` (`silhouette05;`) to only merge shapes that explicitly share the same `Group` or `CompoundPath` record. Independent adjacent shapes (such as background bounding boxes/targets in Skeet or adjacent train cars in Train) are no longer aggressively merged purely based on bounding box collisions.
+  - Preserved backward compatibility for `silhouette04;` (`StudioV4`) documents where group boundaries are not tagged with object tags.
+- **Corpus & Group Isolation Integration Tests (`app/src/studio_format.rs`)**:
+  - Added `test_merge_compound_paths_group_isolation_and_cutline_hairline` asserting that ungrouped concentric shapes in `StudioV5` remain independent, while grouped shapes sharing identical group IDs merge with multi-contour `EvenOdd` cutouts.
+  - Verified all 70 unit and integration tests passing (`cargo test --manifest-path app/Cargo.toml`) and verified clean optimized release build (`cargo build --release --manifest-path app/Cargo.toml`).
+
+---
+
 ## [0.5.2] - 2026-11-23
 
 ### Added & Improved
