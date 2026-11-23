@@ -4,6 +4,25 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.5.5] - 2026-11-23
+
+### Added & Improved
+- **Vector and Raster Coordinate Space Normalization (`app/src/studio_format.rs`)**:
+  - Resolved coordinate space disparity in `.studio` (`silhouette04;`) files where vector cut-paths previously shrank to ~1/3 size and snapped to the top-left origin, detaching from their corresponding raster fills (e.g. `OL DISNEY CHIP & DALE.studio` and `OL BASEBALL SOLID.studio`).
+  - Restructured Print Artwork extraction and layout: rather than guessing that every raster image spans the entire 12" cutting mat, `attach_print_artwork_to_shapes` now differentiates between full-page Print & Cut documents (e.g. `100 ACRE WOODS POOH.studio3` and `AT HOME WITH MINNIE & MICKEY.studio3`, where vector shapes cover >70% of the mat) and localized design elements / overlays. For localized designs, raster bounding boxes are aligned directly with their vector contour bounds in millimeter/inch coordinates.
+  - Unified mat normalization: inserted `Print Artwork` into `shapes` prior to running `normalize_shapes_onto_mat`, ensuring that any canvas translation, centering, or scaling transforms both vector cutlines and raster artwork identically.
+- **Companion Image Discovery (`app/src/studio_format.rs`)**:
+  - Implemented `find_companion_raster_image`: automatically discovers sidecar PNG/JPEG artwork located either in the same directory or within sibling asset directories (`PNG Overkay`, `PNG Overlay`, `PNG`, `Images`, etc.), seamlessly pairing files like `OL DISNEY CHIP & DALE.studio` with `OL DISNEY CHIP & DALE.png`.
+- **Surgical Vector Geometry & Spec Attribution (`app/src/studio_format.rs`, `README.md`)**:
+  - Incorporated structural insights from the open-source `.studio3` specification published by Zayd Mulani (`zaydmulani09`/`studio3svg`), cross-referencing section offset tables, 65-byte transform layouts, millimeter page coordinate outlines (Block P), and relative Bézier control point offsets `(dx, dy)`.
+  - Preserved full embedded raster image extraction (PNG/JPEG) and multi-color cardstock fill support, building on the spec while keeping rich color visualization intact.
+  - Added formal attribution in `README.md` and `CHANGELOG.md` citing Zayd Mulani (`zaydmulani09`) and `studio3svg`.
+- **Test Suite & Verification (`app/src/studio_format.rs`)**:
+  - Added unit test `test_v4_vector_raster_alignment_and_companion_loading` verifying companion raster loading, alignment within <0.2 inches, and non-detaching coordinate normalization.
+  - Verified all 72 automated unit and integration tests passing (`cargo test --manifest-path app/Cargo.toml`).
+
+---
+
 ## [0.5.4] - 2026-11-23
 
 ### Added & Improved

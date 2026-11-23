@@ -283,7 +283,147 @@ pub fn detect_format_and_stream(data: &[u8]) -> Result<(StudioFormatVersion, usi
 /// Parses a Silhouette Studio file from disk.
 pub fn parse_studio_file(path: &Path) -> Result<ParsedStudioDocument, StudioParseError> {
     let data = std::fs::read(path)?;
-    parse_studio_data(&data)
+    let mut doc = parse_studio_data(&data)?;
+
+    // If no embedded artwork was in the binary, look for companion raster image
+    if doc.shapes.iter().all(|s| s.name.as_deref() != Some("Print Artwork")) {
+        if let Some(companion_path) = find_companion_raster_image(path) {
+            if let Ok(comp_bytes) = std::fs::read(&companion_path) {
+                let decoded = decode_png_to_pixmap(&comp_bytes).or_else(|| {
+                    image::load_from_memory(&comp_bytes).ok().and_then(|dyn_img| {
+                        let rgba = dyn_img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        let mut pixmap = tiny_skia::Pixmap::new(w, h)?;
+                        pixmap.data_mut().copy_from_slice(&rgba.into_raw());
+                        Some(pixmap)
+                    })
+                });
+                if let Some(pm) = decoded {
+                    let arc_pm = std::sync::Arc::new(pm);
+                    attach_print_artwork_to_shapes(&mut doc.shapes, arc_pm, doc.mat_width_in, doc.mat_height_in);
+                    normalize_shapes_onto_mat(&mut doc.shapes, doc.mat_width_in, doc.mat_height_in);
+                }
+            }
+        }
+    }
+
+    Ok(doc)
+}
+
+/// Discovers companion raster image files (PNG/JPEG) located alongside or in sibling folders.
+fn find_companion_raster_image(path: &Path) -> Option<std::path::PathBuf> {
+    let stem = path.file_stem()?.to_str()?;
+    let dir = path.parent()?;
+
+    // 1. Check in same directory
+    for ext in ["png", "PNG", "jpg", "JPG", "jpeg", "JPEG"] {
+        let candidate = dir.join(format!("{}.{}", stem, ext));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 2. Check in sibling directories (e.g. "PNG Overkay", "PNG Overlay", "PNG", "Images")
+    if let Some(grandparent) = dir.parent() {
+        for folder in ["PNG Overkay", "PNG Overlay", "PNG", "png", "Images", "images", "Overlays", "overlays"] {
+            for ext in ["png", "PNG", "jpg", "JPG", "jpeg", "JPEG"] {
+                let candidate = grandparent.join(folder).join(format!("{}.{}", stem, ext));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Positions and attaches Print Artwork raster image aligned with vector shapes.
+fn attach_print_artwork_to_shapes(
+    shapes: &mut Vec<CanvasShape>,
+    pm: std::sync::Arc<tiny_skia::Pixmap>,
+    mat_w_in: f32,
+    mat_h_in: f32,
+) {
+    if shapes.iter().any(|s| s.name.as_deref() == Some("Print Artwork")) {
+        return;
+    }
+
+    let mut non_boundary_pts = Vec::new();
+    for s in shapes.iter() {
+        if s.width < 20.0 && s.height < 10.0 {
+            non_boundary_pts.extend_from_slice(&s.points);
+        }
+    }
+    let (vx_min, vy_min, vx_max, vy_max) = if !non_boundary_pts.is_empty() {
+        compute_bounds(&non_boundary_pts)
+    } else {
+        (0.0, 0.0, mat_w_in, mat_h_in)
+    };
+    let vw = vx_max - vx_min;
+    let vh = vy_max - vy_min;
+
+    let (shape_x, shape_y, shape_w, shape_h) = if vw >= mat_w_in * 0.7 && vh >= mat_h_in * 0.7 {
+        // Full-page Print & Cut (e.g. 100 ACRE WOODS POOH, AT HOME WITH MINNIE & MICKEY)
+        let img_aspect = pm.width() as f32 / pm.height().max(1) as f32;
+        let mat_aspect = mat_w_in / mat_h_in.max(0.1);
+        let (sw, sh) = if img_aspect > mat_aspect {
+            (mat_w_in, mat_w_in / img_aspect)
+        } else {
+            (mat_h_in * img_aspect, mat_h_in)
+        };
+        let sx = ((mat_w_in - sw) * 0.5).max(0.0);
+        let sy = ((mat_h_in - sh) * 0.5).max(0.0);
+        (sx, sy, sw, sh)
+    } else if vw > 0.05 && vh > 0.05 {
+        // Localized design / overlay (e.g. OL BASEBALL SOLID, OL DISNEY CHIP & DALE)
+        (vx_min, vy_min, vw, vh)
+    } else {
+        (0.0, 0.0, mat_w_in, mat_h_in)
+    };
+
+    let png_shape = CanvasShape {
+        kind: ShapeKind::Rectangle,
+        x: shape_x,
+        y: shape_y,
+        width: shape_w,
+        height: shape_h,
+        points: vec![
+            egui::pos2(shape_x, shape_y),
+            egui::pos2(shape_x + shape_w, shape_y),
+            egui::pos2(shape_x + shape_w, shape_y + shape_h),
+            egui::pos2(shape_x, shape_y + shape_h),
+        ],
+        text: String::new(),
+        fill_color: egui::Color32::WHITE,
+        stroke_color: None,
+        stroke_width: 0.0,
+        is_closed: true,
+        is_svg_path: false,
+        is_modified: false,
+        triangles: Vec::new(),
+        group_id: None,
+        group_path: Vec::new(),
+        is_visible: true,
+        is_locked: true,
+        name: Some("Print Artwork".to_string()),
+        pixmap: Some(pm),
+        texture: None,
+    };
+    shapes.insert(0, png_shape);
+
+    // Vector cut-lines overlaying print artwork must render with transparent fill
+    for s in shapes.iter_mut() {
+        if s.name.as_deref() != Some("Print Artwork") {
+            let is_cut = s.stroke_color.map_or(false, |c| {
+                (c.r() >= 200 && c.g() <= 50 && c.b() <= 50) || s.stroke_width <= 0.015
+            });
+            if is_cut {
+                s.fill_color = egui::Color32::TRANSPARENT;
+                s.pixmap = None;
+            }
+        }
+    }
 }
 
 /// Parses Silhouette Studio binary data from memory.
@@ -298,21 +438,21 @@ pub fn parse_studio_data(data: &[u8]) -> Result<ParsedStudioDocument, StudioPars
     let (group_names, layer_name_by_id) = parse_layers(data, stream);
 
     // 3. Extract embedded PNG raster image & pattern swatches
-    let (png_shape_opt, pattern_swatch) = extract_embedded_png(data, mat_w_in, mat_h_in);
+    let (artwork_pixmap_opt, pattern_swatch) = extract_embedded_png(data);
 
     // 4. Parse cubic Bézier paths with pattern_swatch reference
     let mut shapes = parse_paths(stream, version, &layer_name_by_id, pattern_swatch.as_deref());
 
-    // 5. Normalize and center shapes onto the mat canvas
+    // 5. If artwork pixmap is present, attach and align Print Artwork shape
+    if let Some(ref pm) = artwork_pixmap_opt {
+        attach_print_artwork_to_shapes(&mut shapes, pm.clone(), mat_w_in, mat_h_in);
+    }
+
+    // 6. Normalize and center shapes onto the mat canvas
     normalize_shapes_onto_mat(&mut shapes, mat_w_in, mat_h_in);
 
-    // 6. Detect and merge compound paths (e.g. concentric wheels with inner cutouts)
-    let mut shapes = merge_compound_paths(shapes, version, pattern_swatch.as_deref());
-
-    // 7. Add positioned Print & Cut artwork (if any, placed under vector shapes)
-    if let Some(png_shape) = png_shape_opt {
-        shapes.insert(0, png_shape);
-    }
+    // 7. Detect and merge compound paths (e.g. concentric wheels with inner cutouts)
+    let shapes = merge_compound_paths(shapes, version, pattern_swatch.as_deref());
 
     Ok(ParsedStudioDocument {
         version,
@@ -2167,9 +2307,9 @@ pub fn base64_encode(data: &[u8]) -> String {
 /// Extracts embedded PNG raster image (e.g. Print & Cut artwork or preview or pattern swatch) from Studio data.
 /// Differentiates between repeating pattern swatches (e.g. square power-of-two texture tiles like 512x512)
 /// and actual positioned Print & Cut raster images.
-fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<CanvasShape>, Option<std::sync::Arc<tiny_skia::Pixmap>>) {
+fn extract_embedded_png(data: &[u8]) -> (Option<std::sync::Arc<tiny_skia::Pixmap>>, Option<std::sync::Arc<tiny_skia::Pixmap>>) {
     let mut pattern_swatch = None;
-    let mut print_artwork_shape = None;
+    let mut print_artwork_pixmap = None;
 
     let mut search_idx = 0;
     while search_idx + 8 <= data.len() {
@@ -2190,47 +2330,8 @@ fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<Ca
                                 if pattern_swatch.is_none() || w >= pattern_swatch.as_ref().map_or(0, |s: &std::sync::Arc<tiny_skia::Pixmap>| s.width()) {
                                     pattern_swatch = Some(std::sync::Arc::new(pm));
                                 }
-                            } else if w >= 400 && h >= 400 && !is_square && print_artwork_shape.is_none() {
-                                // Positioned Print & Cut raster artwork
-                                let img_aspect = w as f32 / h.max(1) as f32;
-                                let mat_aspect = mat_w_in / mat_h_in.max(0.1);
-                                let (shape_w, shape_h) = if img_aspect > mat_aspect {
-                                    (mat_w_in, mat_w_in / img_aspect)
-                                } else {
-                                    (mat_h_in * img_aspect, mat_h_in)
-                                };
-                                let shape_x = ((mat_w_in - shape_w) * 0.5).max(0.0);
-                                let shape_y = ((mat_h_in - shape_h) * 0.5).max(0.0);
-
-                                let shape = CanvasShape {
-                                    kind: ShapeKind::Rectangle,
-                                    x: shape_x,
-                                    y: shape_y,
-                                    width: shape_w,
-                                    height: shape_h,
-                                    points: vec![
-                                        egui::pos2(shape_x, shape_y),
-                                        egui::pos2(shape_x + shape_w, shape_y),
-                                        egui::pos2(shape_x + shape_w, shape_y + shape_h),
-                                        egui::pos2(shape_x, shape_y + shape_h),
-                                    ],
-                                    text: String::new(),
-                                    fill_color: egui::Color32::WHITE,
-                                    stroke_color: None,
-                                    stroke_width: 0.0,
-                                    is_closed: true,
-                                    is_svg_path: false,
-                                    is_modified: false,
-                                    triangles: Vec::new(),
-                                    group_id: None,
-                                    group_path: Vec::new(),
-                                    is_visible: true,
-                                    is_locked: true,
-                                    name: Some("Print Artwork".to_string()),
-                                    pixmap: Some(std::sync::Arc::new(pm)),
-                                    texture: None,
-                                };
-                                print_artwork_shape = Some(shape);
+                            } else if w >= 400 && h >= 400 && !is_square && print_artwork_pixmap.is_none() {
+                                print_artwork_pixmap = Some(std::sync::Arc::new(pm));
                             }
                         }
                     }
@@ -2245,13 +2346,13 @@ fn extract_embedded_png(data: &[u8], mat_w_in: f32, mat_h_in: f32) -> (Option<Ca
     }
 
     // If a repeating pattern swatch exists, any non-square embedded PNG is a document composite preview,
-    // not a standalone Print Artwork rectangle. Discard print_artwork_shape to prevent oversized
+    // not a standalone Print Artwork rectangle. Discard print_artwork_pixmap to prevent oversized
     // unclipped rectangular blocks from rendering across the canvas.
     if pattern_swatch.is_some() {
-        print_artwork_shape = None;
+        print_artwork_pixmap = None;
     }
 
-    (print_artwork_shape, pattern_swatch)
+    (print_artwork_pixmap, pattern_swatch)
 }
 
 /// Robustly decodes PNG bytes to tiny_skia::Pixmap.
@@ -3485,7 +3586,7 @@ mod tests {
             let data = std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read {}: {}", filename, e));
 
             // 1. Verify pattern swatch is extracted and print artwork shape is suppressed to prevent unclipped rectangle
-            let (print_art, swatch) = extract_embedded_png(&data, 12.0, 12.0);
+            let (print_art, swatch) = extract_embedded_png(&data);
             assert!(swatch.is_some(), "{}: Pattern swatch must be extracted", filename);
             assert!(print_art.is_none(), "{}: Print artwork rectangle must be suppressed when pattern swatch is present", filename);
 
@@ -3727,6 +3828,53 @@ mod tests {
             if !transparent_shapes.is_empty() {
                 assert!(svg.contains("fill=\"none\""), "{}: SVG must have fill=\"none\" for cut lines", fname);
             }
+        }
+    }
+
+    #[test]
+    fn test_v4_vector_raster_alignment_and_companion_loading() {
+        // Test 1: Sibling companion image loading and alignment (OL DISNEY CHIP & DALE)
+        let chip_candidates = [
+            Path::new("/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/ZZZ FILES FROM OLD COMPUTER/original overlay sale/studio overlay/OL DISNEY CHIP & DALE.studio"),
+            Path::new("/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/CHARACTERS/OL DISNEY CHIP & DALE.studio"),
+        ];
+        let chip_path = chip_candidates.iter().find(|p| p.exists());
+        if let Some(&chip_path) = chip_path {
+            let doc = parse_studio_file(chip_path).expect("Parse CHIP & DALE with companion image");
+            assert_eq!(doc.version, StudioFormatVersion::StudioV4);
+            // Verify Print Artwork was attached from companion PNG
+            let artwork = doc.shapes.iter().find(|s| s.name.as_deref() == Some("Print Artwork"));
+            assert!(artwork.is_some(), "CHIP & DALE must load companion Print Artwork");
+            let art = artwork.unwrap();
+            assert!(art.pixmap.is_some(), "Print Artwork must have decoded pixmap");
+
+            // Verify vector cut path exists and overlays artwork
+            let cut_shapes: Vec<_> = doc.shapes.iter().filter(|s| s.name.as_deref() != Some("Print Artwork")).collect();
+            assert!(!cut_shapes.is_empty(), "CHIP & DALE must have cut shapes");
+            let cut = cut_shapes[0];
+            assert_eq!(cut.fill_color.a(), 0, "Cut shape over Print Artwork must have transparent fill");
+            assert_eq!(cut.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)), "Cut shape must have red cutline stroke");
+
+            // Verify vector geometry and raster artwork are aligned in the same bounds (not detached/shrunk)
+            let center_dx = ((art.x + art.width * 0.5) - (cut.x + cut.width * 0.5)).abs();
+            let center_dy = ((art.y + art.height * 0.5) - (cut.y + cut.height * 0.5)).abs();
+            assert!(center_dx < 0.2, "Vector cut-line and raster artwork must be aligned in X, got dx={}", center_dx);
+            assert!(center_dy < 0.2, "Vector cut-line and raster artwork must be aligned in Y, got dy={}", center_dy);
+            assert!((art.width - cut.width).abs() < 0.2, "Artwork and cut width must match, got art={}, cut={}", art.width, cut.width);
+            assert!((art.height - cut.height).abs() < 0.2, "Artwork and cut height must match, got art={}, cut={}", art.height, cut.height);
+        }
+
+        // Test 2: Embedded raster alignment in V4 (OL BASEBALL SOLID)
+        let baseball_path = Path::new("/run/media/vineofthedead/7BFE-5A98/Master Kits Folder/ZZZ FILES FROM OLD COMPUTER/original overlay sale/studio overlay/OL BASEBALL SOLID.studio");
+        if baseball_path.exists() {
+            let doc = parse_studio_file(baseball_path).expect("Parse OL BASEBALL SOLID");
+            assert_eq!(doc.version, StudioFormatVersion::StudioV4);
+            let artwork = doc.shapes.iter().find(|s| s.name.as_deref() == Some("Print Artwork"));
+            assert!(artwork.is_some(), "OL BASEBALL SOLID must extract embedded Print Artwork");
+            let art = artwork.unwrap();
+            // Verify artwork is not blown up to fill 12" mat, but localized to the design size (~4 to 6 inches)
+            assert!(art.width < 10.0, "Artwork must be localized, got width {}", art.width);
+            assert!(art.height < 10.0, "Artwork must be localized, got height {}", art.height);
         }
     }
 }

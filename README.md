@@ -133,3 +133,12 @@ To capture a high-resolution screenshot without a display server (e.g. in CI or 
 ```bash
 xvfb-run -a -s "-screen 0 1280x800x24" ./app/target/release/studio-to-svg "test_samples/Peeker Bears.studio" --screenshot /tmp/screenshot.png
 ```
+
+---
+
+## Specifications & Acknowledgements
+
+- **`.studio3` (`silhouette05;`) Binary Specification & Vector Geometry**:
+  - We gratefully acknowledge **Zayd Mulani** ([`zaydmulani09`](https://github.com/zaydmulani09)) and the [`studio3svg`](https://github.com/zaydmulani09/studio3svg) project. Their published clean-room specification (`SPEC.md` and `RESEARCH.md`) provided invaluable structural insights into the `silhouette05;` container section tables (`u64` offset headers at `0x010..0x3e8`), block tree grammar (`0x01 + u32` lengths), Shape Record grammar (Block A properties, 65-byte transform matrix, and Block P page-coordinate outlines in millimeters), and path grammar with signed subpath indices and relative control point offsets `(dx, dy)`.
+  - While `studio3svg` focuses on stripping colors for bare cut path SVG conversion, our application builds upon these vector geometry principles while preserving embedded raster images (PNG/JPEG), pattern fills, and multi-color cardstock layers.
+
