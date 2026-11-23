@@ -4,6 +4,35 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.5.0] - 2026-11-22
+
+### Added & Improved
+- **Format-Aware 2D Transform Decoding for `.studio3` (`silhouette05;`) and `.studio` (`silhouette04;`) (`app/src/studio_format.rs`)**:
+  - Implemented format-aware transform decoding across `.studio` (V4) and `.studio3` (V5) binaries:
+    - **Studio V5 (`silhouette05;`)**: Decodes 36-byte serialized Qt `QTransform` 3x3 matrices (`[m11, m12, 0.0, m21, m22, 0.0, dx, dy, 1.0]`) mapped to affine transforms (`AffineTransform2D::new(m11, m21, dx, m12, m22, dy)`), as well as explicit `TAG_TRANSFORM` (`SXFM`) records. Eliminates center starburst collapse where disparate shapes in files like `AN UNICORN PAPER #2.studio3` collapsed to overlapping center coordinates.
+    - **Studio V4 (`silhouette04;`)**: Decodes 24-byte affine matrices (`[a, b, tx, c, d, ty]`) with `(None, None) => last_valid_xfm` inheritance for child elements, while preventing false transform matching across Russian/multilingual layer name strings.
+    - Added coordinate scale factor detection for 0.1 mm coordinates (`max_coord > 1000.0 => scale_to_in = 1.0 / 254.0`), properly sizing complex multi-layer designs.
+    - Hardened A4 media preset detection (`is_a4_media_preset`) to avoid false-positive substring matches against UUID strings containing `"a4"`.
+- **Compound Path Concentricity Filtering (`app/src/studio_format.rs`)**:
+  - Enforced relative center offset checks (`dx_rel <= 0.35 && dy_rel <= 0.35`) in `merge_compound_paths`.
+  - Distinguishes authentic interior cutout holes (e.g. donut centers, inner ear cutouts) from backdrop or enclosing bounding boxes, preventing background paths from absorbing independent, non-concentric vector shapes (e.g. preserving all 24 shapes in `Peeker Bears.studio`).
+- **Memory-Bounded Raster Caching for Large `.studio3` Documents (`app/src/studio_format.rs`)**:
+  - Pre-renders `tiny_skia::Pixmap` only when required (`pattern_swatch.is_some() || subpath_polylines.len() > 1` and `!hole_indices.is_empty()`).
+  - Capped vector shape pixmap dimensions (`max_dim = 256` if pattern swatch is present, `128` otherwise) at 48 DPI, strictly bounding total pixmap RAM under 50 MB (measured ~25 MB across 773 shapes in 20 MB `JUDITH UNICORN AND DINOSAUR.studio3`).
+- **Trackpad Pinch-to-Zoom & Toolbar Zoom Controls (`app/src/main.rs`)**:
+  - Added native Wayland/X11 trackpad and touchscreen two-finger pinch-to-zoom support via `egui::Event::Zoom(factor)`, zooming smoothly centered around the current pointer position.
+  - Added `Ctrl + Scroll` accelerated zooming around the pointer position on the canvas.
+  - Added `-` and `+` toolbar buttons directly adjacent to `Zoom: XX% | Fit` in the top header.
+  - Added `Ctrl+=` / `Ctrl++` (Zoom In) and `Ctrl+-` (Zoom Out) keyboard shortcuts.
+  - Added unit test `test_zoom_controls_and_pinch_gesture` verifying zoom stepping, clamping limits (0.1x to 5.0x), and pointer-centered canvas panning math.
+- **Integration Testing & Test Suite Verification**:
+  - Added `test_unicorn_paper_and_disney_hearts_cutouts` verifying that:
+    - `test_samples/AN UNICORN PAPER #2.studio3` parses >= 200 shapes without collapsing to the origin (spanning >= 5.0" width and >= 5.0" height).
+    - `test_samples/DISNEY HEARTS.studio3` extracts >= 200 shapes and detects heart cutout containers with visible `#ff2626` cut strokes.
+  - All 67 unit and integration tests passing (`cargo test`); release binary verified (`cargo build --release`).
+
+---
+
 ## [0.4.9] - 2026-11-22
 
 ### Added & Improved

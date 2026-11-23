@@ -301,7 +301,7 @@ pub fn parse_studio_data(data: &[u8]) -> Result<ParsedStudioDocument, StudioPars
     let (png_shape_opt, pattern_swatch) = extract_embedded_png(data, mat_w_in, mat_h_in);
 
     // 4. Parse cubic Bézier paths with pattern_swatch reference
-    let mut shapes = parse_paths(stream, &layer_name_by_id, pattern_swatch.as_deref());
+    let mut shapes = parse_paths(stream, version, &layer_name_by_id, pattern_swatch.as_deref());
 
     // 5. Normalize and center shapes onto the mat canvas
     normalize_shapes_onto_mat(&mut shapes, mat_w_in, mat_h_in);
@@ -701,15 +701,24 @@ fn parse_mat_dimensions(full_data: &[u8], stream: &[u8]) -> (f32, f32) {
     if lower.contains("portrait") || lower.contains("8x12") || lower.contains("8 x 12") {
         return (8.0, 12.0);
     }
-    if lower.contains("a4") {
-        return (8.27, 11.69);
-    }
     if lower.contains("12x12") || lower.contains("12 x 12") || lower.contains("cameo") {
         return (12.0, 12.0);
+    }
+    if is_a4_media_preset(&lower) {
+        return (8.27, 11.69);
     }
 
     // Default: standard 12"x12" Cameo mat (864 x 864 points)
     (12.0, 12.0)
+}
+
+fn is_a4_media_preset(lower: &str) -> bool {
+    lower.contains("media:a4")
+        || lower.contains("mat:a4")
+        || lower.contains(":a4;")
+        || lower.contains(" a4")
+        || lower.contains("a4 ")
+        || lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == "a4")
 }
 
 fn preset_to_dims(preset: &str) -> Option<(f32, f32)> {
@@ -720,10 +729,10 @@ fn preset_to_dims(preset: &str) -> Option<(f32, f32)> {
         Some((8.5, 11.0))
     } else if lower.contains("portrait") || lower.contains("8x12") {
         Some((8.0, 12.0))
-    } else if lower.contains("a4") {
-        Some((8.27, 11.69))
     } else if lower.contains("12x12") || lower.contains("cameo") {
         Some((12.0, 12.0))
+    } else if is_a4_media_preset(&lower) {
+        Some((8.27, 11.69))
     } else {
         None
     }
@@ -802,7 +811,12 @@ fn parse_layers(full_data: &[u8], stream: &[u8]) -> (BTreeMap<u64, String>, BTre
 
 /// Parses all paths from the binary stream.
 /// Supports structured SPTH records as well as raw sequential `01 21 00 00 00` records.
-fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: Option<&tiny_skia::Pixmap>) -> Vec<CanvasShape> {
+fn parse_paths(
+    stream: &[u8],
+    version: StudioFormatVersion,
+    _layers: &BTreeMap<u64, String>,
+    pattern_swatch: Option<&tiny_skia::Pixmap>,
+) -> Vec<CanvasShape> {
     let mut shapes = Vec::new();
 
     // First attempt: Check for structured SPTH blocks
@@ -812,26 +826,76 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: O
         }
     }
 
-    // Second attempt: General stream scanning for 01 21 (2 handles), 01 19 (1 handle), and 01 11 (0 handles / corner) records
-    let mut vertices_with_pos = Vec::new();
+    // Second attempt: Subpath header scanning via \x01 [byte_len: u32] \x01 [num_segments: u32] (\x01[\x21\x19\x11]\x00\x00\x00)
+    let mut subpaths: Vec<StudioSubpath> = Vec::new();
     let mut i = 0;
-    while i + 5 <= stream.len() {
-        if let Some(marker_slice) = stream.get(i..i + 5) {
-            let is_2h = marker_slice == BEZIER_VERTEX_MARKER;
-            let is_1h = marker_slice == BEZIER_VERTEX_MARKER_1H;
-            let is_0h = marker_slice == BEZIER_VERTEX_MARKER_0H;
-            if is_2h || is_1h || is_0h {
-                if let Some(payload) = stream.get(i + 5..) {
-                    let parsed = if is_2h {
-                        parse_bezier_vertex(payload)
-                    } else if is_1h {
-                        parse_bezier_vertex_1h(payload)
-                    } else {
-                        parse_bezier_vertex_0h(payload)
-                    };
-                    if let Some((v, len)) = parsed {
-                        vertices_with_pos.push((i, 5 + len, v));
-                        i = i.saturating_add(5 + len);
+    while i + 15 <= stream.len() {
+        if stream[i] == 0x01 && stream[i + 5] == 0x01 {
+            let marker = &stream[i + 10..i + 15];
+            let is_marker = marker == BEZIER_VERTEX_MARKER
+                || marker == BEZIER_VERTEX_MARKER_1H
+                || marker == BEZIER_VERTEX_MARKER_0H;
+            if is_marker {
+                if let (Some(byte_len), Some(_nseg)) = (
+                    read_u32_le(stream, i + 1),
+                    read_u32_le(stream, i + 6),
+                ) {
+                    if (16..=1_000_000).contains(&byte_len) {
+                        let v_start = i + 10;
+                        let sub_end = i.saturating_add(1).saturating_add(byte_len as usize).min(stream.len());
+                        let mut cur_sub_verts: Vec<StudioBezierVertex> = Vec::new();
+                        let mut cur_sub_start = v_start;
+                        let mut cur_sub_end = v_start;
+                        let mut vi = v_start;
+                        while vi + 5 <= sub_end {
+                            let m = &stream[vi..vi + 5];
+                            let is_2h = m == BEZIER_VERTEX_MARKER;
+                            let is_1h = m == BEZIER_VERTEX_MARKER_1H;
+                            let is_0h = m == BEZIER_VERTEX_MARKER_0H;
+                            if is_2h || is_1h || is_0h {
+                                if let Some(payload) = stream.get(vi + 5..sub_end) {
+                                    let parsed = if is_2h {
+                                        parse_bezier_vertex(payload)
+                                    } else if is_1h {
+                                        parse_bezier_vertex_1h(payload)
+                                    } else {
+                                        parse_bezier_vertex_0h(payload)
+                                    };
+                                    if let Some((v, len)) = parsed {
+                                        let rec_len = 5 + len;
+                                        if !cur_sub_verts.is_empty() {
+                                            let gap = vi.saturating_sub(cur_sub_end);
+                                            if gap > 4 {
+                                                if cur_sub_verts.len() >= 2 {
+                                                    subpaths.push(StudioSubpath {
+                                                        start_pos: cur_sub_start,
+                                                        end_pos: cur_sub_end,
+                                                        vertices: cur_sub_verts,
+                                                    });
+                                                }
+                                                cur_sub_verts = Vec::new();
+                                                cur_sub_start = vi;
+                                            }
+                                        } else {
+                                            cur_sub_start = vi;
+                                        }
+                                        cur_sub_verts.push(v);
+                                        cur_sub_end = vi + rec_len;
+                                        vi = vi.saturating_add(rec_len);
+                                        continue;
+                                    }
+                                }
+                            }
+                            vi = vi.saturating_add(1);
+                        }
+                        if cur_sub_verts.len() >= 2 {
+                            subpaths.push(StudioSubpath {
+                                start_pos: cur_sub_start,
+                                end_pos: cur_sub_end,
+                                vertices: cur_sub_verts,
+                            });
+                        }
+                        i = sub_end;
                         continue;
                     }
                 }
@@ -840,41 +904,66 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: O
         i = i.saturating_add(1);
     }
 
-    if vertices_with_pos.is_empty() {
-        return shapes;
-    }
-
-    let mut subpaths: Vec<StudioSubpath> = Vec::new();
-    let mut cur_subpath_verts: Vec<StudioBezierVertex> = Vec::new();
-    let mut cur_sub_start = 0;
-    let mut cur_sub_end = 0;
-
-    for (pos, rec_len, vert) in vertices_with_pos {
-        if !cur_subpath_verts.is_empty() {
-            let gap = pos.saturating_sub(cur_sub_end);
-            if gap > 4 {
-                if cur_subpath_verts.len() >= 2 {
-                    subpaths.push(StudioSubpath {
-                        start_pos: cur_sub_start,
-                        end_pos: cur_sub_end,
-                        vertices: cur_subpath_verts,
-                    });
+    // Third attempt (fallback): General unstructured stream scanning
+    if subpaths.is_empty() {
+        let mut vertices_with_pos = Vec::new();
+        let mut i = 0;
+        while i + 5 <= stream.len() {
+            if let Some(marker_slice) = stream.get(i..i + 5) {
+                let is_2h = marker_slice == BEZIER_VERTEX_MARKER;
+                let is_1h = marker_slice == BEZIER_VERTEX_MARKER_1H;
+                let is_0h = marker_slice == BEZIER_VERTEX_MARKER_0H;
+                if is_2h || is_1h || is_0h {
+                    if let Some(payload) = stream.get(i + 5..) {
+                        let parsed = if is_2h {
+                            parse_bezier_vertex(payload)
+                        } else if is_1h {
+                            parse_bezier_vertex_1h(payload)
+                        } else {
+                            parse_bezier_vertex_0h(payload)
+                        };
+                        if let Some((v, len)) = parsed {
+                            vertices_with_pos.push((i, 5 + len, v));
+                            i = i.saturating_add(5 + len);
+                            continue;
+                        }
+                    }
                 }
-                cur_subpath_verts = Vec::new();
+            }
+            i = i.saturating_add(1);
+        }
+
+        let mut cur_subpath_verts: Vec<StudioBezierVertex> = Vec::new();
+        let mut cur_sub_start = 0;
+        let mut cur_sub_end = 0;
+
+        for (pos, rec_len, vert) in vertices_with_pos {
+            if !cur_subpath_verts.is_empty() {
+                let gap = pos.saturating_sub(cur_sub_end);
+                if gap > 4 {
+                    if cur_subpath_verts.len() >= 2 {
+                        subpaths.push(StudioSubpath {
+                            start_pos: cur_sub_start,
+                            end_pos: cur_sub_end,
+                            vertices: cur_subpath_verts,
+                        });
+                    }
+                    cur_subpath_verts = Vec::new();
+                    cur_sub_start = pos;
+                }
+            } else {
                 cur_sub_start = pos;
             }
-        } else {
-            cur_sub_start = pos;
+            cur_subpath_verts.push(vert);
+            cur_sub_end = pos + rec_len;
         }
-        cur_subpath_verts.push(vert);
-        cur_sub_end = pos + rec_len;
-    }
-    if cur_subpath_verts.len() >= 2 {
-        subpaths.push(StudioSubpath {
-            start_pos: cur_sub_start,
-            end_pos: cur_sub_end,
-            vertices: cur_subpath_verts,
-        });
+        if cur_subpath_verts.len() >= 2 {
+            subpaths.push(StudioSubpath {
+                start_pos: cur_sub_start,
+                end_pos: cur_sub_end,
+                vertices: cur_subpath_verts,
+            });
+        }
     }
 
     if subpaths.is_empty() {
@@ -988,7 +1077,7 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: O
             // Scan backwards up to 200 bytes for the 3x3 matrix preceding this group closure
             let bwd_start = tag_offset.saturating_sub(200);
             if let Some(bwd_slice) = stream.get(bwd_start..tag_offset) {
-                if let Some(xfm) = find_transform_in_slice(bwd_slice) {
+                if let Some(xfm) = find_transform_in_slice(bwd_slice, version) {
                     group_records.push(StudioGroupRecord {
                         pos: tag_offset,
                         transform: xfm,
@@ -1011,8 +1100,8 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: O
 
     // Determine matrix and fill for each cluster
     let mut cluster_data: Vec<(AffineTransform2D, egui::Color32)> = Vec::new();
-    let mut last_valid_xfm = AffineTransform2D::default();
     let mut last_valid_fill = egui::Color32::TRANSPARENT;
+    let mut last_valid_xfm = AffineTransform2D::default();
 
     for idx in 0..shape_clusters.len() {
         let cluster = &shape_clusters[idx];
@@ -1035,7 +1124,7 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: O
         let mut local_xfm = None;
         if gap_start < gap_end {
             if let Some(gap_slice) = stream.get(gap_start..gap_end) {
-                local_xfm = find_transform_in_slice(gap_slice);
+                local_xfm = find_transform_in_slice(gap_slice, version);
             }
         }
 
@@ -1064,12 +1153,12 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: O
             let mut group_xfm = None;
             if gap_start < group_end {
                 if let Some(fwd_slice) = stream.get(gap_start..group_end) {
-                    group_xfm = find_transform_in_slice(fwd_slice);
+                    group_xfm = find_transform_in_slice(fwd_slice, version);
                 }
             }
             if group_xfm.is_none() && group_start < cluster.start_pos {
                 if let Some(bwd_slice) = stream.get(group_start..cluster.start_pos) {
-                    group_xfm = find_transform_in_slice(bwd_slice);
+                    group_xfm = find_transform_in_slice(bwd_slice, version);
                 }
             }
 
@@ -1083,7 +1172,13 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: O
                 }
                 (Some(parent), None) => parent,
                 (None, Some(child)) => child,
-                (None, None) => last_valid_xfm,
+                (None, None) => {
+                    if version == StudioFormatVersion::StudioV4 {
+                        last_valid_xfm
+                    } else {
+                        AffineTransform2D::default()
+                    }
+                }
             }
         };
         last_valid_xfm = final_xfm;
@@ -1117,7 +1212,13 @@ fn parse_paths(stream: &[u8], _layers: &BTreeMap<u64, String>, pattern_swatch: O
                 cluster_max_coord = cluster_max_coord.max(p_tx.x.abs().max(p_tx.y.abs()));
             }
         }
-        let scale_to_in = if cluster_max_coord > 24.0 { 1.0 / 25.4 } else { 1.0 };
+        let scale_to_in = if cluster_max_coord > 1000.0 {
+            1.0 / 254.0
+        } else if cluster_max_coord > 24.0 {
+            1.0 / 25.4
+        } else {
+            1.0
+        };
 
         if let Some(shape) = create_canvas_shape_from_subpaths(
             &cluster.subpaths,
@@ -1205,7 +1306,13 @@ fn parse_structured_paths(stream: &[u8], pattern_swatch: Option<&tiny_skia::Pixm
                     .iter()
                     .map(|v| v.anchor.x.abs().max(v.anchor.y.abs()))
                     .fold(0.0_f32, f32::max);
-                let scale_to_in = if max_coord > 24.0 { 1.0 / 25.4 } else { 1.0 };
+                let scale_to_in = if max_coord > 1000.0 {
+                    1.0 / 254.0
+                } else if max_coord > 24.0 {
+                    1.0 / 25.4
+                } else {
+                    1.0
+                };
 
                 if let Some(shape) = create_canvas_shape_from_vertices(
                     &vertices,
@@ -1501,17 +1608,6 @@ fn create_canvas_shape_from_subpaths(
     }
 
     // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so multi-subpaths and holes render cleanly
-    let dpi = 96.0_f32;
-    let raw_w = ((w * dpi).ceil() as u32).max(16);
-    let raw_h = ((h * dpi).ceil() as u32).max(16);
-    let max_dim = 1024_u32;
-    let (pix_w, pix_h) = if raw_w > max_dim || raw_h > max_dim {
-        let scale = (max_dim as f32 / raw_w.max(raw_h) as f32).min(1.0);
-        (((raw_w as f32 * scale).round() as u32).max(16), ((raw_h as f32 * scale).round() as u32).max(16))
-    } else {
-        (raw_w, raw_h)
-    };
-
     let is_white_or_light = (fill_color.r() > 240 && fill_color.g() > 240 && fill_color.b() > 240) || fill_color == egui::Color32::WHITE;
     let is_white_or_invisible_stroke = stroke_color.a() == 0 || (stroke_color.r() > 240 && stroke_color.g() > 240 && stroke_color.b() > 240);
     let final_stroke_c = if !is_white_or_invisible_stroke {
@@ -1522,70 +1618,84 @@ fn create_canvas_shape_from_subpaths(
         egui::Color32::TRANSPARENT
     };
 
+    // Pre-render tiny_skia::Pixmap only when needed (pattern fills or multi-subpath compound cutouts)
     let mut pixmap = None;
-    if let Some(mut pm) = tiny_skia::Pixmap::new(pix_w, pix_h) {
-        let pad = 2.0_f32;
-        let sx = (pix_w as f32 - pad * 2.0) / w.max(0.001);
-        let sy = (pix_h as f32 - pad * 2.0) / h.max(0.001);
+    if pattern_swatch.is_some() || subpath_polylines.len() > 1 {
+        let dpi = 48.0_f32;
+        let raw_w = ((w * dpi).ceil() as u32).max(16);
+        let raw_h = ((h * dpi).ceil() as u32).max(16);
+        let max_dim = if pattern_swatch.is_some() { 256_u32 } else { 128_u32 };
+        let (pix_w, pix_h) = if raw_w > max_dim || raw_h > max_dim {
+            let scale = (max_dim as f32 / raw_w.max(raw_h) as f32).min(1.0);
+            (((raw_w as f32 * scale).round() as u32).max(16), ((raw_h as f32 * scale).round() as u32).max(16))
+        } else {
+            (raw_w, raw_h)
+        };
 
-        let mut pb = tiny_skia::PathBuilder::new();
-        for poly in &subpath_polylines {
-            if let Some(p0) = poly.first() {
-                pb.move_to((p0.x - min_x) * sx + pad, (p0.y - min_y) * sy + pad);
-                for p in poly.iter().skip(1) {
-                    pb.line_to((p.x - min_x) * sx + pad, (p.y - min_y) * sy + pad);
+        if let Some(mut pm) = tiny_skia::Pixmap::new(pix_w, pix_h) {
+            let pad = 2.0_f32;
+            let sx = (pix_w as f32 - pad * 2.0) / w.max(0.001);
+            let sy = (pix_h as f32 - pad * 2.0) / h.max(0.001);
+
+            let mut pb = tiny_skia::PathBuilder::new();
+            for poly in &subpath_polylines {
+                if let Some(p0) = poly.first() {
+                    pb.move_to((p0.x - min_x) * sx + pad, (p0.y - min_y) * sy + pad);
+                    for p in poly.iter().skip(1) {
+                        pb.line_to((p.x - min_x) * sx + pad, (p.y - min_y) * sy + pad);
+                    }
+                    pb.close();
                 }
-                pb.close();
             }
-        }
 
-        if let Some(path) = pb.finish() {
-            if let Some(swatch) = pattern_swatch {
-                if is_white_or_light || fill_color.a() == 0 {
-                    // Tiled pattern fill clipped to the vector shape path
-                    let tile_size_in = 2.0_f32;
-                    let tile_w_px = (tile_size_in * sx).max(16.0);
-                    let tile_h_px = (tile_size_in * sy).max(16.0);
-                    let scale_x = tile_w_px / swatch.width() as f32;
-                    let scale_y = tile_h_px / swatch.height() as f32;
-                    let pat_xfm = tiny_skia::Transform::from_scale(scale_x, scale_y).post_translate(pad, pad);
-                    let shader = tiny_skia::Pattern::new(
-                        swatch.as_ref(),
-                        tiny_skia::SpreadMode::Repeat,
-                        tiny_skia::FilterQuality::Bilinear,
-                        1.0,
-                        pat_xfm,
-                    );
-                    let mut fill_paint = tiny_skia::Paint::default();
-                    fill_paint.shader = shader;
-                    fill_paint.anti_alias = true;
-                    pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+            if let Some(path) = pb.finish() {
+                if let Some(swatch) = pattern_swatch {
+                    if is_white_or_light || fill_color.a() == 0 {
+                        // Tiled pattern fill clipped to the vector shape path
+                        let tile_size_in = 2.0_f32;
+                        let tile_w_px = (tile_size_in * sx).max(16.0);
+                        let tile_h_px = (tile_size_in * sy).max(16.0);
+                        let scale_x = tile_w_px / swatch.width() as f32;
+                        let scale_y = tile_h_px / swatch.height() as f32;
+                        let pat_xfm = tiny_skia::Transform::from_scale(scale_x, scale_y).post_translate(pad, pad);
+                        let shader = tiny_skia::Pattern::new(
+                            swatch.as_ref(),
+                            tiny_skia::SpreadMode::Repeat,
+                            tiny_skia::FilterQuality::Bilinear,
+                            1.0,
+                            pat_xfm,
+                        );
+                        let mut fill_paint = tiny_skia::Paint::default();
+                        fill_paint.shader = shader;
+                        fill_paint.anti_alias = true;
+                        pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                    } else if fill_color.a() > 0 {
+                        let mut fill_paint = tiny_skia::Paint::default();
+                        fill_paint.set_color_rgba8(fill_color.r(), fill_color.g(), fill_color.b(), fill_color.a());
+                        fill_paint.anti_alias = true;
+                        pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                    }
                 } else if fill_color.a() > 0 {
                     let mut fill_paint = tiny_skia::Paint::default();
                     fill_paint.set_color_rgba8(fill_color.r(), fill_color.g(), fill_color.b(), fill_color.a());
                     fill_paint.anti_alias = true;
                     pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
                 }
-            } else if fill_color.a() > 0 {
-                let mut fill_paint = tiny_skia::Paint::default();
-                fill_paint.set_color_rgba8(fill_color.r(), fill_color.g(), fill_color.b(), fill_color.a());
-                fill_paint.anti_alias = true;
-                pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
-            }
 
-            if final_stroke_c.a() > 0 {
-                let mut stroke_paint = tiny_skia::Paint::default();
-                stroke_paint.set_color_rgba8(final_stroke_c.r(), final_stroke_c.g(), final_stroke_c.b(), final_stroke_c.a());
-                stroke_paint.anti_alias = true;
-                let st = tiny_skia::Stroke {
-                    width: (stroke_width * sx).max(1.5),
-                    line_cap: tiny_skia::LineCap::Round,
-                    line_join: tiny_skia::LineJoin::Round,
-                    ..Default::default()
-                };
-                pm.stroke_path(&path, &stroke_paint, &st, tiny_skia::Transform::identity(), None);
+                if final_stroke_c.a() > 0 {
+                    let mut stroke_paint = tiny_skia::Paint::default();
+                    stroke_paint.set_color_rgba8(final_stroke_c.r(), final_stroke_c.g(), final_stroke_c.b(), final_stroke_c.a());
+                    stroke_paint.anti_alias = true;
+                    let st = tiny_skia::Stroke {
+                        width: (stroke_width * sx).max(1.5),
+                        line_cap: tiny_skia::LineCap::Round,
+                        line_join: tiny_skia::LineJoin::Round,
+                        ..Default::default()
+                    };
+                    pm.stroke_path(&path, &stroke_paint, &st, tiny_skia::Transform::identity(), None);
+                }
+                pixmap = Some(std::sync::Arc::new(pm));
             }
-            pixmap = Some(std::sync::Arc::new(pm));
         }
     }
 
@@ -1643,7 +1753,7 @@ fn create_canvas_shape_from_vertices(
     )
 }
 
-fn find_transform_in_slice(slice: &[u8]) -> Option<AffineTransform2D> {
+fn find_transform_in_slice(slice: &[u8], version: StudioFormatVersion) -> Option<AffineTransform2D> {
     if slice.len() < 24 {
         return None;
     }
@@ -1663,10 +1773,10 @@ fn find_transform_in_slice(slice: &[u8]) -> Option<AffineTransform2D> {
         }
     }
 
-    // 2. Look for valid 36-byte 3x3 matrix [a, b, tx, c, d, ty, 0, 0, 1] in slice
+    // 2. Look for valid 36-byte Qt 3x3 matrix [m11, m12, 0.0, m21, m22, 0.0, dx, dy, 1.0] in slice
     let mut i = 0;
     while i + 36 <= slice.len() {
-        if let (Some(a), Some(b), Some(tx), Some(c), Some(d), Some(ty), Some(m20), Some(m21), Some(m22)) = (
+        if let (Some(m11), Some(m12), Some(m13), Some(m21), Some(m22), Some(m23), Some(dx), Some(dy), Some(m33)) = (
             read_f32_le(slice, i),
             read_f32_le(slice, i + 4),
             read_f32_le(slice, i + 8),
@@ -1677,40 +1787,52 @@ fn find_transform_in_slice(slice: &[u8]) -> Option<AffineTransform2D> {
             read_f32_le(slice, i + 28),
             read_f32_le(slice, i + 32),
         ) {
-            if m20.abs() < 1e-4 && m21.abs() < 1e-4 && (m22 - 1.0).abs() < 1e-4 {
-                let det = a * d - b * c;
-                if (0.001..500.0).contains(&det.abs()) && tx.abs() < 20_000.0 && ty.abs() < 20_000.0 {
-                    return Some(AffineTransform2D::new(a, b, tx, c, d, ty));
+            if m13.abs() < 1e-4 && m23.abs() < 1e-4 && (m33 - 1.0).abs() < 1e-4 {
+                let det = m11 * m22 - m12 * m21;
+                if (0.05..20.0).contains(&det.abs())
+                    && (0.05..20.0).contains(&m11.abs())
+                    && (0.05..20.0).contains(&m22.abs())
+                    && m12.abs() < 10.0
+                    && m21.abs() < 10.0
+                    && dx.abs() < 20_000.0
+                    && dy.abs() < 20_000.0
+                {
+                    // Map Qt [m11, m12, 0, m21, m22, 0, dx, dy, 1] to AffineTransform2D:
+                    // x' = m11 * x + m21 * y + dx
+                    // y' = m12 * x + m22 * y + dy
+                    return Some(AffineTransform2D::new(m11, m21, dx, m12, m22, dy));
                 }
             }
         }
         i = i.saturating_add(1);
     }
 
-    // 3. Look for valid 24-byte matrix [a, b, tx, c, d, ty] in slice
-    let mut i = 0;
-    while i + 24 <= slice.len() {
-        if let (Some(a), Some(b), Some(tx), Some(c), Some(d), Some(ty)) = (
-            read_f32_le(slice, i),
-            read_f32_le(slice, i + 4),
-            read_f32_le(slice, i + 8),
-            read_f32_le(slice, i + 12),
-            read_f32_le(slice, i + 16),
-            read_f32_le(slice, i + 20),
-        ) {
-            let det = a * d - b * c;
-            if (0.05..20.0).contains(&a.abs())
-                && (0.05..20.0).contains(&d.abs())
-                && b.abs() < 5.0
-                && c.abs() < 5.0
-                && tx.abs() < 20_000.0
-                && ty.abs() < 20_000.0
-                && (0.001..500.0).contains(&det.abs())
-            {
-                return Some(AffineTransform2D::new(a, b, tx, c, d, ty));
+    // 3. For Studio V4, scan for 24-byte matrix [a, b, tx, c, d, ty]
+    if version == StudioFormatVersion::StudioV4 {
+        let mut i = 0;
+        while i + 24 <= slice.len() {
+            if let (Some(a), Some(b), Some(tx), Some(c), Some(d), Some(ty)) = (
+                read_f32_le(slice, i),
+                read_f32_le(slice, i + 4),
+                read_f32_le(slice, i + 8),
+                read_f32_le(slice, i + 12),
+                read_f32_le(slice, i + 16),
+                read_f32_le(slice, i + 20),
+            ) {
+                let det = a * d - b * c;
+                if (0.05..20.0).contains(&a.abs())
+                    && (0.05..20.0).contains(&d.abs())
+                    && b.abs() < 5.0
+                    && c.abs() < 5.0
+                    && tx.abs() < 20_000.0
+                    && ty.abs() < 20_000.0
+                    && (0.001..500.0).contains(&det.abs())
+                {
+                    return Some(AffineTransform2D::new(a, b, tx, c, d, ty));
+                }
             }
+            i = i.saturating_add(1);
         }
-        i = i.saturating_add(1);
     }
 
     None
@@ -1963,6 +2085,17 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
                 continue;
             }
 
+            // If grouped, must belong to the same group
+            if s1.group_id.is_some() && s1.group_id != s2.group_id {
+                continue;
+            }
+
+            // Candidate hole must be a simple cutout (not an artwork with many subpaths or high vertex count)
+            let s2_subpath_count = s2.text.matches('M').count();
+            if s2_subpath_count > 2 || s2.points.len() > 120 {
+                continue;
+            }
+
             // Check if s1 contains s2's bounding box with a margin
             let s1_max_x = s1.x + s1.width;
             let s1_max_y = s1.y + s1.height;
@@ -1975,13 +2108,20 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
                 && s1_max_y >= s2_max_y - 0.05
             {
                 if s2.width < s1.width * 0.99 || s2.height < s1.height * 0.99 {
-                    hole_indices.push(j);
+                    let s1_cx = s1.x + s1.width * 0.5;
+                    let s1_cy = s1.y + s1.height * 0.5;
+                    let s2_cx = s2.x + s2.width * 0.5;
+                    let s2_cy = s2.y + s2.height * 0.5;
+                    let dx_rel = (s1_cx - s2_cx).abs() / s1.width.max(0.001);
+                    let dy_rel = (s1_cy - s2_cy).abs() / s1.height.max(0.001);
+                    if dx_rel <= 0.35 && dy_rel <= 0.35 {
+                        hole_indices.push(j);
+                    }
                 }
             }
         }
 
-        if !hole_indices.is_empty() {
-            println!("merge_compound_paths: merging outer #{} with hole indices {:?}", i, hole_indices);
+        if !hole_indices.is_empty() && hole_indices.len() <= 6 {
             consumed[i] = true;
             for &j in &hole_indices {
                 consumed[j] = true;
@@ -2010,10 +2150,10 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
             }
 
             // Pre-render a tiny_skia::Pixmap with FillRule::EvenOdd so the holes punch through
-            let dpi = 96.0_f32;
+            let dpi = 48.0_f32;
             let raw_w = ((outer.width * dpi).ceil() as u32).max(16);
             let raw_h = ((outer.height * dpi).ceil() as u32).max(16);
-            let max_dim = 1024_u32;
+            let max_dim = if pattern_swatch.is_some() { 256_u32 } else { 128_u32 };
             let (pix_w, pix_h) = if raw_w > max_dim || raw_h > max_dim {
                 let scale = (max_dim as f32 / raw_w.max(raw_h) as f32).min(1.0);
                 (((raw_w as f32 * scale).round() as u32).max(16), ((raw_h as f32 * scale).round() as u32).max(16))
@@ -2022,87 +2162,88 @@ fn merge_compound_paths(shapes: Vec<CanvasShape>, pattern_swatch: Option<&tiny_s
             };
 
             let mut pixmap = None;
-            if let Some(mut pm) = tiny_skia::Pixmap::new(pix_w, pix_h) {
-                let pad = 2.0_f32;
-                let sx = (pix_w as f32 - pad * 2.0) / outer.width.max(0.001);
-                let sy = (pix_h as f32 - pad * 2.0) / outer.height.max(0.001);
+            if pattern_swatch.is_some() || !hole_indices.is_empty() {
+                if let Some(mut pm) = tiny_skia::Pixmap::new(pix_w, pix_h) {
+                    let pad = 2.0_f32;
+                    let sx = (pix_w as f32 - pad * 2.0) / outer.width.max(0.001);
+                    let sy = (pix_h as f32 - pad * 2.0) / outer.height.max(0.001);
 
-                let mut pb = tiny_skia::PathBuilder::new();
-                for sub in compound_d.split('M') {
-                    let sub = sub.trim();
-                    if sub.is_empty() {
-                        continue;
-                    }
-                    let nums: Vec<f32> = sub
-                        .split(|c: char| !c.is_numeric() && c != '.' && c != '-')
-                        .filter_map(|s| s.parse::<f32>().ok())
-                        .collect();
-                    let mut chunks = nums.chunks_exact(2);
-                    if let Some(first) = chunks.next() {
-                        pb.move_to((first[0] - outer.x) * sx + pad, (first[1] - outer.y) * sy + pad);
-                        for p in chunks {
-                            pb.line_to((p[0] - outer.x) * sx + pad, (p[1] - outer.y) * sy + pad);
+                    let mut pb = tiny_skia::PathBuilder::new();
+                    for sub in compound_d.split('M') {
+                        let sub = sub.trim();
+                        if sub.is_empty() {
+                            continue;
                         }
-                        pb.close();
+                        let nums: Vec<f32> = sub
+                            .split(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                            .filter_map(|s| s.parse::<f32>().ok())
+                            .collect();
+                        let mut chunks = nums.chunks_exact(2);
+                        if let Some(first) = chunks.next() {
+                            pb.move_to((first[0] - outer.x) * sx + pad, (first[1] - outer.y) * sy + pad);
+                            for p in chunks {
+                                pb.line_to((p[0] - outer.x) * sx + pad, (p[1] - outer.y) * sy + pad);
+                            }
+                            pb.close();
+                        }
                     }
-                }
 
-                if let Some(path) = pb.finish() {
-                    let is_white_or_light = (outer.fill_color.r() > 240 && outer.fill_color.g() > 240 && outer.fill_color.b() > 240) || outer.fill_color == egui::Color32::WHITE;
-                    if let Some(swatch) = pattern_swatch {
-                        if is_white_or_light || outer.fill_color.a() == 0 {
-                            let tile_size_in = 2.0_f32;
-                            let tile_w_px = (tile_size_in * sx).max(16.0);
-                            let tile_h_px = (tile_size_in * sy).max(16.0);
-                            let scale_x = tile_w_px / swatch.width() as f32;
-                            let scale_y = tile_h_px / swatch.height() as f32;
-                            let pat_xfm = tiny_skia::Transform::from_scale(scale_x, scale_y).post_translate(pad, pad);
-                            let shader = tiny_skia::Pattern::new(
-                                swatch.as_ref(),
-                                tiny_skia::SpreadMode::Repeat,
-                                tiny_skia::FilterQuality::Bilinear,
-                                1.0,
-                                pat_xfm,
-                            );
-                            let mut fill_paint = tiny_skia::Paint::default();
-                            fill_paint.shader = shader;
-                            fill_paint.anti_alias = true;
-                            pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                    if let Some(path) = pb.finish() {
+                        let is_white_or_light = (outer.fill_color.r() > 240 && outer.fill_color.g() > 240 && outer.fill_color.b() > 240) || outer.fill_color == egui::Color32::WHITE;
+                        if let Some(swatch) = pattern_swatch {
+                            if is_white_or_light || outer.fill_color.a() == 0 {
+                                let tile_size_in = 2.0_f32;
+                                let tile_w_px = (tile_size_in * sx).max(16.0);
+                                let tile_h_px = (tile_size_in * sy).max(16.0);
+                                let scale_x = tile_w_px / swatch.width() as f32;
+                                let scale_y = tile_h_px / swatch.height() as f32;
+                                let pat_xfm = tiny_skia::Transform::from_scale(scale_x, scale_y).post_translate(pad, pad);
+                                let shader = tiny_skia::Pattern::new(
+                                    swatch.as_ref(),
+                                    tiny_skia::SpreadMode::Repeat,
+                                    tiny_skia::FilterQuality::Bilinear,
+                                    1.0,
+                                    pat_xfm,
+                                );
+                                let mut fill_paint = tiny_skia::Paint::default();
+                                fill_paint.shader = shader;
+                                fill_paint.anti_alias = true;
+                                pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                            } else if outer.fill_color.a() > 0 {
+                                let mut fill_paint = tiny_skia::Paint::default();
+                                fill_paint.set_color_rgba8(outer.fill_color.r(), outer.fill_color.g(), outer.fill_color.b(), outer.fill_color.a());
+                                fill_paint.anti_alias = true;
+                                pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
+                            }
                         } else if outer.fill_color.a() > 0 {
                             let mut fill_paint = tiny_skia::Paint::default();
                             fill_paint.set_color_rgba8(outer.fill_color.r(), outer.fill_color.g(), outer.fill_color.b(), outer.fill_color.a());
                             fill_paint.anti_alias = true;
                             pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
                         }
-                    } else if outer.fill_color.a() > 0 {
-                        let mut fill_paint = tiny_skia::Paint::default();
-                        fill_paint.set_color_rgba8(outer.fill_color.r(), outer.fill_color.g(), outer.fill_color.b(), outer.fill_color.a());
-                        fill_paint.anti_alias = true;
-                        pm.fill_path(&path, &fill_paint, tiny_skia::FillRule::EvenOdd, tiny_skia::Transform::identity(), None);
-                    }
-                    let is_white_or_light = (outer.fill_color.r() > 240 && outer.fill_color.g() > 240 && outer.fill_color.b() > 240) || outer.fill_color == egui::Color32::WHITE;
-                    let is_white_or_invisible_stroke = outer.stroke_color.map_or(true, |sc| sc.a() == 0 || (sc.r() > 240 && sc.g() > 240 && sc.b() > 240));
-                    let stroke_c = if !is_white_or_invisible_stroke {
-                        outer.stroke_color.unwrap()
-                    } else if pattern_swatch.is_some() || is_white_or_light || outer.fill_color.a() == 0 {
-                        egui::Color32::from_rgb(255, 38, 38)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
-
-                    if stroke_c.a() > 0 {
-                        let mut stroke_paint = tiny_skia::Paint::default();
-                        stroke_paint.set_color_rgba8(stroke_c.r(), stroke_c.g(), stroke_c.b(), stroke_c.a());
-                        stroke_paint.anti_alias = true;
-                        let st = tiny_skia::Stroke {
-                            width: (outer.stroke_width * sx).max(1.5),
-                            line_cap: tiny_skia::LineCap::Round,
-                            line_join: tiny_skia::LineJoin::Round,
-                            ..Default::default()
+                        let is_white_or_invisible_stroke = outer.stroke_color.map_or(true, |sc| sc.a() == 0 || (sc.r() > 240 && sc.g() > 240 && sc.b() > 240));
+                        let stroke_c = if !is_white_or_invisible_stroke {
+                            outer.stroke_color.unwrap()
+                        } else if pattern_swatch.is_some() || is_white_or_light || outer.fill_color.a() == 0 {
+                            egui::Color32::from_rgb(255, 38, 38)
+                        } else {
+                            egui::Color32::TRANSPARENT
                         };
-                        pm.stroke_path(&path, &stroke_paint, &st, tiny_skia::Transform::identity(), None);
+
+                        if stroke_c.a() > 0 {
+                            let mut stroke_paint = tiny_skia::Paint::default();
+                            stroke_paint.set_color_rgba8(stroke_c.r(), stroke_c.g(), stroke_c.b(), stroke_c.a());
+                            stroke_paint.anti_alias = true;
+                            let st = tiny_skia::Stroke {
+                                width: (outer.stroke_width * sx).max(1.5),
+                                line_cap: tiny_skia::LineCap::Round,
+                                line_join: tiny_skia::LineJoin::Round,
+                                ..Default::default()
+                            };
+                            pm.stroke_path(&path, &stroke_paint, &st, tiny_skia::Transform::identity(), None);
+                        }
+                        pixmap = Some(std::sync::Arc::new(pm));
                     }
-                    pixmap = Some(std::sync::Arc::new(pm));
                 }
             }
 
@@ -3037,6 +3178,64 @@ mod tests {
                 }
             }
             assert!(heart_found, "Must find visible white heart path");
+        }
+    }
+
+    #[test]
+    fn test_unicorn_paper_and_disney_hearts_cutouts() {
+        // 1. Verify AN UNICORN PAPER #2.studio3
+        let unicorn_candidates = [
+            Path::new("../test_samples/AN UNICORN PAPER #2.studio3"),
+            Path::new("test_samples/AN UNICORN PAPER #2.studio3"),
+        ];
+        if let Some(path) = unicorn_candidates.iter().find(|p| p.exists()) {
+            let data = std::fs::read(path).expect("Read AN UNICORN PAPER #2");
+            let doc = parse_studio_data(&data).expect("Parse AN UNICORN PAPER #2");
+            assert_eq!(doc.version, StudioFormatVersion::StudioV5);
+            assert_eq!(doc.mat_width_in, 12.0, "Mat width must be 12 inches Cameo");
+            assert_eq!(doc.mat_height_in, 12.0, "Mat height must be 12 inches Cameo");
+            assert!(doc.shapes.len() >= 200, "Expected >= 200 shapes, got {}", doc.shapes.len());
+
+            // Compute overall document bounds
+            let mut min_x = f32::MAX;
+            let mut min_y = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut max_y = f32::MIN;
+            for s in &doc.shapes {
+                min_x = min_x.min(s.x);
+                min_y = min_y.min(s.y);
+                max_x = max_x.max(s.x + s.width);
+                max_y = max_y.max(s.y + s.height);
+                // Ensure no single shape swallowed the whole document (no mega-strings > 50k chars)
+                assert!(s.text.len() < 50_000, "Shape text len must be < 50,000 chars, got {}", s.text.len());
+            }
+            let span_x = max_x - min_x;
+            let span_y = max_y - min_y;
+            assert!(span_x >= 6.0, "Design must span across mat (>= 6.0 in), got {:.2} in", span_x);
+            assert!(span_y >= 4.0, "Design must span across mat (>= 4.0 in), got {:.2} in", span_y);
+        }
+
+        // 2. Verify DISNEY HEARTS.studio3 heart cutouts
+        let disney_candidates = [
+            Path::new("../test_samples/DISNEY HEARTS.studio3"),
+            Path::new("test_samples/DISNEY HEARTS.studio3"),
+        ];
+        if let Some(path) = disney_candidates.iter().find(|p| p.exists()) {
+            let data = std::fs::read(path).expect("Read DISNEY HEARTS");
+            let doc = parse_studio_data(&data).expect("Parse DISNEY HEARTS");
+            assert_eq!(doc.version, StudioFormatVersion::StudioV5);
+            assert_eq!(doc.mat_width_in, 12.0, "Mat width must be 12 inches Cameo");
+            assert_eq!(doc.mat_height_in, 12.0, "Mat height must be 12 inches Cameo");
+
+            // Verify heart cutout shape exists (~1.65" on mat or ~2.97" pre-normalization) with red stroke
+            let heart_shape = doc.shapes.iter().find(|s| {
+                s.is_svg_path
+                    && ((s.width - 1.65).abs() < 0.25 || (s.width - 2.97).abs() < 0.35)
+                    && ((s.height - 1.66).abs() < 0.25 || (s.height - 2.98).abs() < 0.35)
+            });
+            assert!(heart_shape.is_some(), "Must find heart cutout shape with realistic dimensions");
+            let heart = heart_shape.unwrap();
+            assert_eq!(heart.stroke_color, Some(egui::Color32::from_rgb(255, 38, 38)), "Heart cut outline must be red (#ff2626)");
         }
     }
 }

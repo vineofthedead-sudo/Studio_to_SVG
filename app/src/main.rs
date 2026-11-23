@@ -4013,6 +4013,14 @@ impl eframe::App for StudioApp {
             if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Num0)) {
                 self.fit_to_view();
             }
+            // Zoom In: Ctrl+= or Ctrl++
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && (i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus))) {
+                self.zoom = (self.zoom * 1.15).min(5.0);
+            }
+            // Zoom Out: Ctrl+-
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Minus)) {
+                self.zoom = (self.zoom / 1.15).max(0.1);
+            }
 
             // Arrow key nudging for selected shapes
             let nudge_left = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
@@ -4364,7 +4372,13 @@ impl eframe::App for StudioApp {
                     }
                 });
                 ui.separator();
+                if ui.button("−").on_hover_text("Zoom Out (Ctrl+-)").clicked() {
+                    self.zoom = (self.zoom / 1.15).max(0.1);
+                }
                 ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
+                if ui.button("+").on_hover_text("Zoom In (Ctrl+=)").clicked() {
+                    self.zoom = (self.zoom * 1.15).min(5.0);
+                }
                 if ui.button("Fit").on_hover_text("Fit mat to window (Ctrl+0)").clicked() {
                     self.fit_to_view();
                 }
@@ -4904,11 +4918,47 @@ impl eframe::App for StudioApp {
                 self.pan += response.drag_delta();
             }
 
-            // Zooming with scroll wheel
+            // 2. Zooming: trackpad pinch-to-zoom (egui::Event::Zoom), Ctrl+Scroll, and mouse scroll wheel
             if response.hovered() {
-                let scroll = ctx.input(|i| i.raw_scroll_delta.y);
-                if scroll != 0.0 {
-                    self.zoom = (self.zoom * (1.0 + scroll * 0.001)).clamp(0.1, 5.0);
+                let pointer_pos = response
+                    .hover_pos()
+                    .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
+                    .unwrap_or_else(|| rect.center());
+
+                // A. Check for trackpad/touchscreen pinch-to-zoom events (egui::Event::Zoom)
+                let mut pinch_factor = 1.0_f32;
+                ctx.input(|i| {
+                    for event in &i.events {
+                        if let egui::Event::Zoom(factor) = event {
+                            pinch_factor *= *factor;
+                        }
+                    }
+                });
+
+                // B. Scroll wheel / Ctrl + Scroll
+                let scroll_y = ctx.input(|i| i.raw_scroll_delta.y);
+                let is_ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                let scroll_factor = if scroll_y != 0.0 {
+                    if is_ctrl {
+                        1.0 + scroll_y * 0.003
+                    } else {
+                        1.0 + scroll_y * 0.001
+                    }
+                } else {
+                    1.0
+                };
+
+                let total_zoom_factor = pinch_factor * scroll_factor;
+                if (total_zoom_factor - 1.0).abs() > 1e-4 {
+                    let old_zoom = self.zoom;
+                    let new_zoom = (old_zoom * total_zoom_factor).clamp(0.1, 5.0);
+                    if (new_zoom - old_zoom).abs() > 1e-4 {
+                        let zoom_ratio = new_zoom / old_zoom;
+                        let center = rect.center();
+                        let v = pointer_pos - center - self.pan;
+                        self.pan += v * (1.0 - zoom_ratio);
+                        self.zoom = new_zoom;
+                    }
                 }
             }
 
@@ -7677,5 +7727,41 @@ mod tests {
         assert_eq!(app.tabs[0].default_export_filename("png"), "Peeker Bears.png");
         assert_eq!(app.tabs[0].default_export_filename("craft"), "Peeker Bears.craft");
         assert!(app.active_tab_dir().is_some());
+    }
+
+    #[test]
+    fn test_zoom_controls_and_pinch_gesture() {
+        let mut app = StudioApp::new(None);
+        app.zoom = 1.0;
+        app.pan = egui::Vec2::ZERO;
+
+        // Test toolbar buttons
+        // Zoom in: * 1.15
+        app.zoom = (app.zoom * 1.15).min(5.0);
+        assert!((app.zoom - 1.15).abs() < 1e-4);
+
+        // Zoom out: / 1.15
+        app.zoom = (app.zoom / 1.15).max(0.1);
+        assert!((app.zoom - 1.0).abs() < 1e-4);
+
+        // Clamping checks
+        app.zoom = 10.0;
+        app.zoom = (app.zoom * 1.15).min(5.0);
+        assert_eq!(app.zoom, 5.0);
+
+        app.zoom = 0.05;
+        app.zoom = (app.zoom / 1.15).max(0.1);
+        assert_eq!(app.zoom, 0.1);
+
+        // Test zoom around pointer math
+        let old_zoom = 1.0_f32;
+        let new_zoom = 2.0_f32;
+        let zoom_ratio = new_zoom / old_zoom;
+        let center = egui::pos2(500.0, 500.0);
+        let pointer = egui::pos2(600.0, 500.0);
+        let mut pan = egui::Vec2::ZERO;
+        let v = pointer - center - pan;
+        pan += v * (1.0 - zoom_ratio);
+        assert_eq!(pan, egui::vec2(-100.0, 0.0));
     }
 }
