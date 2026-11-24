@@ -3332,9 +3332,25 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
         let img = self.image_tracer.image_data.as_ref().unwrap();
         let svg_string = image_tracer::trace_image_to_svg(img, &params)?;
 
-        let count = self.import_svg_bytes(svg_string.as_bytes())?;
+        let mut count = self.import_svg_bytes(svg_string.as_bytes())?;
 
         if count > 0 {
+            if self.image_tracer.remove_white_background {
+                let start_idx = self.shapes.len().saturating_sub(count);
+                let mut i = start_idx;
+                while i < self.shapes.len() {
+                    let s = &self.shapes[i];
+                    let is_white = (s.fill_color.r() >= 240 && s.fill_color.g() >= 240 && s.fill_color.b() >= 240)
+                        || s.fill_color == egui::Color32::WHITE;
+                    if is_white && s.stroke_color.is_none() {
+                        self.shapes.remove(i);
+                        count = count.saturating_sub(1);
+                    } else {
+                        i += 1;
+                    }
+                }
+                self.selected_indices = (start_idx..self.shapes.len()).collect();
+            }
             let stem = self.image_tracer.source_path
                 .as_ref()
                 .and_then(|p| p.file_stem())
@@ -3422,9 +3438,8 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
                     }
                 }
                 usvg::Node::Path(path) => {
-                    if let Some(shape) = Self::create_shape_from_usvg_path(path, scale_to_in, default_color, current_stack) {
-                        out.push(shape);
-                    }
+                    let shapes = Self::create_shapes_from_usvg_path(path, scale_to_in, default_color, current_stack);
+                    out.extend(shapes);
                 }
                 usvg::Node::Text(text) => {
                     let flattened = text.flattened();
@@ -3435,15 +3450,15 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
         }
     }
 
-    pub fn create_shape_from_usvg_path(
+    pub fn create_shapes_from_usvg_path(
         path: &usvg::Path,
         scale_to_in: f32,
         default_color: egui::Color32,
         current_stack: &[u64],
-    ) -> Option<CanvasShape> {
+    ) -> Vec<CanvasShape> {
         let is_both_none = path.fill().is_none() && path.stroke().is_none();
         if !path.is_visible() && !is_both_none {
-            return None;
+            return Vec::new();
         }
 
         let fill_color = if let Some(fill) = path.fill() {
@@ -3475,130 +3490,259 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
         };
 
         if fill_color.a() == 0 && stroke_color.is_none() {
-            return None;
+            return Vec::new();
         }
 
         let ts = path.abs_transform();
         let transformed = if ts.is_identity() {
             path.data().clone()
         } else {
-            path.data().clone().transform(ts)?
+            match path.data().clone().transform(ts) {
+                Some(t) => t,
+                None => return Vec::new(),
+            }
         };
 
         let b = transformed.bounds();
         if b.width() <= 0.0 && b.height() <= 0.0 {
-            return None;
+            return Vec::new();
         }
-
-        let shape_x = b.left() * scale_to_in;
-        let shape_y = b.top() * scale_to_in;
-        let shape_w = (b.width() * scale_to_in).max(0.005);
-        let shape_h = (b.height() * scale_to_in).max(0.005);
 
         let subpaths = extract_subpaths(&transformed, scale_to_in);
-        let (kind, final_points, is_closed) = if subpaths.len() == 1 {
-            let (raw_segments, sampled_points, closed) = &subpaths[0];
-            let (k, pts) = classify_subpath(raw_segments, sampled_points, *closed);
-            (k, pts.clone(), *closed)
-        } else if subpaths.len() > 1 {
-            let mut all_pts = Vec::new();
-            for (_raw, pts, _closed) in &subpaths {
-                all_pts.extend(pts.iter().copied());
-            }
-            (ShapeKind::Freehand, all_pts, true)
-        } else {
-            (ShapeKind::Freehand, Vec::new(), true)
-        };
-
-        let target_dpi = 150.0_f32;
-        let pix_w = ((shape_w * target_dpi).ceil() as u32).clamp(4, 1024);
-        let pix_h = ((shape_h * target_dpi).ceil() as u32).clamp(4, 1024);
-
-        let mut pixmap = tiny_skia::Pixmap::new(pix_w, pix_h);
-        if let Some(ref mut pm) = pixmap {
-            let sx = pix_w as f32 / b.width().max(0.001);
-            let sy = pix_h as f32 / b.height().max(0.001);
-            let render_ts = tiny_skia::Transform::from_translate(-b.left(), -b.top()).post_scale(sx, sy);
-
-            if let Some(fill) = path.fill() {
-                let fill_rule = match fill.rule() {
-                    usvg::FillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
-                    usvg::FillRule::NonZero => tiny_skia::FillRule::Winding,
-                };
-                let mut paint = tiny_skia::Paint::default();
-                match fill.paint() {
-                    usvg::Paint::Color(c) => {
-                        let a = (fill.opacity().get() * 255.0).round() as u8;
-                        paint.set_color_rgba8(c.red, c.green, c.blue, a);
-                        paint.anti_alias = true;
-                        pm.fill_path(&transformed, &paint, fill_rule, render_ts, None);
-                    }
-                    _ => {
-                        paint.set_color_rgba8(default_color.r(), default_color.g(), default_color.b(), default_color.a());
-                        paint.anti_alias = true;
-                        pm.fill_path(&transformed, &paint, fill_rule, render_ts, None);
-                    }
-                }
-            }
-
-            if let Some(stroke) = path.stroke() {
-                let mut paint = tiny_skia::Paint::default();
-                match stroke.paint() {
-                    usvg::Paint::Color(c) => {
-                        let a = (stroke.opacity().get() * 255.0).round() as u8;
-                        paint.set_color_rgba8(c.red, c.green, c.blue, a);
-                        paint.anti_alias = true;
-                        let sw_pix = (stroke.width().get() * sx).max(1.0);
-                        let skia_stroke = tiny_skia::Stroke {
-                            width: sw_pix,
-                            line_cap: match stroke.linecap() {
-                                usvg::LineCap::Round => tiny_skia::LineCap::Round,
-                                usvg::LineCap::Square => tiny_skia::LineCap::Square,
-                                usvg::LineCap::Butt => tiny_skia::LineCap::Butt,
-                            },
-                            line_join: match stroke.linejoin() {
-                                usvg::LineJoin::Round => tiny_skia::LineJoin::Round,
-                                usvg::LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
-                                usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => tiny_skia::LineJoin::Miter,
-                            },
-                            ..Default::default()
-                        };
-                        pm.stroke_path(&transformed, &paint, &skia_stroke, render_ts, None);
-                    }
-                    _ => {}
-                }
-            } else if is_both_none {
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color_rgba8(default_color.r(), default_color.g(), default_color.b(), default_color.a());
-                paint.anti_alias = true;
-                let skia_stroke = tiny_skia::Stroke { width: 1.5, ..Default::default() };
-                pm.stroke_path(&transformed, &paint, &skia_stroke, render_ts, None);
-            }
+        if subpaths.is_empty() {
+            return Vec::new();
         }
 
-        Some(CanvasShape {
-            kind,
-            x: shape_x,
-            y: shape_y,
-            width: shape_w,
-            height: shape_h,
-            points: final_points,
-            text: String::new(),
-            fill_color,
-            stroke_color,
-            stroke_width: stroke_width_in,
-            is_closed,
-            is_svg_path: true,
-            is_modified: false,
-            triangles: Vec::new(),
-            group_id: current_stack.last().copied(),
-            group_path: current_stack.to_vec(),
-            is_visible: true,
-            is_locked: false,
-            name: None,
-            pixmap: pixmap.map(std::sync::Arc::new),
-            texture: None,
-        })
+        let mut shapes = Vec::new();
+        for (raw_segments, sampled_points, closed) in subpaths {
+            let (kind, pts) = classify_subpath(&raw_segments, &sampled_points, closed);
+
+            let (min_x, min_y, shape_w, shape_h) = {
+                let mut mx = f32::MAX;
+                let mut my = f32::MAX;
+                let mut max_x = f32::MIN;
+                let mut max_y = f32::MIN;
+                let mut has_points = false;
+
+                for p in &pts {
+                    mx = mx.min(p.x);
+                    my = my.min(p.y);
+                    max_x = max_x.max(p.x);
+                    max_y = max_y.max(p.y);
+                    has_points = true;
+                }
+
+                if !has_points {
+                    for seg in &raw_segments {
+                        match seg {
+                            RawSegment::MoveTo(p) | RawSegment::LineTo(p) => {
+                                mx = mx.min(p.x);
+                                my = my.min(p.y);
+                                max_x = max_x.max(p.x);
+                                max_y = max_y.max(p.y);
+                                has_points = true;
+                            }
+                            RawSegment::QuadTo(p1, p2) => {
+                                mx = mx.min(p1.x).min(p2.x);
+                                my = my.min(p1.y).min(p2.y);
+                                max_x = max_x.max(p1.x).max(p2.x);
+                                max_y = max_y.max(p1.y).max(p2.y);
+                                has_points = true;
+                            }
+                            RawSegment::CubicTo(p1, p2, p3) => {
+                                mx = mx.min(p1.x).min(p2.x).min(p3.x);
+                                my = my.min(p1.y).min(p2.y).min(p3.y);
+                                max_x = max_x.max(p1.x).max(p2.x).max(p3.x);
+                                max_y = max_y.max(p1.y).max(p2.y).max(p3.y);
+                                has_points = true;
+                            }
+                            RawSegment::Close => {}
+                        }
+                    }
+                }
+
+                if has_points {
+                    (mx, my, (max_x - mx).max(0.005), (max_y - my).max(0.005))
+                } else {
+                    (
+                        b.left() * scale_to_in,
+                        b.top() * scale_to_in,
+                        (b.width() * scale_to_in).max(0.005),
+                        (b.height() * scale_to_in).max(0.005),
+                    )
+                }
+            };
+
+            // Build SVG path string for this specific subpath
+            let mut path_str = String::new();
+            for seg in &raw_segments {
+                match seg {
+                    RawSegment::MoveTo(p) => path_str.push_str(&format!("M {:.4} {:.4} ", p.x, p.y)),
+                    RawSegment::LineTo(p) => path_str.push_str(&format!("L {:.4} {:.4} ", p.x, p.y)),
+                    RawSegment::QuadTo(p1, p2) => {
+                        path_str.push_str(&format!("Q {:.4} {:.4} {:.4} {:.4} ", p1.x, p1.y, p2.x, p2.y))
+                    }
+                    RawSegment::CubicTo(p1, p2, p3) => path_str.push_str(&format!(
+                        "C {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} ",
+                        p1.x, p1.y, p2.x, p2.y, p3.x, p3.y
+                    )),
+                    RawSegment::Close => path_str.push_str("Z "),
+                }
+            }
+
+            // Build tiny_skia Path for this specific subpath for raster caching
+            let mut pb = tiny_skia::PathBuilder::new();
+            for seg in &raw_segments {
+                match seg {
+                    RawSegment::MoveTo(p) => pb.move_to(p.x / scale_to_in, p.y / scale_to_in),
+                    RawSegment::LineTo(p) => pb.line_to(p.x / scale_to_in, p.y / scale_to_in),
+                    RawSegment::QuadTo(p1, p2) => pb.quad_to(
+                        p1.x / scale_to_in,
+                        p1.y / scale_to_in,
+                        p2.x / scale_to_in,
+                        p2.y / scale_to_in,
+                    ),
+                    RawSegment::CubicTo(p1, p2, p3) => pb.cubic_to(
+                        p1.x / scale_to_in,
+                        p1.y / scale_to_in,
+                        p2.x / scale_to_in,
+                        p2.y / scale_to_in,
+                        p3.x / scale_to_in,
+                        p3.y / scale_to_in,
+                    ),
+                    RawSegment::Close => pb.close(),
+                }
+            }
+            let sub_path = pb.finish();
+
+            let target_dpi = 150.0_f32;
+            let pix_w = ((shape_w * target_dpi).ceil() as u32).clamp(4, 1024);
+            let pix_h = ((shape_h * target_dpi).ceil() as u32).clamp(4, 1024);
+
+            let mut pixmap = tiny_skia::Pixmap::new(pix_w, pix_h);
+            if let (Some(ref mut pm), Some(ref sk_path)) = (&mut pixmap, &sub_path) {
+                let sb = sk_path.bounds();
+                let sb_w = sb.width().max(0.001);
+                let sb_h = sb.height().max(0.001);
+                let sx = pix_w as f32 / sb_w;
+                let sy = pix_h as f32 / sb_h;
+                let render_ts =
+                    tiny_skia::Transform::from_translate(-sb.left(), -sb.top()).post_scale(sx, sy);
+
+                if let Some(fill) = path.fill() {
+                    let fill_rule = match fill.rule() {
+                        usvg::FillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
+                        usvg::FillRule::NonZero => tiny_skia::FillRule::Winding,
+                    };
+                    let mut paint = tiny_skia::Paint::default();
+                    match fill.paint() {
+                        usvg::Paint::Color(c) => {
+                            let a = (fill.opacity().get() * 255.0).round() as u8;
+                            paint.set_color_rgba8(c.red, c.green, c.blue, a);
+                            paint.anti_alias = true;
+                            pm.fill_path(sk_path, &paint, fill_rule, render_ts, None);
+                        }
+                        _ => {
+                            paint.set_color_rgba8(
+                                default_color.r(),
+                                default_color.g(),
+                                default_color.b(),
+                                default_color.a(),
+                            );
+                            paint.anti_alias = true;
+                            pm.fill_path(sk_path, &paint, fill_rule, render_ts, None);
+                        }
+                    }
+                }
+
+                if let Some(stroke) = path.stroke() {
+                    let mut paint = tiny_skia::Paint::default();
+                    match stroke.paint() {
+                        usvg::Paint::Color(c) => {
+                            let a = (stroke.opacity().get() * 255.0).round() as u8;
+                            paint.set_color_rgba8(c.red, c.green, c.blue, a);
+                            paint.anti_alias = true;
+                            let sw_pix = (stroke.width().get() * sx).max(1.0);
+                            let skia_stroke = tiny_skia::Stroke {
+                                width: sw_pix,
+                                line_cap: match stroke.linecap() {
+                                    usvg::LineCap::Round => tiny_skia::LineCap::Round,
+                                    usvg::LineCap::Square => tiny_skia::LineCap::Square,
+                                    usvg::LineCap::Butt => tiny_skia::LineCap::Butt,
+                                },
+                                line_join: match stroke.linejoin() {
+                                    usvg::LineJoin::Round => tiny_skia::LineJoin::Round,
+                                    usvg::LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
+                                    usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => {
+                                        tiny_skia::LineJoin::Miter
+                                    }
+                                },
+                                ..Default::default()
+                            };
+                            pm.stroke_path(sk_path, &paint, &skia_stroke, render_ts, None);
+                        }
+                        _ => {}
+                    }
+                } else if is_both_none {
+                    let mut paint = tiny_skia::Paint::default();
+                    paint.set_color_rgba8(
+                        default_color.r(),
+                        default_color.g(),
+                        default_color.b(),
+                        default_color.a(),
+                    );
+                    paint.anti_alias = true;
+                    let skia_stroke = tiny_skia::Stroke {
+                        width: 1.5,
+                        ..Default::default()
+                    };
+                    pm.stroke_path(sk_path, &paint, &skia_stroke, render_ts, None);
+                }
+            }
+
+            let triangles = if pts.len() >= 3 && (fill_color.a() > 0 || closed) {
+                triangulate_polygon(&pts)
+            } else {
+                Vec::new()
+            };
+
+            shapes.push(CanvasShape {
+                kind,
+                x: min_x,
+                y: min_y,
+                width: shape_w,
+                height: shape_h,
+                points: pts,
+                text: path_str,
+                fill_color,
+                stroke_color,
+                stroke_width: stroke_width_in,
+                is_closed: closed,
+                is_svg_path: true,
+                is_modified: false,
+                triangles,
+                group_id: current_stack.last().copied(),
+                group_path: current_stack.to_vec(),
+                is_visible: true,
+                is_locked: false,
+                name: None,
+                pixmap: pixmap.map(std::sync::Arc::new),
+                texture: None,
+            });
+        }
+
+        shapes
+    }
+
+    pub fn create_shape_from_usvg_path(
+        path: &usvg::Path,
+        scale_to_in: f32,
+        default_color: egui::Color32,
+        current_stack: &[u64],
+    ) -> Option<CanvasShape> {
+        Self::create_shapes_from_usvg_path(path, scale_to_in, default_color, current_stack)
+            .into_iter()
+            .next()
     }
 }
 
@@ -3646,9 +3790,8 @@ pub fn import_svg_data(bytes: &[u8], default_color: egui::Color32) -> Vec<Canvas
                     }
                 }
                 usvg::Node::Path(p) => {
-                    if let Some(s) = StudioApp::create_shape_from_usvg_path(p, scale_to_in, default_color, stack) {
-                        out.push(s);
-                    }
+                    let shapes = StudioApp::create_shapes_from_usvg_path(p, scale_to_in, default_color, stack);
+                    out.extend(shapes);
                 }
                 usvg::Node::Text(t) => {
                     traverse_node(t.flattened(), scale_to_in, default_color, stack, gid_counter, out);
@@ -8214,5 +8357,39 @@ mod tests {
         assert!(!app.image_tracer.is_active, "Tracer should close after vectorization");
         assert_eq!(app.undo_stack.len(), 1, "Undo snapshot must be created");
         assert!(!app.selected_indices.is_empty(), "New shapes must be selected");
+    }
+
+    #[test]
+    fn test_svg_multi_subpath_splits_into_separate_shapes_no_bridging() {
+        let mut app = StudioApp::new(None);
+        // An SVG path with 2 distinct square subpaths separated by an M command
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10in" height="10in" viewBox="0 0 100 100">
+            <path d="M 10 10 L 20 10 L 20 20 L 10 20 Z M 50 50 L 60 50 L 60 60 L 50 60 Z" fill="#000000" />
+        </svg>"##;
+
+        let count = app.import_svg_bytes(svg.as_bytes()).expect("import failed");
+        // Must produce 2 separate shapes, NOT a single joined shape with bridging lines!
+        assert_eq!(count, 2);
+        assert_eq!(app.shapes.len(), 2);
+
+        let shape1 = &app.shapes[0];
+        let shape2 = &app.shapes[1];
+
+        // Bounds of shape 1 should be around (1.0, 1.0) inches
+        assert!((shape1.x - 1.0).abs() < 0.05);
+        assert!((shape1.y - 1.0).abs() < 0.05);
+
+        // Bounds of shape 2 should be around (5.0, 5.0) inches
+        assert!((shape2.x - 5.0).abs() < 0.05);
+        assert!((shape2.y - 5.0).abs() < 0.05);
+
+        // Shape 1 points must not contain points near 5.0 in
+        for p in &shape1.points {
+            assert!(p.x < 3.5, "Shape 1 points must not leak into Shape 2 coordinates");
+        }
+        // Shape 2 points must not contain points near 1.0 in
+        for p in &shape2.points {
+            assert!(p.x > 3.5, "Shape 2 points must not leak into Shape 1 coordinates");
+        }
     }
 }

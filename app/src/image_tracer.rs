@@ -450,24 +450,29 @@ pub fn trace_image_to_svg(
     // Crop the image strictly to the defined crop rectangle
     let mut cropped = image::imageops::crop_imm(img, crop.min_x, crop.min_y, w, h).to_image();
 
-    // If remove_white_background is requested, set alpha of near-white background pixels to transparent
-    if params.remove_white_background {
-        for pixel in cropped.pixels_mut() {
-            let r = pixel[0];
-            let g = pixel[1];
-            let b = pixel[2];
-            // If near pure white paper background
-            if r > 240 && g > 240 && b > 240 {
-                pixel[3] = 0;
-            }
+    // Iterate through cropped image buffer and apply strict binary threshold:
+    // Convert to grayscale/luminance: if below 128.0, force to pure #000000 ([0, 0, 0, 255]),
+    // otherwise force to pure #ffffff ([255, 255, 255, 255]).
+    // The image must contain ONLY exactly two hex colors (#000000 and #ffffff).
+    for pixel in cropped.pixels_mut() {
+        let r = pixel[0] as f32;
+        let g = pixel[1] as f32;
+        let b = pixel[2] as f32;
+        let a = pixel[3];
+        let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        if a >= 64 && lum < 128.0 {
+            *pixel = image::Rgba([0, 0, 0, 255]);
+        } else {
+            *pixel = image::Rgba([255, 255, 255, 255]);
         }
     }
 
-    // Configure vtracer
-    let mut cfg = vtracer::Config::from_preset(vtracer::Preset::Poster);
-    cfg.max_colors = Some(params.color_count.clamp(2, 64));
-    cfg.color_precision = 7;
-    cfg.filter_speckle = 4;
+    // Configure vtracer with aggressive parameters
+    let mut cfg = vtracer::Config::from_preset(vtracer::Preset::Bw);
+    cfg.hierarchical = vtracer::config::Hierarchical::Stacked;
+    cfg.color_precision = 8;
+    cfg.filter_speckle = 14;
+    cfg.max_colors = Some(2);
     cfg.corner_threshold = 60;
     cfg.length_threshold = 4.0;
     cfg.splice_threshold = 45;

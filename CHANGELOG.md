@@ -4,6 +4,30 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.6.1] - 2026-11-24
+
+### Fixed & Improved
+- **Eliminated `egui` Vector Bridging Lines via Subpath Separation (`app/src/main.rs`)**:
+  - Identified root cause of bridging lines: `egui::epaint::PathShape` draws single continuous lines without internal MoveTo jump support. When SVG paths with multiple MoveTo subpaths were mashed into a single `Vec<Pos2>`, `egui` connected the end of one disconnected contour straight into the next.
+  - Implemented `create_shapes_from_usvg_path`: parses each `MoveTo` subpath into an independent, distinct `CanvasShape` with its own isolated points, per-subpath bounding box, SVG path string (`M ... Z`), and raster pixmap cache.
+  - Updated both `import_usvg_node` and `traverse_node` to extend with all subpath shapes.
+  - Added unit test `test_svg_multi_subpath_splits_into_separate_shapes_no_bridging` asserting multi-contour paths split into separate shapes with zero coordinate leakage.
+- **Strict Binary Luminance Thresholding (`app/src/image_tracer.rs`)**:
+  - Eliminated spiderwebbed vector artifacts caused by `vtracer` tracing anti-aliasing edges and textured paper noise.
+  - Applied strict binary thresholding directly on the cropped image buffer prior to tracing: converts pixel RGBA to luminance ($0.299R + 0.587G + 0.114B$); pixels with $\text{luminance} < 128.0$ and alpha $\ge 64$ are forced to pure `#000000` (`[0, 0, 0, 255]`), and all other pixels are forced to pure `#ffffff` (`[255, 255, 255, 255]`).
+  - Guarantees `vtracer` receives a crisp, bi-level two-color image.
+- **Aggressive `vtracer::Config` Parameters (`app/src/image_tracer.rs`)**:
+  - Configured `vtracer::Config::from_preset(Preset::Bw)`.
+  - Set `hierarchical: Hierarchical::Stacked` to ensure robust layered painter-order output.
+  - Increased `filter_speckle: 14` ($\ge 10$) to aggressively discard scanning speckles and dust.
+  - Set `color_precision: 8` and `max_colors: Some(2)` to lock in exact binary tracing.
+  - Added white-background shape filtering upon import in `trace_current_image` when `remove_white_background` is enabled.
+- **Verification**:
+  - All 79 test cases passing (`cargo test --manifest-path app/Cargo.toml`).
+  - Production release binary built cleanly (`cargo build --release --manifest-path app/Cargo.toml`).
+
+---
+
 ## [0.6.0] - 2026-11-23
 
 ### Added & Improved
