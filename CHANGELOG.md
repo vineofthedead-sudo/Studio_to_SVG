@@ -4,6 +4,33 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.6.0] - 2026-11-23
+
+### Added & Improved
+- **VTracer-Based Image-to-SVG Vectorization Pipeline (`app/src/image_tracer.rs`)**:
+  - Added `vtracer` (v1.0.0-alpha.4) and `image` (v0.24) integration for high-performance multi-color vectorization of legacy catalog cards and raster images.
+  - Implemented `trace_image_to_svg` converting cropped image buffers into clean, grouped SVG paths configured for posterized color clustering, corner thresholding, and speckle removal.
+  - Integrated "Remove White Background" toggle: automatically identifies and transparentizes near-white background paper before vectorization, and omits background canvas fills.
+  - Added "Color Count" integer slider control (2–32 colors) allowing granular control over multi-color vector palette clustering.
+- **"Original Overlays" Catalog Card Auto-Cropper Algorithm (`app/src/image_tracer.rs`)**:
+  - Implemented specialized auto-crop detection for legacy physical catalog cards:
+    - Automatically ignores olive-green, brown, and dark physical outer framing/matting.
+    - Accurately detects the rectangular boundaries of the central white card base.
+    - Masks out the top ~15% containing catalog header text (e.g. "V.120 Original Overlays...").
+    - Masks out the bottom-right corner containing the price tag (e.g. "$4.00", "$5.00").
+    - Calculates a tight bounding box around the remaining high-contrast central artwork with non-clipping padding.
+- **Interactive UI Crop Box (`egui`) & Canvas Integration (`app/src/main.rs`)**:
+  - Added canvas raster rendering with an interactive, draggable bounding box overlay.
+  - Features 8 interactive drag handles (4 corners + 4 edge centers) and full-box translation with contextual cursor feedback (`ResizeNwSe`, `ResizeNeSw`, `ResizeVertical`, `ResizeHorizontal`, `Move`).
+  - Added dimmed background mask outside crop box and rule-of-thirds alignment grid.
+  - Added "⚡ Auto-Crop" button (snaps box to calculated artwork region) and "Full Image" reset.
+  - Added "▶ Trace to Vector" action: vectorizes strictly within the crop boundary and imports resulting paths directly into the active document tab aligned to the canvas mat, complete with undo/redo snapshot and layer group registration.
+  - Added "Import Image for Tracing..." UI flows via File menu, left sidebar button, and `Ctrl+I` keyboard shortcut.
+- **Automated Verification**:
+  - Added 6 new unit and integration tests covering the auto-crop heuristics, vtracer pipeline, and app state integration (78/78 tests passing).
+
+---
+
 ## [0.5.7] - 2026-11-23
 
 ### Added & Improved

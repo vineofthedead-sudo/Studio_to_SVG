@@ -1,6 +1,7 @@
 pub mod studio_format;
 pub mod vector_ops;
 pub mod project_file;
+pub mod image_tracer;
 
 use eframe::egui;
 use std::path::Path;
@@ -785,6 +786,7 @@ pub struct StudioApp {
     pub focus_text_input: bool,
     pub renaming_target: Option<RenamingTarget>,
     pub renaming_text: String,
+    pub image_tracer: image_tracer::ImageTracerState,
 }
 
 #[derive(Clone, Debug)]
@@ -1080,6 +1082,7 @@ impl StudioApp {
             focus_text_input: false,
             renaming_target: None,
             renaming_text: String::new(),
+            image_tracer: image_tracer::ImageTracerState::default(),
         }
     }
 
@@ -3284,6 +3287,115 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
         Ok(count)
     }
 
+    /// Open file dialog to import an image for vector tracing
+    pub fn open_image_trace_dialog(&mut self, ctx: &egui::Context) {
+        let dir = self.active_tab_dir();
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("Images (*.jpg, *.jpeg, *.png)", &["jpg", "jpeg", "png", "PNG", "JPG", "JPEG"]);
+        if let Some(d) = dir {
+            dialog = dialog.set_directory(d);
+        }
+        if let Some(path) = dialog.pick_file() {
+            if let Err(e) = self.import_image_for_tracing(&path, ctx) {
+                self.set_status(format!("Error loading image for tracing: {}", e));
+            }
+        }
+    }
+
+    /// Load image from file path into ImageTracerState
+    pub fn import_image_for_tracing(&mut self, path: &Path, ctx: &egui::Context) -> Result<(), Box<dyn std::error::Error>> {
+        self.image_tracer.load_image(path, ctx)?;
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("image");
+        self.set_status(format!("Imported '{}' for tracing. Drag crop box to adjust, then click 'Trace to Vector'", name));
+        Ok(())
+    }
+
+    /// Vectorize the defined crop region of the loaded image using vtracer
+    pub fn trace_current_image(&mut self) -> Result<usize, Box<dyn std::error::Error>> {
+        let (img_w, img_h) = match self.image_tracer.image_data {
+            Some(ref img) => img.dimensions(),
+            None => return Err("No image loaded for tracing".into()),
+        };
+
+        let crop_rect = image_tracer::PixelRect::from_egui_rect(
+            self.image_tracer.crop_rect,
+            img_w,
+            img_h,
+        );
+
+        let params = image_tracer::TracingParams {
+            color_count: self.image_tracer.color_count,
+            remove_white_background: self.image_tracer.remove_white_background,
+            crop_rect,
+        };
+
+        let img = self.image_tracer.image_data.as_ref().unwrap();
+        let svg_string = image_tracer::trace_image_to_svg(img, &params)?;
+
+        let count = self.import_svg_bytes(svg_string.as_bytes())?;
+
+        if count > 0 {
+            let stem = self.image_tracer.source_path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .and_then(|s| s.to_str())
+                .unwrap_or("Catalog Card");
+            let root_gid = self.next_group_id.saturating_sub(1);
+            self.group_names.insert(root_gid, format!("Traced: {}", stem));
+
+            // Fit traced shapes onto mat matching the crop box position on mat
+            let aspect = img_w as f32 / img_h as f32;
+            let fit_w_in = (self.mat_width_in * 0.85).min(self.mat_height_in * 0.85 * aspect);
+            let fit_h_in = fit_w_in / aspect;
+            let img_min_in = egui::pos2(
+                (self.mat_width_in - fit_w_in) * 0.5,
+                (self.mat_height_in - fit_h_in) * 0.5,
+            );
+
+            let target_x = img_min_in.x + (crop_rect.min_x as f32 / img_w as f32) * fit_w_in;
+            let target_y = img_min_in.y + (crop_rect.min_y as f32 / img_h as f32) * fit_h_in;
+            let target_w = (crop_rect.width() as f32 / img_w as f32) * fit_w_in;
+            let target_h = (crop_rect.height() as f32 / img_h as f32) * fit_h_in;
+
+            let mut curr_min_x = f32::MAX;
+            let mut curr_min_y = f32::MAX;
+            let mut curr_max_x = f32::MIN;
+            let mut curr_max_y = f32::MIN;
+            for &idx in &self.selected_indices {
+                if let Some(s) = self.shapes.get(idx) {
+                    curr_min_x = curr_min_x.min(s.x);
+                    curr_min_y = curr_min_y.min(s.y);
+                    curr_max_x = curr_max_x.max(s.x + s.width);
+                    curr_max_y = curr_max_y.max(s.y + s.height);
+                }
+            }
+
+            let curr_w = (curr_max_x - curr_min_x).max(0.001);
+            let curr_h = (curr_max_y - curr_min_y).max(0.001);
+            let scale_x = target_w / curr_w;
+            let scale_y = target_h / curr_h;
+
+            for &idx in &self.selected_indices {
+                if let Some(s) = self.shapes.get_mut(idx) {
+                    s.x = target_x + (s.x - curr_min_x) * scale_x;
+                    s.y = target_y + (s.y - curr_min_y) * scale_y;
+                    s.width *= scale_x;
+                    s.height *= scale_y;
+                    for pt in &mut s.points {
+                        pt.x = target_x + (pt.x - curr_min_x) * scale_x;
+                        pt.y = target_y + (pt.y - curr_min_y) * scale_y;
+                    }
+                    s.is_modified = true;
+                }
+            }
+
+            self.set_status(format!("Traced {} vector shapes from '{}'", count, stem));
+            self.image_tracer.close();
+        }
+
+        Ok(count)
+    }
+
     fn import_usvg_node(
         &mut self,
         group: &usvg::Group,
@@ -4013,6 +4125,10 @@ impl eframe::App for StudioApp {
                     let _ = self.open_file_into_tab(&path);
                 }
             }
+            // Import Image for Tracing: Ctrl+I
+            if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift && i.key_pressed(egui::Key::I)) {
+                self.open_image_trace_dialog(ctx);
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
                 let mut to_remove = self.all_selected_indices();
                 if !to_remove.is_empty() {
@@ -4193,6 +4309,10 @@ impl eframe::App for StudioApp {
                                 Err(e) => self.set_status(format!("Error importing SVG: {}", e)),
                             }
                         }
+                        ui.close_menu();
+                    }
+                    if ui.button("Import Image for Tracing... (Ctrl+I)").clicked() {
+                        self.open_image_trace_dialog(ctx);
                         ui.close_menu();
                     }
                     if ui.button("Export SVG...").clicked() {
@@ -4460,7 +4580,7 @@ impl eframe::App for StudioApp {
         });
 
         // Left tool panel
-        egui::SidePanel::left("left_tools").default_width(110.0).show(ctx, |ui| {
+        egui::SidePanel::left("left_tools").default_width(135.0).show(ctx, |ui| {
             ui.heading("Tools");
             ui.separator();
             if ui.selectable_value(&mut self.active_tool, Tool::Select, "Select").clicked() {
@@ -4486,6 +4606,41 @@ impl eframe::App for StudioApp {
             if ui.selectable_value(&mut self.active_tool, Tool::Freehand, "Freehand").clicked() {
                 self.drag_start = None;
                 self.freehand_points.clear();
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.heading("Image Tracing");
+            if self.image_tracer.is_active {
+                if let Some(ref p) = self.image_tracer.source_path {
+                    let stem = p.file_name().and_then(|s| s.to_str()).unwrap_or("image");
+                    ui.label(egui::RichText::new(stem).small().color(egui::Color32::from_rgb(0, 180, 240)));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("⚡ Auto-Crop").on_hover_text("Snap crop box to central artwork").clicked() {
+                        self.image_tracer.snap_to_auto_crop();
+                    }
+                    if ui.button("Full").on_hover_text("Reset crop box to full image").clicked() {
+                        self.image_tracer.reset_to_full_image();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.add(egui::Slider::new(&mut self.image_tracer.color_count, 2..=32).text("Colors"));
+                ui.checkbox(&mut self.image_tracer.remove_white_background, "Remove White Bg");
+                ui.add_space(6.0);
+                if ui.add(egui::Button::new("▶ Trace to Vector").fill(egui::Color32::from_rgb(0, 130, 200))).on_hover_text("Vectorize crop region with vtracer").clicked() {
+                    match self.trace_current_image() {
+                        Ok(cnt) => self.set_status(format!("Traced {} vector shapes", cnt)),
+                        Err(e) => self.set_status(format!("Tracing error: {}", e)),
+                    }
+                }
+                if ui.button("✕ Close Tracing").clicked() {
+                    self.image_tracer.close();
+                }
+            } else {
+                if ui.button("🖼 Import Image...").on_hover_text("Import catalog card or photo for vector tracing (Ctrl+I)").clicked() {
+                    self.open_image_trace_dialog(ctx);
+                }
             }
         });
 
@@ -5004,39 +5159,84 @@ impl eframe::App for StudioApp {
                 )
             };
 
-            // Set cursor icon based on active tool
-            if response.hovered() {
-                match self.active_tool {
-                    Tool::Select => {
-                        let active_corner = self.active_resize_corner.or_else(|| {
-                            let mouse_pos = ctx.input(|i| i.pointer.latest_pos());
-                            if let (Some(m_pos), Some(sel_rect)) = (mouse_pos, self.get_selection_bounds()) {
-                                self.hit_test_resize_handle(m_pos, sel_rect, &mat_to_screen)
-                            } else {
-                                None
-                            }
-                        });
+            // Image tracer geometry
+            let tracer_info = if self.image_tracer.is_active && self.image_tracer.texture.is_some() {
+                let (img_w, img_h) = self.image_tracer.image_data.as_ref().map(|i| i.dimensions()).unwrap_or((1, 1));
+                let aspect = img_w as f32 / img_h as f32;
+                let fit_w_in = (self.mat_width_in * 0.85).min(self.mat_height_in * 0.85 * aspect);
+                let fit_h_in = fit_w_in / aspect;
+                let img_min_in = egui::pos2(
+                    (self.mat_width_in - fit_w_in) * 0.5,
+                    (self.mat_height_in - fit_h_in) * 0.5,
+                );
+                let img_max_in = egui::pos2(img_min_in.x + fit_w_in, img_min_in.y + fit_h_in);
+                let img_screen_rect = egui::Rect::from_min_max(mat_to_screen(img_min_in), mat_to_screen(img_max_in));
 
-                        if let Some(corner) = active_corner {
-                            match corner {
-                                ResizeCorner::TopLeft | ResizeCorner::BottomRight => {
-                                    ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-                                }
-                                ResizeCorner::TopRight | ResizeCorner::BottomLeft => {
-                                    ctx.set_cursor_icon(egui::CursorIcon::ResizeNeSw);
-                                }
-                            }
-                        } else if self.is_dragging_shape {
-                            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                        } else {
-                            ctx.set_cursor_icon(egui::CursorIcon::Default);
+                let u0 = (self.image_tracer.crop_rect.min.x / img_w as f32).clamp(0.0, 1.0);
+                let v0 = (self.image_tracer.crop_rect.min.y / img_h as f32).clamp(0.0, 1.0);
+                let u1 = (self.image_tracer.crop_rect.max.x / img_w as f32).clamp(0.0, 1.0);
+                let v1 = (self.image_tracer.crop_rect.max.y / img_h as f32).clamp(0.0, 1.0);
+
+                let crop_screen = egui::Rect::from_min_max(
+                    egui::pos2(
+                        img_screen_rect.min.x + u0 * img_screen_rect.width(),
+                        img_screen_rect.min.y + v0 * img_screen_rect.height(),
+                    ),
+                    egui::pos2(
+                        img_screen_rect.min.x + u1 * img_screen_rect.width(),
+                        img_screen_rect.min.y + v1 * img_screen_rect.height(),
+                    ),
+                );
+                Some((img_w, img_h, img_screen_rect, crop_screen))
+            } else {
+                None
+            };
+
+            // Set cursor icon based on active tool / image tracer
+            if response.hovered() {
+                let mut cursor_set = false;
+                if let Some((_, _, _, crop_screen)) = tracer_info {
+                    if let Some(m_pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                        if let Some(handle) = self.image_tracer.hit_test_handle(m_pos, crop_screen) {
+                            ctx.set_cursor_icon(image_tracer::ImageTracerState::cursor_for_handle(handle));
+                            cursor_set = true;
                         }
                     }
-                    Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Freehand => {
-                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-                    }
-                    Tool::Text => {
-                        ctx.set_cursor_icon(egui::CursorIcon::Text);
+                }
+
+                if !cursor_set {
+                    match self.active_tool {
+                        Tool::Select => {
+                            let active_corner = self.active_resize_corner.or_else(|| {
+                                let mouse_pos = ctx.input(|i| i.pointer.latest_pos());
+                                if let (Some(m_pos), Some(sel_rect)) = (mouse_pos, self.get_selection_bounds()) {
+                                    self.hit_test_resize_handle(m_pos, sel_rect, &mat_to_screen)
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if let Some(corner) = active_corner {
+                                match corner {
+                                    ResizeCorner::TopLeft | ResizeCorner::BottomRight => {
+                                        ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                                    }
+                                    ResizeCorner::TopRight | ResizeCorner::BottomLeft => {
+                                        ctx.set_cursor_icon(egui::CursorIcon::ResizeNeSw);
+                                    }
+                                }
+                            } else if self.is_dragging_shape {
+                                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                            } else {
+                                ctx.set_cursor_icon(egui::CursorIcon::Default);
+                            }
+                        }
+                        Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Freehand => {
+                            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                        }
+                        Tool::Text => {
+                            ctx.set_cursor_icon(egui::CursorIcon::Text);
+                        }
                     }
                 }
             }
@@ -5065,12 +5265,119 @@ impl eframe::App for StudioApp {
                 painter.line_segment([egui::pos2(mat_rect.min.x, y), egui::pos2(mat_rect.max.x, y)], grid_stroke);
             }
 
+            // Render raster image and interactive crop box
+            if let Some((_, _, img_screen_rect, crop_screen)) = tracer_info {
+                if let Some(ref tex) = self.image_tracer.texture {
+                    // Render base image
+                    painter.image(
+                        tex.id(),
+                        img_screen_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+
+                    // Dim outside crop box
+                    let dim_color = egui::Color32::from_black_alpha(150);
+                    if crop_screen.min.y > img_screen_rect.min.y {
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(img_screen_rect.min, egui::pos2(img_screen_rect.max.x, crop_screen.min.y)),
+                            0.0,
+                            dim_color,
+                        );
+                    }
+                    if crop_screen.max.y < img_screen_rect.max.y {
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(egui::pos2(img_screen_rect.min.x, crop_screen.max.y), img_screen_rect.max),
+                            0.0,
+                            dim_color,
+                        );
+                    }
+                    if crop_screen.min.x > img_screen_rect.min.x {
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(img_screen_rect.min.x, crop_screen.min.y),
+                                egui::pos2(crop_screen.min.x, crop_screen.max.y),
+                            ),
+                            0.0,
+                            dim_color,
+                        );
+                    }
+                    if crop_screen.max.x < img_screen_rect.max.x {
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(crop_screen.max.x, crop_screen.min.y),
+                                egui::pos2(img_screen_rect.max.x, crop_screen.max.y),
+                            ),
+                            0.0,
+                            dim_color,
+                        );
+                    }
+
+                    // Bright crop rectangle outline & rule-of-thirds grid
+                    painter.rect_stroke(crop_screen, 0.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 220, 255)));
+                    let third_w = crop_screen.width() / 3.0;
+                    let third_h = crop_screen.height() / 3.0;
+                    let grid_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80));
+                    painter.line_segment([egui::pos2(crop_screen.min.x + third_w, crop_screen.min.y), egui::pos2(crop_screen.min.x + third_w, crop_screen.max.y)], grid_stroke);
+                    painter.line_segment([egui::pos2(crop_screen.min.x + 2.0 * third_w, crop_screen.min.y), egui::pos2(crop_screen.min.x + 2.0 * third_w, crop_screen.max.y)], grid_stroke);
+                    painter.line_segment([egui::pos2(crop_screen.min.x, crop_screen.min.y + third_h), egui::pos2(crop_screen.max.x, crop_screen.min.y + third_h)], grid_stroke);
+                    painter.line_segment([egui::pos2(crop_screen.min.x, crop_screen.min.y + 2.0 * third_h), egui::pos2(crop_screen.max.x, crop_screen.min.y + 2.0 * third_h)], grid_stroke);
+
+                    // 8 Handles
+                    let handle_sz = 10.0;
+                    let draw_handle = |pos: egui::Pos2| {
+                        painter.rect_filled(
+                            egui::Rect::from_center_size(pos, egui::vec2(handle_sz, handle_sz)),
+                            2.0,
+                            egui::Color32::WHITE,
+                        );
+                        painter.rect_stroke(
+                            egui::Rect::from_center_size(pos, egui::vec2(handle_sz, handle_sz)),
+                            2.0,
+                            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 120, 255)),
+                        );
+                    };
+
+                    draw_handle(crop_screen.left_top());
+                    draw_handle(crop_screen.right_top());
+                    draw_handle(crop_screen.left_bottom());
+                    draw_handle(crop_screen.right_bottom());
+                    draw_handle(crop_screen.center_top());
+                    draw_handle(crop_screen.center_bottom());
+                    draw_handle(crop_screen.left_center());
+                    draw_handle(crop_screen.right_center());
+                }
+            }
+
             // Left-mouse tool interactions
             let hit_tol = (10.0 / px_per_in).max(0.2);
             let current_fill = self.current_color32();
 
-            // Drag started
-            if response.drag_started_by(egui::PointerButton::Primary) {
+            // Image tracer drag interaction
+            let mut tracer_dragged = false;
+            if let Some((img_w, img_h, img_screen_rect, crop_screen)) = tracer_info {
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    let start_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.press_origin()));
+                    if let Some(pos) = start_pos {
+                        if let Some(handle) = self.image_tracer.hit_test_handle(pos, crop_screen) {
+                            self.image_tracer.active_drag_handle = Some(handle);
+                            self.image_tracer.drag_start_mouse = pos;
+                            self.image_tracer.drag_start_rect = self.image_tracer.crop_rect;
+                            tracer_dragged = true;
+                        }
+                    }
+                } else if response.dragged_by(egui::PointerButton::Primary) && self.image_tracer.active_drag_handle.is_some() {
+                    let curr_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+                    if let Some(pos) = curr_pos {
+                        self.image_tracer.update_drag(pos, img_screen_rect, img_w, img_h);
+                        tracer_dragged = true;
+                    }
+                }
+            }
+
+            if !tracer_dragged && self.image_tracer.active_drag_handle.is_none() {
+                // Drag started
+                if response.drag_started_by(egui::PointerButton::Primary) {
                 let start_pos = response.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.press_origin()));
                 if let Some(pos) = start_pos {
                     let mat_pos = screen_to_mat(pos);
@@ -5244,6 +5551,7 @@ impl eframe::App for StudioApp {
                     Tool::Text => {}
                 }
             }
+            }
 
             // Click handling
             let is_double_click = response.double_clicked();
@@ -5339,6 +5647,7 @@ impl eframe::App for StudioApp {
                 || ctx.input(|i| i.pointer.primary_released());
 
             if primary_released {
+                self.image_tracer.active_drag_handle = None;
                 if self.active_resize_corner.is_some() {
                     self.active_resize_corner = None;
                     self.resize_initial_rect = None;
@@ -7827,5 +8136,83 @@ mod tests {
         let v = pointer - center - pan;
         pan += v * (1.0 - zoom_ratio);
         assert_eq!(pan, egui::vec2(-100.0, 0.0));
+    }
+
+    #[test]
+    fn test_image_tracer_catalog_card_pipeline() {
+        let mut app = StudioApp::new(None);
+        assert!(!app.image_tracer.is_active);
+        assert_eq!(app.image_tracer.color_count, 8);
+        assert!(app.image_tracer.remove_white_background);
+
+        // Create a synthetic 120x120 catalog card
+        let width = 120u32;
+        let height = 120u32;
+        let mut img = image::RgbaImage::new(width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                if x < 10 || x >= 110 || y < 10 || y >= 110 {
+                    // Olive green outer frame
+                    img.put_pixel(x, y, image::Rgba([110, 125, 60, 255]));
+                } else {
+                    // White card base
+                    img.put_pixel(x, y, image::Rgba([245, 245, 245, 255]));
+                }
+            }
+        }
+
+        // Header text in top 15% of card (y: 12..24)
+        for y in 14..22 {
+            for x in 20..100 {
+                img.put_pixel(x, y, image::Rgba([20, 20, 20, 255]));
+            }
+        }
+
+        // Price tag in bottom right (y: 95..108, x: 88..108)
+        for y in 95..108 {
+            for x in 88..108 {
+                img.put_pixel(x, y, image::Rgba([20, 20, 20, 255]));
+            }
+        }
+
+        // Central artwork (x: 45..75, y: 45..75)
+        for y in 45..75 {
+            for x in 45..75 {
+                img.put_pixel(x, y, image::Rgba([200, 30, 30, 255]));
+            }
+        }
+
+        let auto_crop = image_tracer::auto_crop_catalog_card(&img);
+        assert!(auto_crop.min_x >= 10, "auto_crop must be inside card");
+        assert!(auto_crop.min_y > 22, "auto_crop must ignore top header");
+        assert!(auto_crop.max_x < 88, "auto_crop must ignore price tag");
+        assert!(auto_crop.max_y < 95, "auto_crop must ignore price tag");
+        assert!(auto_crop.min_x <= 45 && auto_crop.max_x >= 75);
+        assert!(auto_crop.min_y <= 45 && auto_crop.max_y >= 75);
+
+        // Set up tracer state manually
+        app.image_tracer.is_active = true;
+        app.image_tracer.source_path = Some(std::path::PathBuf::from("test_card.png"));
+        app.image_tracer.auto_crop_rect = auto_crop.to_egui_rect();
+        app.image_tracer.crop_rect = auto_crop.to_egui_rect();
+        app.image_tracer.color_count = 6;
+        app.image_tracer.remove_white_background = true;
+        app.image_tracer.image_data = Some(img);
+
+        // Test snap_to_auto_crop and reset_to_full_image
+        app.image_tracer.reset_to_full_image();
+        assert_eq!(app.image_tracer.crop_rect.width(), 119.0);
+        app.image_tracer.snap_to_auto_crop();
+        assert_eq!(app.image_tracer.crop_rect, auto_crop.to_egui_rect());
+
+        // Test trace_current_image()
+        let initial_shapes = app.shapes.len();
+        let count = app.trace_current_image().expect("Tracing should succeed");
+        assert!(count > 0, "Traced shapes count must be > 0");
+        assert_eq!(app.shapes.len(), initial_shapes + count);
+        assert!(!app.image_tracer.is_active, "Tracer should close after vectorization");
+        assert_eq!(app.undo_stack.len(), 1, "Undo snapshot must be created");
+        assert!(!app.selected_indices.is_empty(), "New shapes must be selected");
     }
 }
