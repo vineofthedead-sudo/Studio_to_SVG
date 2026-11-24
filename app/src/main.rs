@@ -2658,97 +2658,155 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
             self.mat_width_in, self.mat_height_in, self.mat_width_in, self.mat_height_in
         ));
 
+        // Group shapes while preserving group appearance order
+        let mut group_order = Vec::new();
+        let mut grouped: std::collections::BTreeMap<Option<u64>, Vec<&CanvasShape>> = std::collections::BTreeMap::new();
         for shape in &self.shapes {
-            if let Some(ref pm) = shape.pixmap {
-                if !shape.is_svg_path {
-                    if let Ok(png_bytes) = pm.encode_png() {
-                        let b64 = crate::studio_format::base64_encode(&png_bytes);
+            if !grouped.contains_key(&shape.group_id) {
+                group_order.push(shape.group_id);
+            }
+            grouped.entry(shape.group_id).or_default().push(shape);
+        }
+
+        for gid_opt in group_order {
+            let shapes = match grouped.get(&gid_opt) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let in_group = gid_opt.is_some();
+            let indent = if in_group { "    " } else { "  " };
+
+            if let Some(gid) = gid_opt {
+                let name = self.group_names.get(&gid).cloned().unwrap_or_else(|| format!("Group {}", gid));
+                out.push_str(&format!("  <g id=\"{}\" data-name=\"{}\">\n", escape_xml(&name), escape_xml(&name)));
+            }
+
+            for shape in shapes {
+                if let Some(ref pm) = shape.pixmap {
+                    if !shape.is_svg_path {
+                        if let Ok(png_bytes) = pm.encode_png() {
+                            let b64 = crate::studio_format::base64_encode(&png_bytes);
+                            out.push_str(&format!(
+                                "{}<image x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" href=\"data:image/png;base64,{}\" />\n",
+                                indent, shape.x, shape.y, shape.width, shape.height, b64
+                            ));
+                            continue;
+                        }
+                    }
+                }
+
+                let hex = format!("#{:02x}{:02x}{:02x}", shape.fill_color.r(), shape.fill_color.g(), shape.fill_color.b());
+                let opacity = shape.fill_color.a() as f32 / 255.0;
+                let fill_str = if shape.fill_color.a() == 0 {
+                    " fill=\"none\"".to_string()
+                } else if opacity < 0.999 {
+                    format!(" fill=\"{}\" fill-opacity=\"{:.2}\"", hex, opacity)
+                } else {
+                    format!(" fill=\"{}\"", hex)
+                };
+
+                let is_white_or_light = (shape.fill_color.r() > 240 && shape.fill_color.g() > 240 && shape.fill_color.b() > 240) || shape.fill_color == egui::Color32::WHITE;
+                let stroke_str = if let Some(sc) = shape.stroke_color {
+                    if sc.a() > 0 && !(sc.r() > 240 && sc.g() > 240 && sc.b() > 240) {
+                        let sc_hex = format!("#{:02x}{:02x}{:02x}", sc.r(), sc.g(), sc.b());
+                        let sw = if shape.stroke_width > 0.0 { shape.stroke_width } else { 0.01 };
+                        if sc.a() < 255 {
+                            format!(" stroke=\"{}\" stroke-width=\"{:.3}\" stroke-opacity=\"{:.2}\"", sc_hex, sw, sc.a() as f32 / 255.0)
+                        } else {
+                            format!(" stroke=\"{}\" stroke-width=\"{:.3}\"", sc_hex, sw)
+                        }
+                    } else if shape.fill_color.a() == 0 || is_white_or_light {
+                        format!(" stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.01))
+                    } else {
+                        " stroke=\"none\"".to_string()
+                    }
+                } else if shape.fill_color.a() == 0 || is_white_or_light {
+                    format!(" stroke=\"#ff2626\" stroke-width=\"{:.3}\"", shape.stroke_width.max(0.01))
+                } else {
+                    " stroke=\"none\"".to_string()
+                };
+
+                if shape.is_svg_path || (shape.kind == ShapeKind::Freehand && !shape.text.is_empty()) {
+                    let d = if !shape.text.is_empty() {
+                        shape.text.clone()
+                    } else if !shape.points.is_empty() {
+                        let mut p_d = String::new();
+                        if let Some(p0) = shape.points.first() {
+                            p_d.push_str(&format!("M {:.4} {:.4}", p0.x, p0.y));
+                            for p in shape.points.iter().skip(1) {
+                                p_d.push_str(&format!(" L {:.4} {:.4}", p.x, p.y));
+                            }
+                            if shape.is_closed {
+                                p_d.push_str(" Z");
+                            }
+                        }
+                        p_d
+                    } else {
+                        String::new()
+                    };
+
+                    if !d.is_empty() {
+                        let name_attr = shape.name.as_ref().map(|n| format!(" data-name=\"{}\"", escape_xml(n))).unwrap_or_default();
                         out.push_str(&format!(
-                            "  <image x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" href=\"data:image/png;base64,{}\" />\n",
-                            shape.x, shape.y, shape.width, shape.height, b64
+                            "{}<path{} d=\"{}\" fill-rule=\"evenodd\"{}{} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                            indent, name_attr, d.trim(), fill_str, stroke_str
                         ));
                         continue;
                     }
                 }
+
+                match shape.kind {
+                    ShapeKind::Rectangle => {
+                        out.push_str(&format!(
+                            "{}<rect x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\"{}{} />\n",
+                            indent, shape.x, shape.y, shape.width, shape.height, fill_str, stroke_str
+                        ));
+                    }
+                    ShapeKind::Ellipse => {
+                        let cx = shape.x + shape.width * 0.5;
+                        let cy = shape.y + shape.height * 0.5;
+                        let rx = shape.width * 0.5;
+                        let ry = shape.height * 0.5;
+                        out.push_str(&format!(
+                            "{}<ellipse cx=\"{:.3}\" cy=\"{:.3}\" rx=\"{:.3}\" ry=\"{:.3}\"{}{} />\n",
+                            indent, cx, cy, rx, ry, fill_str, stroke_str
+                        ));
+                    }
+                    ShapeKind::Line => {
+                        if shape.points.len() >= 2 {
+                            out.push_str(&format!(
+                                "{}<line x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\"{} stroke-linecap=\"round\" />\n",
+                                indent, shape.points[0].x, shape.points[0].y, shape.points[1].x, shape.points[1].y, stroke_str
+                            ));
+                        }
+                    }
+                    ShapeKind::Freehand => {
+                        if shape.points.len() >= 2 {
+                            let pts_str = shape.points.iter()
+                                .map(|p| format!("{:.3},{:.3}", p.x, p.y))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let tag = if shape.is_closed { "polygon" } else { "polyline" };
+                            out.push_str(&format!(
+                                "{}<{} points=\"{}\"{}{} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                                indent, tag, pts_str, fill_str, stroke_str
+                            ));
+                        }
+                    }
+                    ShapeKind::Text => {
+                        let escaped = escape_xml(&shape.text);
+                        let y_base = shape.y + shape.height * 0.85;
+                        out.push_str(&format!(
+                            "{}<text x=\"{:.3}\" y=\"{:.3}\" font-family=\"sans-serif\" font-size=\"{:.3}\"{}>{}</text>\n",
+                            indent, shape.x, y_base, shape.height, fill_str, escaped
+                        ));
+                    }
+                }
             }
 
-            let hex = format!("#{:02x}{:02x}{:02x}", shape.fill_color.r(), shape.fill_color.g(), shape.fill_color.b());
-            let opacity = shape.fill_color.a() as f32 / 255.0;
-            let fill_str = if shape.fill_color.a() == 0 {
-                " fill=\"none\"".to_string()
-            } else if opacity < 0.999 {
-                format!(" fill=\"{}\" fill-opacity=\"{:.2}\"", hex, opacity)
-            } else {
-                format!(" fill=\"{}\"", hex)
-            };
-
-            let stroke_str = if let Some(sc) = shape.stroke_color {
-                if sc.a() > 0 {
-                    let sc_hex = format!("#{:02x}{:02x}{:02x}", sc.r(), sc.g(), sc.b());
-                    let sw = if shape.stroke_width > 0.0 { shape.stroke_width } else { 0.05 };
-                    if sc.a() < 255 {
-                        format!(" stroke=\"{}\" stroke-width=\"{:.3}\" stroke-opacity=\"{:.2}\"", sc_hex, sw, sc.a() as f32 / 255.0)
-                    } else {
-                        format!(" stroke=\"{}\" stroke-width=\"{:.3}\"", sc_hex, sw)
-                    }
-                } else {
-                    " stroke=\"none\"".to_string()
-                }
-            } else {
-                " stroke=\"none\"".to_string()
-            };
-
-            match shape.kind {
-                ShapeKind::Rectangle => {
-                    out.push_str(&format!(
-                        "  <rect x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\"{}{} />\n",
-                        shape.x, shape.y, shape.width, shape.height, fill_str, stroke_str
-                    ));
-                }
-                ShapeKind::Ellipse => {
-                    let cx = shape.x + shape.width * 0.5;
-                    let cy = shape.y + shape.height * 0.5;
-                    let rx = shape.width * 0.5;
-                    let ry = shape.height * 0.5;
-                    out.push_str(&format!(
-                        "  <ellipse cx=\"{:.3}\" cy=\"{:.3}\" rx=\"{:.3}\" ry=\"{:.3}\"{}{} />\n",
-                        cx, cy, rx, ry, fill_str, stroke_str
-                    ));
-                }
-                ShapeKind::Line => {
-                    if shape.points.len() >= 2 {
-                        out.push_str(&format!(
-                            "  <line x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\"{} stroke-linecap=\"round\" />\n",
-                            shape.points[0].x, shape.points[0].y, shape.points[1].x, shape.points[1].y, stroke_str
-                        ));
-                    }
-                }
-                ShapeKind::Freehand => {
-                    if shape.is_svg_path && !shape.text.is_empty() {
-                        out.push_str(&format!(
-                            "  <path d=\"{}\" fill-rule=\"evenodd\"{}{} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
-                            shape.text, fill_str, stroke_str
-                        ));
-                    } else if shape.points.len() >= 2 {
-                        let pts_str = shape.points.iter()
-                            .map(|p| format!("{:.3},{:.3}", p.x, p.y))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let tag = if shape.is_closed { "polygon" } else { "polyline" };
-                        out.push_str(&format!(
-                            "  <{} points=\"{}\"{}{} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
-                            tag, pts_str, fill_str, stroke_str
-                        ));
-                    }
-                }
-                ShapeKind::Text => {
-                    let escaped = escape_xml(&shape.text);
-                    let y_base = shape.y + shape.height * 0.85;
-                    out.push_str(&format!(
-                        "  <text x=\"{:.3}\" y=\"{:.3}\" font-family=\"sans-serif\" font-size=\"{:.3}\"{}>{}</text>\n",
-                        shape.x, y_base, shape.height, fill_str, escaped
-                    ));
-                }
+            if in_group {
+                out.push_str("  </g>\n");
             }
         }
 
@@ -3390,6 +3448,8 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
             let curr_h = (curr_max_y - curr_min_y).max(0.001);
             let scale_x = target_w / curr_w;
             let scale_y = target_h / curr_h;
+            let offset_x = target_x - curr_min_x * scale_x;
+            let offset_y = target_y - curr_min_y * scale_y;
 
             for &idx in &self.selected_indices {
                 if let Some(s) = self.shapes.get_mut(idx) {
@@ -3400,6 +3460,11 @@ fn canvas_shape_to_welded(shape: &CanvasShape) -> Option<vector_ops::WeldedShape
                     for pt in &mut s.points {
                         pt.x = target_x + (pt.x - curr_min_x) * scale_x;
                         pt.y = target_y + (pt.y - curr_min_y) * scale_y;
+                    }
+                    if s.is_svg_path && !s.text.is_empty() {
+                        s.text = crate::studio_format::transform_svg_path_data_affine(
+                            &s.text, scale_x, 0.0, 0.0, scale_y, offset_x, offset_y,
+                        );
                     }
                     s.is_modified = true;
                 }
@@ -5654,6 +5719,15 @@ impl eframe::App for StudioApp {
                                                     new_rect.min.y + pt_u_y * new_rect.height(),
                                                 )
                                             }).collect();
+                                        }
+                                        if orig_shape.is_svg_path && !orig_shape.text.is_empty() {
+                                            let sx = new_rect.width() / init_w;
+                                            let sy = new_rect.height() / init_h;
+                                            let tx = new_rect.min.x - init_rect.min.x * sx;
+                                            let ty = new_rect.min.y - init_rect.min.y * sy;
+                                            shape.text = crate::studio_format::transform_svg_path_data_affine(
+                                                &orig_shape.text, sx, 0.0, 0.0, sy, tx, ty,
+                                            );
                                         }
                                         shape.is_modified = true;
                                     }
@@ -8391,5 +8465,74 @@ mod tests {
         for p in &shape2.points {
             assert!(p.x > 3.5, "Shape 2 points must not leak into Shape 1 coordinates");
         }
+
+        // Test SVG export of these split subpath shapes
+        let svg_out = app.export_svg_string();
+        assert!(svg_out.contains("<path "));
+        assert!(svg_out.contains("fill-rule=\"evenodd\""));
+        let re_imported = import_svg_str(&svg_out, egui::Color32::BLACK);
+        assert_eq!(re_imported.len(), 2);
+    }
+
+    #[test]
+    fn test_svg_export_traced_shapes_and_groups() {
+        let mut app = StudioApp::new(None);
+        app.mat_width_in = 12.0;
+        app.mat_height_in = 12.0;
+
+        let gid = app.next_group_id();
+        app.group_names.insert(gid, "Traced: Test Design".to_string());
+
+        // Push two traced subpaths into the group
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Freehand,
+            x: 2.0, y: 2.0, width: 3.0, height: 3.0,
+            points: vec![egui::pos2(2.0, 2.0), egui::pos2(5.0, 2.0), egui::pos2(5.0, 5.0), egui::pos2(2.0, 5.0)],
+            text: "M 2.0000 2.0000 L 5.0000 2.0000 L 5.0000 5.0000 L 2.0000 5.0000 Z".to_string(),
+            fill_color: egui::Color32::BLACK,
+            stroke_color: None,
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: true,
+            is_modified: false,
+            triangles: Vec::new(),
+            group_id: Some(gid),
+            group_path: vec![gid],
+            is_visible: true,
+            is_locked: false,
+            name: Some("Contour 1".to_string()),
+            pixmap: None,
+            texture: None,
+        });
+
+        app.shapes.push(CanvasShape {
+            kind: ShapeKind::Freehand,
+            x: 6.0, y: 6.0, width: 2.0, height: 2.0,
+            points: vec![egui::pos2(6.0, 6.0), egui::pos2(8.0, 6.0), egui::pos2(8.0, 8.0)],
+            text: "M 6.0000 6.0000 C 6.5000 5.5000 7.5000 5.5000 8.0000 6.0000 L 8.0000 8.0000 Z".to_string(),
+            fill_color: egui::Color32::TRANSPARENT,
+            stroke_color: None, // Transparent with no stroke -> red cutline
+            stroke_width: 0.0,
+            is_closed: true,
+            is_svg_path: true,
+            is_modified: false,
+            triangles: Vec::new(),
+            group_id: Some(gid),
+            group_path: vec![gid],
+            is_visible: true,
+            is_locked: false,
+            name: Some("Cut Contour".to_string()),
+            pixmap: None,
+            texture: None,
+        });
+
+        let svg = app.export_svg_string();
+        assert!(svg.contains("<g id=\"Traced: Test Design\" data-name=\"Traced: Test Design\">"));
+        assert!(svg.contains("<path data-name=\"Contour 1\" d=\"M 2.0000 2.0000"));
+        assert!(svg.contains("fill=\"#000000\""));
+        assert!(svg.contains("<path data-name=\"Cut Contour\" d=\"M 6.0000 6.0000 C 6.5000 5.5000 7.5000 5.5000 8.0000 6.0000 L 8.0000 8.0000 Z\""));
+        assert!(svg.contains("stroke=\"#ff2626\" stroke-width=\"0.010\""));
+        assert!(svg.contains("fill=\"none\""));
+        assert!(svg.contains("</g>"));
     }
 }

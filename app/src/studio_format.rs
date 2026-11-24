@@ -534,6 +534,165 @@ fn normalize_shapes_onto_mat(shapes: &mut [CanvasShape], mat_w_in: f32, mat_h_in
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SvgPathToken {
+    Command(char),
+    Number(f32),
+}
+
+/// Tokenizes an SVG path `d` string into commands and numbers.
+pub fn tokenize_svg_path(text: &str) -> Vec<SvgPathToken> {
+    let mut tokens = Vec::new();
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+
+    while i < n {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() || b == b',' {
+            i += 1;
+            continue;
+        }
+
+        if b.is_ascii_alphabetic() && b != b'e' && b != b'E' {
+            tokens.push(SvgPathToken::Command(b as char));
+            i += 1;
+            continue;
+        }
+
+        if b.is_ascii_digit() || b == b'+' || b == b'-' || b == b'.' {
+            let start = i;
+            if b == b'+' || b == b'-' {
+                i += 1;
+            }
+            let mut has_dot = false;
+            while i < n {
+                let c = bytes[i];
+                if c.is_ascii_digit() {
+                    i += 1;
+                } else if c == b'.' && !has_dot {
+                    has_dot = true;
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if i < n && (bytes[i] == b'e' || bytes[i] == b'E') {
+                i += 1;
+                if i < n && (bytes[i] == b'+' || bytes[i] == b'-') {
+                    i += 1;
+                }
+                while i < n && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            let num_str = &text[start..i];
+            if let Ok(val) = num_str.parse::<f32>() {
+                tokens.push(SvgPathToken::Number(val));
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    tokens
+}
+
+/// Transforms 2D coordinates within an SVG path data string (`d`) using an affine transform
+/// x' = a * x + c * y + tx
+/// y' = b * x + d_val * y + ty
+pub fn transform_svg_path_data_affine(
+    text: &str,
+    a: f32,
+    b: f32,
+    c: f32,
+    d_val: f32,
+    tx: f32,
+    ty: f32,
+) -> String {
+    let tokens = tokenize_svg_path(text);
+    if tokens.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut current_cmd = 'M';
+    let mut coord_index = 0;
+    let mut pending_x = 0.0_f32;
+
+    for tok in tokens {
+        match tok {
+            SvgPathToken::Command(cmd) => {
+                current_cmd = cmd;
+                coord_index = 0;
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push(cmd);
+            }
+            SvgPathToken::Number(num) => {
+                let is_rel = current_cmd.is_ascii_lowercase();
+                let upper = current_cmd.to_ascii_uppercase();
+
+                match upper {
+                    'M' | 'L' | 'C' | 'S' | 'Q' | 'T' => {
+                        if coord_index % 2 == 0 {
+                            pending_x = num;
+                            coord_index += 1;
+                        } else {
+                            let y = num;
+                            let (nx, ny) = if is_rel {
+                                (a * pending_x + c * y, b * pending_x + d_val * y)
+                            } else {
+                                (a * pending_x + c * y + tx, b * pending_x + d_val * y + ty)
+                            };
+                            out.push_str(&format!(" {:.4} {:.4}", nx, ny));
+                            coord_index += 1;
+                        }
+                    }
+                    'H' => {
+                        let nx = if is_rel { a * num } else { a * num + tx };
+                        out.push_str(&format!(" {:.4}", nx));
+                    }
+                    'V' => {
+                        let ny = if is_rel { d_val * num } else { d_val * num + ty };
+                        out.push_str(&format!(" {:.4}", ny));
+                    }
+                    'A' => {
+                        let rem = coord_index % 7;
+                        if rem == 0 {
+                            let rx = (num * a.abs()).max(1e-4);
+                            out.push_str(&format!(" {:.4}", rx));
+                        } else if rem == 1 {
+                            let ry = (num * d_val.abs()).max(1e-4);
+                            out.push_str(&format!(" {:.4}", ry));
+                        } else if rem == 5 {
+                            pending_x = num;
+                        } else if rem == 6 {
+                            let y = num;
+                            let (nx, ny) = if is_rel {
+                                (a * pending_x + c * y, b * pending_x + d_val * y)
+                            } else {
+                                (a * pending_x + c * y + tx, b * pending_x + d_val * y + ty)
+                            };
+                            out.push_str(&format!(" {:.4} {:.4}", nx, ny));
+                        } else {
+                            out.push_str(&format!(" {}", num));
+                        }
+                        coord_index += 1;
+                    }
+                    _ => {
+                        out.push_str(&format!(" {:.4}", num));
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// Transforms 2D coordinates within SVG path data string (`d`) using scale and offset.
 pub fn transform_svg_path_data(
     text: &str,
@@ -543,48 +702,9 @@ pub fn transform_svg_path_data(
     target_cx: f32,
     target_cy: f32,
 ) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut tokens = text.split_whitespace().peekable();
-    while let Some(tok) = tokens.next() {
-        if tok == "M" || tok == "L" {
-            if let (Some(x_str), Some(y_str)) = (tokens.next(), tokens.next()) {
-                if let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) {
-                    let tx = target_cx + (x - orig_cx) * scale;
-                    let ty = target_cy + (y - orig_cy) * scale;
-                    if !out.is_empty() {
-                        out.push(' ');
-                    }
-                    out.push_str(&format!("{} {:.4} {:.4}", tok, tx, ty));
-                    continue;
-                }
-            }
-        } else if tok == "Z" {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str("Z");
-            continue;
-        } else if let Some((x_str, y_str)) = tok.split_once(',') {
-            if let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) {
-                let tx = target_cx + (x - orig_cx) * scale;
-                let ty = target_cy + (y - orig_cy) * scale;
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push_str(&format!("{:.4},{:.4}", tx, ty));
-                continue;
-            }
-        }
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(tok);
-    }
-    if out.is_empty() {
-        text.to_string()
-    } else {
-        out
-    }
+    let tx = target_cx - orig_cx * scale;
+    let ty = target_cy - orig_cy * scale;
+    transform_svg_path_data_affine(text, scale, 0.0, 0.0, scale, tx, ty)
 }
 
 /// Converts Silhouette Studio binary data directly into a standalone SVG string.
@@ -676,10 +796,29 @@ pub fn convert_studio_to_svg(data: &[u8]) -> Result<String, StudioParseError> {
                 "stroke=\"none\"".to_string()
             };
 
-            if shape.is_svg_path && !shape.text.is_empty() {
+            let d = if shape.is_svg_path && !shape.text.is_empty() {
+                shape.text.clone()
+            } else if shape.is_svg_path && !shape.points.is_empty() {
+                let mut p_d = String::new();
+                if let Some(p0) = shape.points.first() {
+                    p_d.push_str(&format!("M {:.4} {:.4}", p0.x, p0.y));
+                    for p in shape.points.iter().skip(1) {
+                        p_d.push_str(&format!(" L {:.4} {:.4}", p.x, p.y));
+                    }
+                    if shape.is_closed {
+                        p_d.push_str(" Z");
+                    }
+                }
+                p_d
+            } else {
+                String::new()
+            };
+
+            if !d.is_empty() {
+                let name_attr = shape.name.as_ref().map(|n| format!(" data-name=\"{}\"", escape_xml(n))).unwrap_or_default();
                 svg.push_str(&format!(
-                    "    <path d=\"{}\" fill-rule=\"evenodd\" {} {} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
-                    shape.text, fill_str, stroke_str
+                    "    <path{} d=\"{}\" fill-rule=\"evenodd\" {} {} stroke-linecap=\"round\" stroke-linejoin=\"round\" />\n",
+                    name_attr, d.trim(), fill_str, stroke_str
                 ));
             } else if shape.points.len() >= 2 {
                 let pts_str = shape
@@ -2048,6 +2187,7 @@ fn create_canvas_shape_from_subpaths(
     }
 
     let mut subpath_polylines = Vec::new();
+    let mut subpath_d_strings = Vec::new();
 
     for sub in subpaths {
         let clean_verts = sanitize_subpath_vertices(&sub.vertices);
@@ -2062,6 +2202,57 @@ fn create_canvas_shape_from_subpaths(
         let polyline = path_vertices_to_polyline(&clean_verts, is_closed, transform, scale_to_in, 0.002);
         if polyline.len() >= 2 {
             subpath_polylines.push(polyline);
+        }
+
+        // Build true Bézier curve SVG path string for this subpath
+        let transformed_verts: Vec<StudioBezierVertex> = clean_verts
+            .iter()
+            .map(|v| {
+                let mut v2 = *v;
+                if let Some(t) = transform {
+                    v2.anchor = t.apply(v2.anchor);
+                    v2.handle_in = t.apply(v2.handle_in);
+                    v2.handle_out = t.apply(v2.handle_out);
+                }
+                v2.anchor = egui::pos2(v2.anchor.x * scale_to_in, v2.anchor.y * scale_to_in);
+                v2.handle_in = egui::pos2(v2.handle_in.x * scale_to_in, v2.handle_in.y * scale_to_in);
+                v2.handle_out = egui::pos2(v2.handle_out.x * scale_to_in, v2.handle_out.y * scale_to_in);
+                v2
+            })
+            .collect();
+
+        if !transformed_verts.is_empty() {
+            let mut sub_d = format!("M {:.4} {:.4}", transformed_verts[0].anchor.x, transformed_verts[0].anchor.y);
+            for i in 0..transformed_verts.len().saturating_sub(1) {
+                let a = &transformed_verts[i];
+                let b = &transformed_verts[i + 1];
+                let has_out = (a.handle_out.x - a.anchor.x).hypot(a.handle_out.y - a.anchor.y) >= 1e-4;
+                let has_in = (b.handle_in.x - b.anchor.x).hypot(b.handle_in.y - b.anchor.y) >= 1e-4;
+
+                if !has_out && !has_in {
+                    sub_d.push_str(&format!(" L {:.4} {:.4}", b.anchor.x, b.anchor.y));
+                } else {
+                    sub_d.push_str(&format!(
+                        " C {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}",
+                        a.handle_out.x, a.handle_out.y, b.handle_in.x, b.handle_in.y, b.anchor.x, b.anchor.y
+                    ));
+                }
+            }
+
+            if is_closed && transformed_verts.len() >= 2 {
+                let last_v = transformed_verts.last().unwrap();
+                let first_v = &transformed_verts[0];
+                let has_out = (last_v.handle_out.x - last_v.anchor.x).hypot(last_v.handle_out.y - last_v.anchor.y) >= 1e-4;
+                let has_in = (first_v.handle_in.x - first_v.anchor.x).hypot(first_v.handle_in.y - first_v.anchor.y) >= 1e-4;
+                if has_out || has_in {
+                    sub_d.push_str(&format!(
+                        " C {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}",
+                        last_v.handle_out.x, last_v.handle_out.y, first_v.handle_in.x, first_v.handle_in.y, first_v.anchor.x, first_v.anchor.y
+                    ));
+                }
+                sub_d.push_str(" Z");
+            }
+            subpath_d_strings.push(sub_d);
         }
     }
 
@@ -2078,18 +2269,19 @@ fn create_canvas_shape_from_subpaths(
     let w = (max_x - min_x).max(0.005);
     let h = (max_y - min_y).max(0.005);
 
-    // Build compound SVG path d string: M {x0} {y0} L {x1} {y1} ... Z M {x0'} {y0'} ... Z
-    let mut svg_d = String::new();
-    for poly in &subpath_polylines {
-        if let Some(p0) = poly.first() {
-            if !svg_d.is_empty() {
-                svg_d.push(' ');
+    let mut svg_d = subpath_d_strings.join(" ");
+    if svg_d.is_empty() {
+        for poly in &subpath_polylines {
+            if let Some(p0) = poly.first() {
+                if !svg_d.is_empty() {
+                    svg_d.push(' ');
+                }
+                svg_d.push_str(&format!("M {:.4} {:.4}", p0.x, p0.y));
+                for p in poly.iter().skip(1) {
+                    svg_d.push_str(&format!(" L {:.4} {:.4}", p.x, p.y));
+                }
+                svg_d.push_str(" Z");
             }
-            svg_d.push_str(&format!("M {:.4} {:.4}", p0.x, p0.y));
-            for p in poly.iter().skip(1) {
-                svg_d.push_str(&format!(" L {:.4} {:.4}", p.x, p.y));
-            }
-            svg_d.push_str(" Z");
         }
     }
 
@@ -2912,6 +3104,52 @@ pub fn create_test_v5_data(mat_preset: &str, layer_name: &str, paths: &[TestPath
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_transform_svg_path_data_affine_bezier() {
+        let path = "M 10 20 C 12 25 18 35 20 40 Q 25 50 30 60 Z";
+        // Scale by 2.0 and translate by (5.0, 10.0)
+        let transformed = transform_svg_path_data_affine(path, 2.0, 0.0, 0.0, 2.0, 5.0, 10.0);
+        assert!(transformed.contains("M 25.0000 50.0000"));
+        assert!(transformed.contains("C 29.0000 60.0000 41.0000 80.0000 45.0000 90.0000"));
+        assert!(transformed.contains("Q 55.0000 110.0000 65.0000 130.0000"));
+        assert!(transformed.contains("Z"));
+    }
+
+    #[test]
+    fn test_subpath_true_bezier_export() {
+        let vertices = vec![
+            StudioBezierVertex {
+                anchor: egui::pos2(10.0, 10.0),
+                handle_in: egui::pos2(10.0, 10.0),
+                handle_out: egui::pos2(12.0, 15.0),
+            },
+            StudioBezierVertex {
+                anchor: egui::pos2(20.0, 20.0),
+                handle_in: egui::pos2(18.0, 15.0),
+                handle_out: egui::pos2(20.0, 20.0),
+            },
+        ];
+        let subpaths = vec![StudioSubpath {
+            start_pos: 0,
+            end_pos: 0,
+            vertices,
+        }];
+        let shape = create_canvas_shape_from_subpaths(
+            &subpaths,
+            Some(1),
+            vec![1],
+            None,
+            egui::Color32::TRANSPARENT,
+            egui::Color32::from_rgb(255, 38, 38),
+            0.01,
+            1.0,
+            None,
+        ).expect("create shape");
+
+        assert!(shape.is_svg_path);
+        assert!(shape.text.contains("C 12.0000 15.0000 18.0000 15.0000 20.0000 20.0000"));
+    }
 
     #[test]
     fn test_detect_silhouette04_header_offset_zero() {

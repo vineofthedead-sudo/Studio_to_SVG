@@ -4,6 +4,31 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.6.2] - 2026-11-24
+
+### Fixed & Improved
+- **SVG Export Engine Finalization & Full Repository Ingestion (`studio3svg`)**:
+  - Ingested and verified format insights from Zayd Mulani (`zaydmulani09/studio3svg`):
+    - Clean-room specification analysis of `SPEC.md`, `RESEARCH.md`, and core converter implementations (`src/studio3.js`, `src/svg.js`).
+    - Exact cubic Bézier curve output formatting (`pathData`): emits true Bézier curve segments (`C c1x c1y c2x c2y bx by`) using control points from relative handle offsets (`dx, dy`) when handles exist, and straight line segments (`L bx by`) when handles are absent.
+    - Closed path closing segments: appends closing `C` segment back to the first anchor if either handle is active, followed by `Z`.
+  - Implemented `transform_svg_path_data_affine` and `tokenize_svg_path` in `app/src/studio_format.rs`:
+    - Robust SVG path data tokenizer and 2D affine transformation engine supporting `M, L, C, S, Q, T, H, V, A, Z` commands and arbitrary nested coordinate pairs.
+    - Updated `transform_svg_path_data` to preserve cubic/quad Bézier control points across any coordinate scaling or translation.
+  - Synchronized `CanvasShape.text` Across Vector Manipulations (`app/src/main.rs`):
+    - In `trace_current_image`: transforms `s.text` by affine scale and translation from raster pixel space into exact mat-inch coordinates, eliminating scaling blowouts in exported SVGs.
+    - In interactive corner resizing: dynamically transforms `orig_shape.text` by the active resize matrix `(sx, sy, tx, ty)`.
+    - In `CanvasShape::translate`: translates all curve control points in `self.text` without distorting Bézier curves.
+  - Layer & Group Hierarchy Preservation in SVG Export (`app/src/main.rs`):
+    - Refactored `export_svg_string` to iterate over shapes grouped by `group_id`, wrapping them in `<g id="{name}" data-name="{name}">` so layer hierarchies open cleanly in Inkscape, Illustrator, and other vector software.
+    - Strict `<path d="..." />` syntax: shapes with `is_svg_path == true` are guaranteed to export as SVG paths with `fill-rule="evenodd"`.
+    - Silhouette cutline enforcement: transparent fill shapes (`fill_color.a() == 0`) with no explicit stroke export with Silhouette standard red hairline cutline (`stroke="#ff2626" stroke-width="0.010"`).
+- **Verification**:
+  - All 82 test cases passing (`cargo test --manifest-path app/Cargo.toml`).
+  - Production release binary built cleanly (`cargo build --release --manifest-path app/Cargo.toml`).
+
+---
+
 ## [0.6.1] - 2026-11-24
 
 ### Fixed & Improved
