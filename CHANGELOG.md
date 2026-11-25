@@ -4,6 +4,22 @@ All notable changes, architectural implementations, and roadmap milestones for t
 
 ---
 
+## [0.6.3] - 2026-11-24
+
+### Added
+- **Cross-Platform Automated GitHub Actions Release Workflow (`.github/workflows/release.yml`)**:
+  - Automatically triggers on version tag pushes (`refs/tags/v*`) and manual triggers (`workflow_dispatch`).
+  - Cross-platform build matrix supporting 4 target architectures:
+    - `x86_64-unknown-linux-gnu` (Linux x86_64 standalone on `ubuntu-latest`) packaged as `.tar.gz`.
+    - `x86_64-pc-windows-msvc` (Windows x86_64 executable on `windows-latest`) packaged as `.zip`.
+    - `x86_64-apple-darwin` (macOS Intel on `macos-13`) packaged as `.zip`.
+    - `aarch64-apple-darwin` (macOS Apple Silicon / M-series on `macos-latest`) packaged as `.zip`.
+  - Configured Linux system graphics dependencies (`pkg-config`, `libfontconfig1-dev`, `libx11-dev`, `libwayland-dev`, `libxkbcommon-dev`, `libgtk-3-dev`, `libxcb-*`).
+  - Integrated `softprops/action-gh-release@v2` for automated GitHub Releases creation, release note generation, and asset uploads.
+  - Attached `actions/upload-artifact@v4` for easy downloadable artifacts in manual/dispatch runs.
+
+---
+
 ## [0.6.2] - 2026-11-24
 
 ### Fixed & Improved

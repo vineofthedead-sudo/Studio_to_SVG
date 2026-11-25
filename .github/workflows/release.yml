@@ -1,0 +1,91 @@
+name: Release
+
+'on':
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            bin_name: studio-to-svg
+            archive_name: studio-to-svg-linux-x86_64.tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin_name: studio-to-svg.exe
+            archive_name: studio-to-svg-windows-x86_64.zip
+          - target: x86_64-apple-darwin
+            os: macos-13
+            bin_name: studio-to-svg
+            archive_name: studio-to-svg-macos-x86_64.zip
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            bin_name: studio-to-svg
+            archive_name: studio-to-svg-macos-aarch64.zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig1-dev libx11-dev libwayland-dev libxkbcommon-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build binary
+        run: cargo build --release --manifest-path app/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Package release asset (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp "app/target/${{ matrix.target }}/release/${{ matrix.bin_name }}" staging/
+          chmod +x staging/${{ matrix.bin_name }}
+          if [[ "${{ matrix.archive_name }}" == *.tar.gz ]]; then
+            tar -czvf "${{ matrix.archive_name }}" -C staging "${{ matrix.bin_name }}"
+          else
+            cd staging && zip "../${{ matrix.archive_name }}" "${{ matrix.bin_name }}" && cd ..
+          fi
+
+      - name: Package release asset (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item "app/target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -Destination staging/
+          Set-Location staging
+          Compress-Archive -Path "${{ matrix.bin_name }}" -DestinationPath "../${{ matrix.archive_name }}" -Force
+          Set-Location ..
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-to-svg-${{ matrix.target }}
+          path: ${{ matrix.archive_name }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.archive_name }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
