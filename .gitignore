@@ -2,3 +2,14 @@ target/
 *.exe
 *.AppImage
 test_samples/
+
+# Agent / session artifacts (never commit)
+transcript.json
+build-activity.log
+feed.json
+craft.json
+usage.json
+investigation.cany/
+inbox/build-progress.json
+pinned/play.log
+checks/round-*/screenshot.png
